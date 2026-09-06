@@ -13,10 +13,11 @@ models:
 
   cloud:
     provider: "chutes"
-    base_url: "https://chutes.ai/v1"
+    base_url: "https://llm.chutes.ai/v1"
     api_key: "YOUR_CHUTES_API_KEY_HERE"
-    vision_model: "Qwen/Qwen2.5-VL-72B-Instruct"
-    reasoning_model: "deepseek-ai/DeepSeek-R1"
+    vision_model: "Qwen/Qwen3.5-397B-A17B-TEE"        # Flagship 397B GUI/vision MoE (17B active)
+    fast_vision_model: "google/gemma-4-31B-turbo-TEE" # Fast 31B NVFP4 speculative decoding vision
+    reasoning_model: "moonshotai/Kimi-K2.6-TEE"       # 1T MoE agentic reasoning & planning
     timeout_seconds: 90
 
 safety:

@@ -51,6 +51,28 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "click_element",
+            "description": "Locate an element visually by natural language description (e.g. 'Save button', 'Terminal tab', 'Search bar') and click it automatically via visual grounding.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_description": {
+                        "type": "string",
+                        "description": "Visual description of the UI element to find and click."
+                    },
+                    "button": {
+                        "type": "string",
+                        "enum": ["left", "right", "middle"],
+                        "default": "left"
+                    }
+                },
+                "required": ["target_description"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "click",
             "description": "Click the mouse at specific (x, y) screen coordinates.",
             "parameters": {

@@ -9,8 +9,11 @@ from typing import Any, Dict, List, Optional
 from eidos.actions.mouse_keyboard import InputSimulator
 from eidos.actions.shell import ShellExecutor
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
-from eidos.models.base import ToolCall
+from eidos.models.base import BaseModelClient, ToolCall
+from eidos.models.chutes_client import ChutesClient
 from eidos.models.ollama_client import OllamaClient
+from eidos.models.router import ModelRouter
+from eidos.perception.grounder import VisualGrounder
 from eidos.perception.screen import ScreenCapture
 from eidos.perception.window_info import WindowDetector
 from eidos.safety.allowlist import AllowlistManager
@@ -29,7 +32,7 @@ class AgentLoop:
         config: Optional[Dict[str, Any]] = None,
         kill_switch: Optional[KillSwitch] = None,
         gatekeeper: Optional[Gatekeeper] = None,
-        model_client: Optional[OllamaClient] = None,
+        model_client: Optional[BaseModelClient] = None,
     ):
         self.config = config or {}
         self.kill_switch = kill_switch or KillSwitch()
@@ -48,17 +51,33 @@ class AgentLoop:
         )
 
         local_cfg = self.config.get("models", {}).get("local", {})
-        self.model = model_client or OllamaClient(
+        cloud_cfg = self.config.get("models", {}).get("cloud", {})
+        pref = self.config.get("models", {}).get("provider_preference", "local")
+
+        self.ollama = OllamaClient(
             base_url=local_cfg.get("base_url", "http://localhost:11434"),
             reasoning_model=local_cfg.get("reasoning_model", "batiai/gemma4-26b:iq4"),
             vision_model=local_cfg.get("vision_model", "batiai/gemma4-12b:q6"),
             timeout=local_cfg.get("timeout_seconds", 60.0),
         )
 
+        self.chutes = ChutesClient(
+            api_key=cloud_cfg.get("api_key"),
+            base_url=cloud_cfg.get("base_url", "https://llm.chutes.ai/v1"),
+            vision_model=cloud_cfg.get("vision_model", "Qwen/Qwen3.5-397B-A17B-TEE"),
+            fast_vision_model=cloud_cfg.get("fast_vision_model", "google/gemma-4-31B-turbo-TEE"),
+            reasoning_model=cloud_cfg.get("reasoning_model", "moonshotai/Kimi-K2.6-TEE"),
+            timeout=cloud_cfg.get("timeout_seconds", 90.0),
+        )
+
+        self.router = ModelRouter(ollama_client=self.ollama, chutes_client=self.chutes, preference=pref)
+        self.model = model_client or self.router
+
         self.screen = ScreenCapture(
             scale_factor=self.config.get("perception", {}).get("screen_scale_factor", 1.0)
         )
         self.windows = WindowDetector()
+        self.grounder = VisualGrounder(model_router=self.router)
         self.shell = ShellExecutor(gatekeeper=self.gatekeeper)
         self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
 
@@ -183,6 +202,22 @@ class AgentLoop:
                 }, False
             except Exception as e:
                 return {"status": "error", "error": str(e)}, False
+
+        if name == "click_element":
+            desc = args.get("target_description", "")
+            button = args.get("button", "left")
+            try:
+                img = self.screen.capture()
+                coords = self.grounder.ground(desc, img)
+                if coords:
+                    gx, gy = coords
+                    res = self.inputs.click(x=gx, y=gy, button=button)
+                    res["grounded_coords"] = [gx, gy]
+                    return res, False
+                else:
+                    return {"success": False, "error": f"Visual grounder could not locate: '{desc}'"}, False
+            except Exception as e:
+                return {"success": False, "error": f"Visual grounding exception: {str(e)}"}, False
 
         if name == "click":
             x = int(args.get("x", 0))

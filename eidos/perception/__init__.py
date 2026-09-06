@@ -1,6 +1,13 @@
 """Perception subsystem for desktop capture and window state."""
 
+from eidos.perception.grounder import CoordinateMapper, SetOfMarkAnnotator, VisualGrounder
 from eidos.perception.screen import ScreenCapture
 from eidos.perception.window_info import WindowDetector
 
-__all__ = ["ScreenCapture", "WindowDetector"]
+__all__ = [
+    "ScreenCapture",
+    "WindowDetector",
+    "VisualGrounder",
+    "CoordinateMapper",
+    "SetOfMarkAnnotator",
+]
