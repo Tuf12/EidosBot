@@ -1,0 +1,55 @@
+# EidosBot System Configuration Template
+# Copy to config.yaml and customize for your local setup
+
+models:
+  provider_preference: "local"     # Options: "local", "cloud", "auto"
+  
+  local:
+    base_url: "http://localhost:11434"
+    reasoning_model: "batiai/gemma4-26b:iq4"
+    vision_model: "batiai/gemma4-12b:q6"
+    chat_model: "gpt-oss:20b"
+    timeout_seconds: 60
+
+  cloud:
+    provider: "chutes"
+    base_url: "https://chutes.ai/v1"
+    api_key: "YOUR_CHUTES_API_KEY_HERE"
+    vision_model: "Qwen/Qwen2.5-VL-72B-Instruct"
+    reasoning_model: "deepseek-ai/DeepSeek-R1"
+    timeout_seconds: 90
+
+safety:
+  kill_switch_hotkey: "<ctrl>+<alt>+<esc>"
+  
+  # Confirmation Policy
+  confirm_level_1_ui: false        # Require confirmation before mouse clicks and typing
+  confirm_level_2_shell: true      # Require confirmation before running terminal commands
+  confirm_level_3_destructive: true # ALWAYS TRUE (Cannot be disabled)
+
+  storage:
+    allowlist_file: "~/.eidos/allowlist.json"
+    audit_log_file: "~/.eidos/audit.log"
+
+perception:
+  screen_scale_factor: 1.0         # 1.0 for native, 0.75 or 0.5 for faster LLM token processing
+  max_fps: 5
+  active_monitor_only: true
+
+ui:
+  hud_overlay_enabled: true
+  target_reticle_duration_ms: 250
+  status_pill:
+    enabled: true
+    position: "top-right"          # "top-right", "top-left", "bottom-right", "bottom-left"
+    opacity: 0.92
+
+integrations:
+  optimalx:
+    enabled: true
+    cdp_port: 9222
+    launch_command: "optimalx-desktop --remote-debugging-port=9222"
+  
+  cursor:
+    enabled: true
+    binary_path: "cursor"

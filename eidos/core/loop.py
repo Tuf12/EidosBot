@@ -1,0 +1,215 @@
+"""Core Sense -> Reason -> Confirm -> Act loop for EidosBot."""
+
+import json
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+from eidos.actions.mouse_keyboard import InputSimulator
+from eidos.actions.shell import ShellExecutor
+from eidos.core.context import EIDOS_TOOLS, build_system_prompt
+from eidos.models.base import ToolCall
+from eidos.models.ollama_client import OllamaClient
+from eidos.perception.screen import ScreenCapture
+from eidos.perception.window_info import WindowDetector
+from eidos.safety.allowlist import AllowlistManager
+from eidos.safety.audit import AuditLogger
+from eidos.safety.gatekeeper import Gatekeeper
+from eidos.safety.kill_switch import KillSwitch
+
+logger = logging.getLogger(__name__)
+
+
+class AgentLoop:
+    """Orchestrates perception, reasoning, safety gatekeeping, and action dispatch."""
+
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        kill_switch: Optional[KillSwitch] = None,
+        gatekeeper: Optional[Gatekeeper] = None,
+        model_client: Optional[OllamaClient] = None,
+    ):
+        self.config = config or {}
+        self.kill_switch = kill_switch or KillSwitch()
+        self.allowlist = AllowlistManager(
+            storage_path=self.config.get("safety", {}).get("storage", {}).get("allowlist_file")
+        )
+        self.audit = AuditLogger(
+            log_path=self.config.get("safety", {}).get("storage", {}).get("audit_log_file")
+        )
+        self.gatekeeper = gatekeeper or Gatekeeper(
+            allowlist=self.allowlist,
+            audit_logger=self.audit,
+            kill_switch=self.kill_switch,
+            confirm_level_1_ui=self.config.get("safety", {}).get("confirm_level_1_ui", False),
+            confirm_level_2_shell=self.config.get("safety", {}).get("confirm_level_2_shell", True),
+        )
+
+        local_cfg = self.config.get("models", {}).get("local", {})
+        self.model = model_client or OllamaClient(
+            base_url=local_cfg.get("base_url", "http://localhost:11434"),
+            reasoning_model=local_cfg.get("reasoning_model", "batiai/gemma4-26b:iq4"),
+            vision_model=local_cfg.get("vision_model", "batiai/gemma4-12b:q6"),
+            timeout=local_cfg.get("timeout_seconds", 60.0),
+        )
+
+        self.screen = ScreenCapture(
+            scale_factor=self.config.get("perception", {}).get("screen_scale_factor", 1.0)
+        )
+        self.windows = WindowDetector()
+        self.shell = ShellExecutor(gatekeeper=self.gatekeeper)
+        self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
+
+    def run_task(self, user_goal: str, max_steps: int = 15) -> Dict[str, Any]:
+        """Run autonomous agent loop until goal achieved or max_steps reached."""
+        logger.info("Starting EidosBot task: %s", user_goal)
+
+        if self.kill_switch.is_triggered():
+            return {
+                "success": False,
+                "summary": "Task aborted: Global kill switch is currently active. Reset kill switch before starting.",
+                "steps_taken": 0,
+            }
+
+        active_win = self.windows.get_active_window_info()
+        system_prompt = build_system_prompt(active_win, os.getcwd())
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"User Goal: {user_goal}"},
+        ]
+
+        step = 0
+        task_summary = ""
+
+        while step < max_steps:
+            step += 1
+            logger.info("=== Cycle Step %d / %d ===", step, max_steps)
+
+            # 1. Sense emergency kill switch
+            if self.kill_switch.is_triggered():
+                logger.warning("Agent loop stopped by kill switch at step %d", step)
+                return {
+                    "success": False,
+                    "summary": f"Aborted by emergency kill switch at step {step}.",
+                    "steps_taken": step,
+                }
+
+            # 2. Reason: Call model
+            response = self.model.chat(messages=messages, tools=EIDOS_TOOLS)
+
+            if response.thinking:
+                logger.info("[Thinking]: %s", response.thinking)
+
+            # Record assistant response
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content}
+            if response.has_tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id or f"call_{i}",
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments},
+                    }
+                    for i, tc in enumerate(response.tool_calls)
+                ]
+            messages.append(assistant_msg)
+
+            # 3. Check if done without tool calls
+            if not response.has_tool_calls:
+                if response.content:
+                    task_summary = response.content
+                break
+
+            # 4. Dispatch Tool Calls
+            task_finished = False
+            for tc in response.tool_calls:
+                tool_result, is_finish = self._dispatch_tool(tc)
+                if is_finish:
+                    task_summary = tool_result.get("summary", "Task completed.")
+                    task_finished = True
+
+                # Append tool result to conversation history
+                messages.append({
+                    "role": "tool",
+                    "content": json.dumps(tool_result),
+                    "name": tc.name,
+                })
+
+            if task_finished:
+                return {
+                    "success": True,
+                    "summary": task_summary,
+                    "steps_taken": step,
+                }
+
+            time.sleep(0.1)
+
+        return {
+            "success": bool(task_summary),
+            "summary": task_summary or f"Reached max steps limit ({max_steps}).",
+            "steps_taken": step,
+        }
+
+    def _dispatch_tool(self, tool_call: ToolCall) -> tuple[Dict[str, Any], bool]:
+        """Dispatch a single tool call to the action or perception engine."""
+        name = tool_call.name
+        args = tool_call.arguments
+        logger.info("Dispatching tool '%s' with args: %s", name, args)
+
+        if name == "finish_task":
+            return {"status": "completed", "summary": args.get("summary", "")}, True
+
+        if name == "execute_shell":
+            cmd = args.get("command", "")
+            res = self.shell.execute(cmd)
+            return res, False
+
+        if name == "get_active_window":
+            win_info = self.windows.get_active_window_info()
+            return win_info, False
+
+        if name == "take_screenshot":
+            try:
+                img = self.screen.capture()
+                b64 = ScreenCapture.to_base64(img, quality=75)
+                # Return resolution and base64 preview
+                return {
+                    "status": "success",
+                    "width": img.width,
+                    "height": img.height,
+                    "base64_preview": b64[:50] + "...",
+                }, False
+            except Exception as e:
+                return {"status": "error", "error": str(e)}, False
+
+        if name == "click":
+            x = int(args.get("x", 0))
+            y = int(args.get("y", 0))
+            button = args.get("button", "left")
+            res = self.inputs.click(x=x, y=y, button=button)
+            return res, False
+
+        if name == "double_click":
+            x = int(args.get("x", 0))
+            y = int(args.get("y", 0))
+            res = self.inputs.double_click(x=x, y=y)
+            return res, False
+
+        if name == "type_text":
+            text = args.get("text", "")
+            res = self.inputs.type_text(text)
+            return res, False
+
+        if name == "press_key":
+            key = args.get("key", "")
+            res = self.inputs.press_key(key)
+            return res, False
+
+        if name == "hotkey":
+            keys = args.get("keys", [])
+            res = self.inputs.hotkey(*keys)
+            return res, False
+
+        return {"error": f"Unknown tool name '{name}'"}, False
