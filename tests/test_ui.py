@@ -13,6 +13,7 @@ from eidos.ui.app import UIController
 from eidos.ui.dialogs import ConfirmationDialog
 from eidos.ui.hud import HUDOverlay
 from eidos.ui.pill import StatusPill
+from eidos.ui.settings_dialog import SettingsDialog
 
 # Ensure single QApplication per test session
 @pytest.fixture(scope="session")
@@ -125,3 +126,80 @@ def test_ui_controller_initialization(qapp):
 
         controller.hud.close()
         controller.pill.close()
+
+
+def test_settings_dialog_load_and_save(qapp):
+    with tempfile.NamedTemporaryFile(suffix=".yaml") as tmp_cfg:
+        initial_cfg = {
+            "models": {
+                "provider_preference": "auto",
+                "local": {
+                    "base_url": "http://localhost:11434",
+                    "reasoning_model": "test-reasoning",
+                    "vision_model": "test-vision"
+                },
+                "cloud": {
+                    "api_key": "initial_key",
+                    "base_url": "https://llm.chutes.ai/v1",
+                    "vision_model": "Qwen/Qwen3.5-397B-A17B-TEE",
+                    "reasoning_model": "moonshotai/Kimi-K2.6-TEE"
+                }
+            },
+            "safety": {
+                "confirm_level_1_ui": False,
+                "confirm_level_2_shell": True
+            },
+            "ui": {
+                "hud_overlay_enabled": True,
+                "target_reticle_duration_ms": 300,
+                "status_pill": {"position": "top-right"}
+            }
+        }
+
+        dialog = SettingsDialog(config=initial_cfg, config_path=tmp_cfg.name)
+
+        # Check loaded values
+        assert dialog.combo_preference.currentIndex() == 1  # auto
+        assert dialog.edit_chutes_key.text() == "initial_key"
+        assert dialog.combo_local_reasoning.currentText() == "test-reasoning"
+
+        # Toggle password visibility
+        assert dialog.edit_chutes_key.echoMode() == dialog.edit_chutes_key.EchoMode.Password
+        dialog._toggle_key_visibility()
+        assert dialog.edit_chutes_key.echoMode() == dialog.edit_chutes_key.EchoMode.Normal
+
+        # Modify values
+        dialog.edit_chutes_key.setText("new_secret_key")
+        dialog.combo_preference.setCurrentIndex(2)  # cloud
+        dialog.chk_confirm_ui.setChecked(True)
+
+        extracted = dialog.extract_config()
+        assert extracted["models"]["provider_preference"] == "cloud"
+        assert extracted["models"]["cloud"]["api_key"] == "new_secret_key"
+        assert extracted["safety"]["confirm_level_1_ui"] is True
+
+        # Save and verify signal
+        saved_holder = []
+        dialog.signal_settings_applied.connect(lambda c: saved_holder.append(c))
+        dialog._on_save_clicked()
+        assert len(saved_holder) == 1
+        assert saved_holder[0]["models"]["cloud"]["api_key"] == "new_secret_key"
+
+        dialog.close()
+
+
+def test_status_pill_menu_and_settings_buttons(qapp):
+    pill = StatusPill()
+    assert pill.btn_menu is not None
+    assert pill.btn_settings is not None
+    assert pill.btn_menu.text() == "☰"
+    assert pill.btn_settings.text() == "⚙️"
+
+    # Test signal emitted on settings click
+    signals_received = []
+    pill.signal_open_settings.connect(lambda: signals_received.append("settings"))
+    pill.btn_settings.click()
+    assert "settings" in signals_received
+
+    pill.close()
+

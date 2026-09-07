@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -38,6 +39,7 @@ class StatusPill(QWidget):
     signal_submit_task = pyqtSignal(str)      # user prompt
     signal_emergency_kill = pyqtSignal()
     signal_open_allowlist = pyqtSignal()
+    signal_open_settings = pyqtSignal()
     signal_reset_kill = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -82,6 +84,17 @@ class StatusPill(QWidget):
         top_bar = QHBoxLayout()
         top_bar.setSpacing(10)
 
+        # Menu Button (Dropdown for Settings, Allowlist, Kill)
+        self.btn_menu = QPushButton("☰")
+        self.btn_menu.setToolTip("Main Menu (Settings, Allowlist, Actions)")
+        self.btn_menu.setStyleSheet(
+            "QPushButton { background-color: #282a36; color: #8be9fd; font-weight: bold; "
+            "border: 1px solid #44475a; border-radius: 6px; padding: 4px 8px; font-size: 13px; } "
+            "QPushButton:hover { background-color: #44475a; color: #50fa7b; }"
+        )
+        self.btn_menu.clicked.connect(self._show_menu)
+        top_bar.addWidget(self.btn_menu)
+
         # Draggable Grab Indicator
         self.grab_icon = QLabel("⠿")
         self.grab_icon.setStyleSheet("color: #6272a4; font-size: 14px; font-weight: bold;")
@@ -108,6 +121,17 @@ class StatusPill(QWidget):
         )
         self.btn_allowlist.clicked.connect(self.signal_open_allowlist.emit)
         top_bar.addWidget(self.btn_allowlist)
+
+        # Settings Button
+        self.btn_settings = QPushButton("⚙️")
+        self.btn_settings.setToolTip("Open Settings (Models, API Keys, Safety)")
+        self.btn_settings.setStyleSheet(
+            "QPushButton { background-color: #282a36; border: 1px solid #6272a4; "
+            "border-radius: 6px; padding: 4px 8px; font-size: 12px; } "
+            "QPushButton:hover { background-color: #44475a; }"
+        )
+        self.btn_settings.clicked.connect(self.signal_open_settings.emit)
+        top_bar.addWidget(self.btn_settings)
 
         # Emergency Stop / Reset Button
         self.btn_kill = QPushButton("🛑 Stop")
@@ -178,6 +202,31 @@ class StatusPill(QWidget):
                 "background-color: #ff5555; color: white; font-weight: bold; "
                 "border-radius: 6px; padding: 4px 10px; font-size: 12px; border: none;"
             )
+
+    def _show_menu(self):
+        """Display dropdown menu from ☰ button."""
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background-color: #21222c; color: #f8f8f2; border: 1px solid #44475a; border-radius: 6px; padding: 4px; } "
+            "QMenu::item { padding: 6px 20px 6px 24px; border-radius: 4px; } "
+            "QMenu::item:selected { background-color: #44475a; color: #50fa7b; }"
+        )
+        action_settings = menu.addAction("⚙️  Settings (Models & API Keys)...")
+        action_allowlist = menu.addAction("🛡️  Shell Allowlist Manager...")
+        menu.addSeparator()
+        if self._current_state == "killed":
+            action_kill = menu.addAction("🔄  Reset Emergency Stop")
+        else:
+            action_kill = menu.addAction("🛑  Emergency Stop (Ctrl+Alt+Esc)")
+
+        # Position menu right below the button
+        action = menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height() + 4)))
+        if action == action_settings:
+            self.signal_open_settings.emit()
+        elif action == action_allowlist:
+            self.signal_open_allowlist.emit()
+        elif action == action_kill:
+            self._on_kill_or_reset()
 
     def _on_kill_or_reset(self):
         if self._current_state == "killed":

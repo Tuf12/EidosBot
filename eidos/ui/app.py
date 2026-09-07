@@ -16,6 +16,7 @@ from eidos.ui.allowlist_dialog import AllowlistManagerDialog
 from eidos.ui.dialogs import ConfirmationDialog
 from eidos.ui.hud import HUDOverlay
 from eidos.ui.pill import StatusPill
+from eidos.ui.settings_dialog import SettingsDialog
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class UIController(QObject):
         self.hud = HUDOverlay()
         self.pill = StatusPill()
         self.allowlist_dialog: Optional[AllowlistManagerDialog] = None
+        self.settings_dialog: Optional[SettingsDialog] = None
 
         self._agent_thread: Optional[threading.Thread] = None
         self._agent_loop: Optional[AgentLoop] = None
@@ -62,6 +64,7 @@ class UIController(QObject):
         self.pill.signal_emergency_kill.connect(self.trigger_emergency_kill)
         self.pill.signal_reset_kill.connect(self.reset_emergency_kill)
         self.pill.signal_open_allowlist.connect(self.open_allowlist_manager)
+        self.pill.signal_open_settings.connect(self.open_settings_dialog)
         self.pill.signal_submit_task.connect(self.start_task_in_background)
 
     def _register_kill_switch_callbacks(self):
@@ -105,6 +108,33 @@ class UIController(QObject):
         self.allowlist_dialog.show()
         self.allowlist_dialog.raise_()
         self.allowlist_dialog.activateWindow()
+
+    @pyqtSlot()
+    def open_settings_dialog(self):
+        """Open the Settings dialog."""
+        if self.settings_dialog is None:
+            self.settings_dialog = SettingsDialog(config=self.config)
+            self.settings_dialog.signal_settings_applied.connect(self.on_settings_applied)
+            self.settings_dialog.signal_open_allowlist.connect(self.open_allowlist_manager)
+        else:
+            self.settings_dialog.config = self.config
+            self.settings_dialog.load_from_config()
+
+        self.settings_dialog.show()
+        self.settings_dialog.raise_()
+        self.settings_dialog.activateWindow()
+
+    @pyqtSlot(dict)
+    def on_settings_applied(self, new_config: dict):
+        """Handle dynamic live update of system settings."""
+        self.config = new_config
+
+        # Update running AgentLoop
+        if self._agent_loop is not None:
+            self._agent_loop.update_config(new_config)
+
+        pref = new_config.get("models", {}).get("provider_preference", "local")
+        self.pill.set_status("idle", f"Settings updated (Mode: {pref})")
 
     def get_confirmation_callback(self):
         """

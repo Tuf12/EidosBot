@@ -81,6 +81,38 @@ class AgentLoop:
         self.shell = ShellExecutor(gatekeeper=self.gatekeeper)
         self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
 
+    def update_config(self, new_config: Dict[str, Any]):
+        """Dynamically apply updated configuration to active agent components."""
+        self.config = new_config
+
+        # Update local Ollama settings
+        local_cfg = new_config.get("models", {}).get("local", {})
+        if local_cfg:
+            self.ollama.base_url = local_cfg.get("base_url", self.ollama.base_url).rstrip("/")
+            self.ollama.reasoning_model = local_cfg.get("reasoning_model", self.ollama.reasoning_model)
+            self.ollama.vision_model = local_cfg.get("vision_model", self.ollama.vision_model)
+
+        # Update cloud Chutes settings
+        cloud_cfg = new_config.get("models", {}).get("cloud", {})
+        if cloud_cfg:
+            self.chutes.api_key = cloud_cfg.get("api_key", self.chutes.api_key)
+            self.chutes.base_url = cloud_cfg.get("base_url", self.chutes.base_url).rstrip("/")
+            self.chutes.vision_model = cloud_cfg.get("vision_model", self.chutes.vision_model)
+            self.chutes.reasoning_model = cloud_cfg.get("reasoning_model", self.chutes.reasoning_model)
+
+        # Update Router preference
+        pref = new_config.get("models", {}).get("provider_preference")
+        if pref:
+            self.router.set_preference(pref)
+
+        # Update Safety policy
+        safety_cfg = new_config.get("safety", {})
+        if safety_cfg:
+            self.gatekeeper.confirm_level_1_ui = safety_cfg.get("confirm_level_1_ui", self.gatekeeper.confirm_level_1_ui)
+            self.gatekeeper.confirm_level_2_shell = safety_cfg.get("confirm_level_2_shell", self.gatekeeper.confirm_level_2_shell)
+
+        logger.info("AgentLoop successfully reconfigured with updated settings.")
+
     def run_task(self, user_goal: str, max_steps: int = 15) -> Dict[str, Any]:
         """Run autonomous agent loop until goal achieved or max_steps reached."""
         logger.info("Starting EidosBot task: %s", user_goal)
