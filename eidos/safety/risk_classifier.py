@@ -63,17 +63,30 @@ class RiskClassifier:
         """Classify an action and return (RiskLevel, explanation)."""
         action_type = action_type.lower().strip()
 
-        if action_type in ("screenshot", "get_window_info", "read_clipboard", "read_file", "list_directory"):
-            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection action"
+        if action_type in (
+            "screenshot", "take_screenshot", "get_window_info", "get_active_window",
+            "read_clipboard", "read_file", "list_directory",
+            "web_search", "web_fetch"
+        ):
+            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection or web research action"
 
-        if action_type in ("click", "double_click", "move_mouse", "scroll", "type_text", "hotkey", "drag"):
-            return RiskLevel.LEVEL_1_UI, "Desktop UI interaction"
+        if action_type in (
+            "click", "double_click", "move_mouse", "scroll", "type_text",
+            "hotkey", "drag", "click_element", "cursor_action"
+        ):
+            return RiskLevel.LEVEL_1_UI, "Desktop UI interaction or editor navigation"
 
-        if action_type in ("shell", "bash", "execute_command", "run_script"):
+        if action_type == "optimalx_action":
+            sub_action = details.get("action", "").lower()
+            if sub_action in ("get_status", "get_llm_status", "focus", "query_dom"):
+                return RiskLevel.LEVEL_0_PASSIVE, "OptimalX read-only query"
+            return RiskLevel.LEVEL_1_UI, f"OptimalX action: {sub_action}"
+
+        if action_type in ("shell", "bash", "execute_command", "run_script", "execute_shell"):
             command = details.get("command", "").strip()
             return RiskClassifier.classify_shell_command(command)
 
-        if action_type in ("write_file", "delete_file", "append_file"):
+        if action_type in ("write_file", "delete_file", "append_file", "download_file"):
             if action_type == "delete_file":
                 return RiskLevel.LEVEL_3_DESTRUCTIVE, "File deletion request"
             return RiskLevel.LEVEL_2_SHELL, "Filesystem modification"

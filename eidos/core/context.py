@@ -150,6 +150,112 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "optimalx_action",
+            "description": "Interact directly with OptimalX Desktop 1.0 Electron application via local API or Chrome DevTools Protocol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get_status", "get_llm_status", "focus", "query_dom", "click_dom", "evaluate_js"],
+                        "description": "Action to perform on OptimalX Desktop."
+                    },
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector when using query_dom or click_dom."
+                    },
+                    "expression": {
+                        "type": "string",
+                        "description": "JavaScript expression when using evaluate_js."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cursor_action",
+            "description": "Automate Cursor IDE (open file at line/col, open workspace, trigger Command Palette, open diff).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["open_file", "open_workspace", "open_diff", "command_palette", "focus"],
+                        "description": "Action to perform in Cursor IDE."
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Target file or workspace path."
+                    },
+                    "line": {
+                        "type": "integer",
+                        "description": "Line number to jump to."
+                    },
+                    "col": {
+                        "type": "integer",
+                        "description": "Column number to jump to."
+                    },
+                    "command_name": {
+                        "type": "string",
+                        "description": "Name of command to run in Cursor Command Palette (e.g. 'View: Toggle Terminal')."
+                    },
+                    "file_b": {
+                        "type": "string",
+                        "description": "Second file path when action is open_diff."
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the live web using Brave / DuckDuckGo search. Returns relevant titles, URLs, and snippets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of results to return (default: 5)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Fetch a webpage URL and extract clean, readable text content for research and analysis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL of webpage to fetch."
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters of text content to extract (default: 8000)."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_task",
             "description": "Signal that the user's task goal has been completed or cannot be completed further.",
             "parameters": {

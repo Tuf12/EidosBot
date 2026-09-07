@@ -9,6 +9,9 @@ from typing import Any, Dict, List, Optional
 from eidos.actions.mouse_keyboard import InputSimulator
 from eidos.actions.shell import ShellExecutor
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
+from eidos.integrations.cursor_ide import CursorAdapter
+from eidos.integrations.optimalx import OptimalXBridge
+from eidos.integrations.web_research import WebResearchEngine
 from eidos.models.base import BaseModelClient, ToolCall
 from eidos.models.chutes_client import ChutesClient
 from eidos.models.ollama_client import OllamaClient
@@ -80,6 +83,20 @@ class AgentLoop:
         self.grounder = VisualGrounder(model_router=self.router)
         self.shell = ShellExecutor(gatekeeper=self.gatekeeper)
         self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
+
+        # Integrations
+        opt_cfg = self.config.get("integrations", {}).get("optimalx", {})
+        cur_cfg = self.config.get("integrations", {}).get("cursor", {})
+        self.optimalx = OptimalXBridge(
+            cdp_port=opt_cfg.get("cdp_port", 9222),
+            window_detector=self.windows
+        )
+        self.cursor = CursorAdapter(
+            binary_path=cur_cfg.get("binary_path", "cursor"),
+            window_detector=self.windows,
+            input_simulator=self.inputs
+        )
+        self.web = WebResearchEngine(model_router=self.router)
 
     def update_config(self, new_config: Dict[str, Any]):
         """Dynamically apply updated configuration to active agent components."""
@@ -250,6 +267,74 @@ class AgentLoop:
                     return {"success": False, "error": f"Visual grounder could not locate: '{desc}'"}, False
             except Exception as e:
                 return {"success": False, "error": f"Visual grounding exception: {str(e)}"}, False
+
+        if name == "optimalx_action":
+            action = args.get("action", "").lower()
+            allowed, reason = self.gatekeeper.evaluate("optimalx_action", {"action": action, **args})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            if action == "get_status":
+                return self.optimalx.get_sync_status(), False
+            elif action == "get_llm_status":
+                return self.optimalx.get_llm_status(), False
+            elif action == "focus":
+                return {"focused": self.optimalx.focus_window()}, False
+            elif action == "query_dom":
+                selector = args.get("selector", "")
+                return self.optimalx.query_dom_element(selector), False
+            elif action == "click_dom":
+                selector = args.get("selector", "")
+                return self.optimalx.click_dom_element(selector), False
+            elif action == "evaluate_js":
+                expr = args.get("expression", "")
+                return self.optimalx.evaluate_js_sync(expr), False
+            else:
+                return {"error": f"Unknown optimalx action: '{action}'"}, False
+
+        if name == "cursor_action":
+            action = args.get("action", "").lower()
+            allowed, reason = self.gatekeeper.evaluate("cursor_action", {"action": action, **args})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            if action == "open_file":
+                fp = args.get("file_path", "")
+                line = args.get("line")
+                col = args.get("col")
+                return self.cursor.open_file(fp, line=line, col=col), False
+            elif action == "open_workspace":
+                fp = args.get("file_path", "")
+                return self.cursor.open_workspace(fp), False
+            elif action == "open_diff":
+                fa = args.get("file_path", "")
+                fb = args.get("file_b", "")
+                return self.cursor.open_diff(fa, fb), False
+            elif action == "command_palette":
+                cmd_name = args.get("command_name", "")
+                return self.cursor.execute_command_palette(cmd_name), False
+            elif action == "focus":
+                return {"focused": self.cursor.focus_window()}, False
+            else:
+                return {"error": f"Unknown cursor action: '{action}'"}, False
+
+        if name == "web_search":
+            query = args.get("query", "")
+            count = int(args.get("count", 5))
+            allowed, reason = self.gatekeeper.evaluate("web_search", {"query": query, "count": count})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            results = self.web.search(query, count=count)
+            return {"query": query, "count": len(results), "results": results}, False
+
+        if name == "web_fetch":
+            url = args.get("url", "")
+            max_chars = int(args.get("max_chars", 8000))
+            allowed, reason = self.gatekeeper.evaluate("web_fetch", {"url": url, "max_chars": max_chars})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.web.fetch_webpage(url, max_chars=max_chars)
+            return res, False
 
         if name == "click":
             x = int(args.get("x", 0))

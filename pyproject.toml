@@ -20,7 +20,8 @@ dependencies = [
     "Pillow>=10.2.0",
     "PyQt6>=6.6.0",
     "websockets>=12.0",
-    "playwright>=1.42.0"
+    "playwright>=1.42.0",
+    "beautifulsoup4>=4.12.0"
 ]
 
 [project.scripts]

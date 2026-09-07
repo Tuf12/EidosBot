@@ -18,6 +18,7 @@ PyQt6>=6.6.0
 # Integrations & CDP
 websockets>=12.0
 playwright>=1.42.0
+beautifulsoup4>=4.12.0
 
 # Testing
 pytest>=8.0.0
