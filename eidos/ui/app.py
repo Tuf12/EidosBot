@@ -56,6 +56,11 @@ class UIController(QObject):
         self._connect_signals()
         self._register_kill_switch_callbacks()
 
+        # Prevent Qt from quitting when modal dialogs (Settings, Allowlist, Confirmations) close
+        app = QApplication.instance()
+        if app is not None:
+            app.setQuitOnLastWindowClosed(False)
+
     def _connect_signals(self):
         # Confirmation signal handling on main Qt thread
         self.signal_prompt_confirmation.connect(self._show_confirmation_dialog)
@@ -65,6 +70,7 @@ class UIController(QObject):
         self.pill.signal_reset_kill.connect(self.reset_emergency_kill)
         self.pill.signal_open_allowlist.connect(self.open_allowlist_manager)
         self.pill.signal_open_settings.connect(self.open_settings_dialog)
+        self.pill.signal_quit_app.connect(self.quit_application)
         self.pill.signal_submit_task.connect(self.start_task_in_background)
 
     def _register_kill_switch_callbacks(self):
@@ -135,6 +141,15 @@ class UIController(QObject):
 
         pref = new_config.get("models", {}).get("provider_preference", "local")
         self.pill.set_status("idle", f"Settings updated (Mode: {pref})")
+
+    @pyqtSlot()
+    def quit_application(self):
+        """Cleanly exit EidosBot."""
+        logger.info("Exiting EidosBot from GUI menu...")
+        self.kill_switch.stop()
+        app = QApplication.instance()
+        if app:
+            app.quit()
 
     def get_confirmation_callback(self):
         """

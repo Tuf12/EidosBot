@@ -203,3 +203,28 @@ def test_status_pill_menu_and_settings_buttons(qapp):
 
     pill.close()
 
+
+def test_quit_on_last_window_closed_is_disabled(qapp):
+    controller = UIController()
+    assert qapp.quitOnLastWindowClosed() is False
+
+    controller.show()
+    assert controller.pill.isVisible()
+
+    # Open and close settings dialog
+    controller.open_settings_dialog()
+    assert controller.settings_dialog is not None
+    assert controller.settings_dialog.isVisible()
+
+    # Close settings dialog
+    controller.settings_dialog.close()
+    assert not controller.settings_dialog.isVisible()
+
+    # Verify status pill is still alive and visible
+    assert controller.pill.isVisible()
+
+    controller.hide()
+    controller.hud.close()
+    controller.pill.close()
+
+

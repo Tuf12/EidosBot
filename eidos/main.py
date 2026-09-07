@@ -51,6 +51,8 @@ def run_gui_mode(cfg: dict, kill_switch: KillSwitch):
     if app is None:
         app = QApplication(sys.argv)
     app.setApplicationName("EidosBot")
+    # Prevent Qt from terminating the app when floating dialogs (Settings, Allowlist) close
+    app.setQuitOnLastWindowClosed(False)
 
     # Allow Python signal handling (e.g. Ctrl+C in terminal)
     signal.signal(signal.SIGINT, signal.SIG_DFL)

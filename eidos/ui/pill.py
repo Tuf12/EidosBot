@@ -41,6 +41,7 @@ class StatusPill(QWidget):
     signal_open_allowlist = pyqtSignal()
     signal_open_settings = pyqtSignal()
     signal_reset_kill = pyqtSignal()
+    signal_quit_app = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -218,6 +219,8 @@ class StatusPill(QWidget):
             action_kill = menu.addAction("🔄  Reset Emergency Stop")
         else:
             action_kill = menu.addAction("🛑  Emergency Stop (Ctrl+Alt+Esc)")
+        menu.addSeparator()
+        action_quit = menu.addAction("❌  Quit EidosBot")
 
         # Position menu right below the button
         action = menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height() + 4)))
@@ -227,6 +230,8 @@ class StatusPill(QWidget):
             self.signal_open_allowlist.emit()
         elif action == action_kill:
             self._on_kill_or_reset()
+        elif action == action_quit:
+            self.signal_quit_app.emit()
 
     def _on_kill_or_reset(self):
         if self._current_state == "killed":
