@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
+import time
 import urllib.parse
 
 from bs4 import BeautifulSoup
@@ -228,27 +229,77 @@ class WebResearchEngine:
             "sources": [r["url"] for r in search_results],
         }
 
-    def download_file(self, url: str, destination_path: str) -> Dict[str, Any]:
-        """Download file (e.g. PDF, image, dataset) to disk."""
-        dest = Path(os.path.abspath(os.path.expanduser(destination_path)))
-        dest.parent.mkdir(parents=True, exist_ok=True)
+    def download_file(
+        self,
+        url: str,
+        destination_path: Optional[str] = None,
+        filename: Optional[str] = None,
+        timeout: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Download file (e.g. PDF, patent, dataset, image) to disk."""
+        default_dir = os.path.abspath(os.path.expanduser("~/EidosWorkspace/downloads"))
+        target_dest = destination_path or default_dir
+        dest_path = Path(os.path.abspath(os.path.expanduser(target_dest)))
+
+        # Determine target file destination
+        if dest_path.is_dir() or str(target_dest).endswith(("/", "\\")) or filename or not dest_path.suffix:
+            dest_dir = dest_path if (dest_path.is_dir() or str(target_dest).endswith(("/", "\\")) or not dest_path.suffix) else dest_path.parent
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            if not filename:
+                parsed = urllib.parse.urlparse(url)
+                name = os.path.basename(parsed.path)
+                if not name or "." not in name:
+                    name = f"download_{int(time.time())}.bin"
+                final_filename = name
+            else:
+                final_filename = filename
+            final_file = dest_dir / final_filename
+        else:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            final_file = dest_path
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36 EidosBot/1.0"
+            ),
+            "Accept": "*/*",
+        }
 
         try:
-            resp = requests.get(url, stream=True, timeout=20.0)
+            resp = requests.get(url, headers=headers, stream=True, timeout=timeout)
             resp.raise_for_status()
 
+            # If filename was derived and content-disposition header contains a better filename, use it
+            content_disp = resp.headers.get("content-disposition", "")
+            if "filename=" in content_disp and not filename:
+                extracted = re.findall(r'filename=["\']?([^"\';]+)["\']?', content_disp)
+                if extracted:
+                    clean_extracted = os.path.basename(extracted[0].strip())
+                    if clean_extracted:
+                        final_file = final_file.parent / clean_extracted
+
             total_bytes = 0
-            with open(dest, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
+            with open(final_file, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=16384):
                     if chunk:
                         f.write(chunk)
                         total_bytes += len(chunk)
 
+            size_kb = round(total_bytes / 1024, 2)
+            size_mb = round(total_bytes / (1024 * 1024), 2)
+            size_str = f"{size_mb} MB" if size_mb >= 1.0 else f"{size_kb} KB"
+            content_type = resp.headers.get("content-type", "application/octet-stream")
+
             return {
                 "success": True,
-                "path": str(dest),
+                "path": str(final_file),
+                "filename": final_file.name,
                 "bytes_downloaded": total_bytes,
+                "size": size_str,
+                "content_type": content_type,
                 "url": url,
             }
         except Exception as e:
+            logger.warning("Failed to download file from %s: %s", url, e)
             return {"success": False, "error": str(e), "url": url}

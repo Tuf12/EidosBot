@@ -120,9 +120,12 @@ class AllowlistManagerDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+        from eidos.ui.styles import GLOBAL_TOOLTIP_STYLE
+
         self.setStyleSheet(
             "QDialog { background-color: #282a36; color: #f8f8f2; } "
-            "QPushButton:hover { opacity: 0.85; }"
+            "QPushButton:hover { opacity: 0.85; }\n"
+            f"{GLOBAL_TOOLTIP_STYLE}"
         )
 
     def refresh_table(self):

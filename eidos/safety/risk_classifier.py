@@ -1,6 +1,7 @@
 """Risk classification for EidosBot actions."""
 
 from enum import IntEnum
+import os
 import re
 import shlex
 from typing import List, Optional, Tuple
@@ -64,17 +65,32 @@ class RiskClassifier:
         action_type = action_type.lower().strip()
 
         if action_type in (
-            "screenshot", "take_screenshot", "get_window_info", "get_active_window",
-            "read_clipboard", "read_file", "list_directory",
-            "web_search", "web_fetch"
+            "update_user_profile",
+            "add_workflow_rule",
+            "remove_workflow_rule",
+            "remove_user_fact",
         ):
-            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection or web research action"
+            return RiskLevel.LEVEL_1_UI, "Update local user profile memory"
+
+        if action_type in (
+            "screenshot", "take_screenshot", "get_window_info", "get_active_window",
+            "get_current_time",
+            "read_clipboard", "read_file", "list_directory",
+            "web_search", "web_fetch", "speak", "speak_aloud",
+            "browser_open", "browser_extract", "browser_screenshot", "browser_close",
+            "list_skills", "load_skill", "get_job_status",
+        ):
+            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection, vocal feedback, or web research action"
 
         if action_type in (
             "click", "double_click", "move_mouse", "scroll", "type_text",
-            "hotkey", "drag", "click_element", "cursor_action"
+            "hotkey", "drag", "click_element",
+            "browser_click", "browser_type", "browser_evaluate",
+            "create_skill", "update_skill",
+            "init_batch_job", "step_batch_job", "pause_batch_job", "resume_batch_job",
+            "open_in_browser",
         ):
-            return RiskLevel.LEVEL_1_UI, "Desktop UI interaction or editor navigation"
+            return RiskLevel.LEVEL_1_UI, "Desktop UI interaction, skill modification, batch queue control, or browser launch"
 
         if action_type == "optimalx_action":
             sub_action = details.get("action", "").lower()
@@ -89,6 +105,13 @@ class RiskClassifier:
         if action_type in ("write_file", "delete_file", "append_file", "download_file"):
             if action_type == "delete_file":
                 return RiskLevel.LEVEL_3_DESTRUCTIVE, "File deletion request"
+            if action_type == "download_file":
+                dest = details.get("destination_path") or details.get("destination_dir") or ""
+                dest_abs = os.path.abspath(os.path.expanduser(dest)) if dest else ""
+                workspace_abs = os.path.abspath(os.path.expanduser("~/EidosWorkspace"))
+                if not dest_abs or dest_abs.startswith(workspace_abs) or "/Downloads" in dest_abs:
+                    return RiskLevel.LEVEL_0_PASSIVE, "Download file into user workspace"
+                return RiskLevel.LEVEL_1_UI, f"Download file to {dest}"
             return RiskLevel.LEVEL_2_SHELL, "Filesystem modification"
 
         # Default fallback: treat unknown actions as Level 2

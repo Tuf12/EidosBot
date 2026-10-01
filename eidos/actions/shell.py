@@ -1,4 +1,4 @@
-"""Safe shell command execution engine with gatekeeper integration."""
+"""Safe shell command execution engine with gatekeeper integration and kernel sandboxing."""
 
 import logging
 import os
@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, Optional
 
 from eidos.safety.gatekeeper import Gatekeeper
+from eidos.sandbox.bwrap import BubblewrapSandbox
 
 logger = logging.getLogger(__name__)
 
@@ -14,24 +15,260 @@ logger = logging.getLogger(__name__)
 class ShellExecutor:
     """Executes shell commands with safety checks, timeout control, and kill switch awareness."""
 
-    def __init__(self, gatekeeper: Optional[Gatekeeper] = None, default_timeout: float = 30.0):
+    def __init__(
+        self,
+        gatekeeper: Optional[Gatekeeper] = None,
+        default_timeout: float = 30.0,
+        sandbox: Optional[BubblewrapSandbox] = None,
+        sandbox_config: Optional[Dict[str, Any]] = None,
+    ):
         self.gatekeeper = gatekeeper or Gatekeeper()
         self.default_timeout = default_timeout
+        self.sandbox: Optional[BubblewrapSandbox] = None
+        self.sandbox_enabled: bool = False
+        self._init_sandbox(sandbox, sandbox_config)
+
+    def _init_sandbox(
+        self,
+        sandbox: Optional[BubblewrapSandbox] = None,
+        sandbox_config: Optional[Dict[str, Any]] = None,
+    ):
+        if sandbox is not None:
+            self.sandbox = sandbox
+            self.sandbox_enabled = True
+            return
+
+        cfg = sandbox_config or {}
+        self.default_workspace = os.path.abspath(
+            os.path.expanduser(cfg.get("default_workspace", "~/EidosWorkspace"))
+        )
+        self.sandbox_enabled = bool(cfg.get("enabled", False))
+        if self.sandbox_enabled:
+            if BubblewrapSandbox.is_available():
+                self.sandbox = BubblewrapSandbox(
+                    workspace_dir=cfg.get("default_workspace", "~/EidosWorkspace"),
+                    allow_network=cfg.get("network_access", True),
+                    extra_writable=cfg.get("writable_paths"),
+                    allow_dev_gpu=cfg.get("allow_dev_gpu", True),
+                )
+            else:
+                logger.warning("Sandbox enabled in configuration but bwrap is not available. Disabling sandbox.")
+                self.sandbox = None
+                self.sandbox_enabled = False
+        else:
+            self.sandbox = None
+
+    def configure_sandbox(self, sandbox_config: Dict[str, Any]):
+        """Dynamically update sandbox configuration."""
+        self._init_sandbox(None, sandbox_config)
+
+    @staticmethod
+    def _is_background_command(command: str) -> bool:
+        """Return True when a shell command intentionally detaches into the background."""
+        stripped = command.strip()
+        if not stripped.endswith("&"):
+            return False
+        if stripped.endswith("&&") or stripped.endswith("&>"):
+            return False
+        return True
 
     def execute(
         self,
         command: str,
         cwd: Optional[str] = None,
-        timeout: Optional[float] = None
+        timeout: Optional[float] = None,
+        sandboxed: bool = True,
     ) -> Dict[str, Any]:
         """
-        Execute a shell command safely after passing through the Gatekeeper.
+        Execute a shell command safely.
+
+        If sandboxed=True and sandbox is enabled in configuration, execution
+        is isolated via Bubblewrap (root and home read-only, workspace read-write),
+        auto-allowed without prompt fatigue, and logged to audit log.
+        Otherwise, execution requires Gatekeeper policy evaluation.
         """
         cmd_clean = command.strip()
-        work_dir = os.path.abspath(cwd) if cwd else os.getcwd()
         timeout_val = timeout if timeout is not None else self.default_timeout
 
-        # Step 1: Gatekeeper safety evaluation
+        use_sandbox = sandboxed and self.sandbox_enabled and (self.sandbox is not None)
+
+        if use_sandbox:
+            work_dir = os.path.abspath(cwd) if cwd else self.sandbox.workspace_dir
+
+            # Step 1: Kill switch check
+            if self.gatekeeper.kill_switch.is_triggered():
+                self.gatekeeper.audit.log(
+                    "shell",
+                    {"command": cmd_clean, "cwd": work_dir, "sandboxed": True},
+                    3,
+                    "killed",
+                    "Kill switch is active",
+                )
+                return {
+                    "success": False,
+                    "denied": False,
+                    "error": "Action aborted: Global kill switch is active.",
+                    "stdout": "",
+                    "stderr": "Aborted by kill switch",
+                    "exit_code": -9,
+                    "duration_ms": 0.0,
+                    "command": cmd_clean,
+                    "sandboxed": True,
+                }
+
+            # Step 2: Auto-allow and log to audit logger
+            self.gatekeeper.audit.log(
+                "shell",
+                {"command": cmd_clean, "cwd": work_dir, "sandboxed": True},
+                0,
+                "auto_allowed",
+                "Kernel sandboxed workspace execution (bwrap)",
+            )
+
+            start_time = time.time()
+            try:
+                bwrap_cmd = self.sandbox.build_command(cmd_clean, cwd=work_dir)
+            except Exception as e:
+                return {
+                    "success": False,
+                    "denied": False,
+                    "error": f"Failed to build sandbox command: {str(e)}",
+                    "stdout": "",
+                    "stderr": str(e),
+                    "exit_code": -1,
+                    "duration_ms": 0.0,
+                    "command": cmd_clean,
+                    "sandboxed": True,
+                }
+
+            if self._is_background_command(cmd_clean):
+                try:
+                    process = subprocess.Popen(
+                        bwrap_cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    duration_ms = (time.time() - start_time) * 1000
+                    return {
+                        "success": True,
+                        "denied": False,
+                        "error": "",
+                        "stdout": f"Started background process in sandbox (pid {process.pid})",
+                        "stderr": "",
+                        "exit_code": 0,
+                        "duration_ms": round(duration_ms, 2),
+                        "command": cmd_clean,
+                        "background": True,
+                        "pid": process.pid,
+                        "sandboxed": True,
+                    }
+                except Exception as e:
+                    duration_ms = (time.time() - start_time) * 1000
+                    return {
+                        "success": False,
+                        "denied": False,
+                        "error": f"Failed to start background process in sandbox: {str(e)}",
+                        "stdout": "",
+                        "stderr": str(e),
+                        "exit_code": -1,
+                        "duration_ms": round(duration_ms, 2),
+                        "command": cmd_clean,
+                        "sandboxed": True,
+                    }
+
+            process = None
+            try:
+                process = subprocess.Popen(
+                    bwrap_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+                poll_interval = 0.05
+                elapsed = 0.0
+                while elapsed < timeout_val:
+                    ret = process.poll()
+                    if ret is not None:
+                        break
+
+                    if self.gatekeeper.kill_switch.is_triggered():
+                        process.kill()
+                        process.wait()
+                        duration_ms = (time.time() - start_time) * 1000
+                        return {
+                            "success": False,
+                            "denied": False,
+                            "error": "Process killed: Emergency kill switch activated during execution.",
+                            "stdout": "",
+                            "stderr": "Aborted by kill switch",
+                            "exit_code": -9,
+                            "duration_ms": duration_ms,
+                            "command": cmd_clean,
+                            "sandboxed": True,
+                        }
+
+                    time.sleep(poll_interval)
+                    elapsed = time.time() - start_time
+
+                if process.poll() is None:
+                    process.kill()
+                    stdout, stderr = process.communicate()
+                    duration_ms = (time.time() - start_time) * 1000
+                    return {
+                        "success": False,
+                        "denied": False,
+                        "error": f"Command timed out after {timeout_val} seconds.",
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "exit_code": -1,
+                        "duration_ms": duration_ms,
+                        "command": cmd_clean,
+                        "sandboxed": True,
+                    }
+
+                stdout, stderr = process.communicate()
+                duration_ms = (time.time() - start_time) * 1000
+                return {
+                    "success": (process.returncode == 0),
+                    "denied": False,
+                    "error": stderr.strip() if process.returncode != 0 else "",
+                    "stdout": stdout.strip(),
+                    "stderr": stderr.strip(),
+                    "exit_code": process.returncode,
+                    "duration_ms": round(duration_ms, 2),
+                    "command": cmd_clean,
+                    "sandboxed": True,
+                }
+
+            except Exception as e:
+                duration_ms = (time.time() - start_time) * 1000
+                if process and process.poll() is None:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                return {
+                    "success": False,
+                    "denied": False,
+                    "error": f"Subprocess exception: {str(e)}",
+                    "stdout": "",
+                    "stderr": str(e),
+                    "exit_code": -1,
+                    "duration_ms": round(duration_ms, 2),
+                    "command": cmd_clean,
+                    "sandboxed": True,
+                }
+
+        # Step 1: Gatekeeper safety evaluation (Mode B: Host privilege mode)
+        work_dir = os.path.abspath(cwd) if cwd else (self.sandbox.workspace_dir if self.sandbox else self.default_workspace)
+        if not os.path.exists(work_dir):
+            try:
+                os.makedirs(work_dir, exist_ok=True)
+            except Exception:
+                work_dir = os.getcwd()
         details = {"command": cmd_clean, "cwd": work_dir}
         allowed, reason = self.gatekeeper.evaluate("shell", details)
         if not allowed:
@@ -44,11 +281,53 @@ class ShellExecutor:
                 "stderr": "",
                 "exit_code": -1,
                 "duration_ms": 0.0,
-                "command": cmd_clean
+                "command": cmd_clean,
+                "sandboxed": False,
             }
 
-        # Step 2: Execute command with process tracking
+        # Step 2: Execute command with process tracking on host
         start_time = time.time()
+
+        if self._is_background_command(cmd_clean):
+            try:
+                process = subprocess.Popen(
+                    cmd_clean,
+                    shell=True,
+                    cwd=work_dir,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
+                    start_new_session=True,
+                    executable="/bin/bash",
+                )
+                duration_ms = (time.time() - start_time) * 1000
+                return {
+                    "success": True,
+                    "denied": False,
+                    "error": "",
+                    "stdout": f"Started background process (pid {process.pid})",
+                    "stderr": "",
+                    "exit_code": 0,
+                    "duration_ms": round(duration_ms, 2),
+                    "command": cmd_clean,
+                    "background": True,
+                    "pid": process.pid,
+                    "sandboxed": False,
+                }
+            except Exception as e:
+                duration_ms = (time.time() - start_time) * 1000
+                return {
+                    "success": False,
+                    "denied": False,
+                    "error": f"Failed to start background process: {str(e)}",
+                    "stdout": "",
+                    "stderr": str(e),
+                    "exit_code": -1,
+                    "duration_ms": round(duration_ms, 2),
+                    "command": cmd_clean,
+                    "sandboxed": False,
+                }
+
         process = None
         try:
             process = subprocess.Popen(
@@ -58,7 +337,7 @@ class ShellExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                executable="/bin/bash"
+                executable="/bin/bash",
             )
 
             # Poll for completion or kill switch
@@ -82,7 +361,8 @@ class ShellExecutor:
                         "stderr": "Aborted by kill switch",
                         "exit_code": -9,
                         "duration_ms": duration_ms,
-                        "command": cmd_clean
+                        "command": cmd_clean,
+                        "sandboxed": False,
                     }
 
                 time.sleep(poll_interval)
@@ -101,7 +381,8 @@ class ShellExecutor:
                     "stderr": stderr,
                     "exit_code": -1,
                     "duration_ms": duration_ms,
-                    "command": cmd_clean
+                    "command": cmd_clean,
+                    "sandboxed": False,
                 }
 
             stdout, stderr = process.communicate()
@@ -114,7 +395,8 @@ class ShellExecutor:
                 "stderr": stderr.strip(),
                 "exit_code": process.returncode,
                 "duration_ms": round(duration_ms, 2),
-                "command": cmd_clean
+                "command": cmd_clean,
+                "sandboxed": False,
             }
 
         except Exception as e:
@@ -132,5 +414,6 @@ class ShellExecutor:
                 "stderr": str(e),
                 "exit_code": -1,
                 "duration_ms": round(duration_ms, 2),
-                "command": cmd_clean
+                "command": cmd_clean,
+                "sandboxed": False,
             }

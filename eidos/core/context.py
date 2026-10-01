@@ -1,7 +1,9 @@
 """Context management and tool definitions for EidosBot."""
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+from eidos.core.clock import EidosClock
 
 EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
@@ -14,10 +16,25 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The exact shell command to run (e.g. 'ls -la', 'git status', 'python3 -m unittest')."
+                        "description": "The exact shell command to run (e.g. 'ls -la', 'df -h', 'curl -sI https://example.com')."
+                    },
+                    "sandboxed": {
+                        "type": "boolean",
+                        "description": "Whether to execute inside the kernel sandbox (root & home read-only, workspace read-write). Defaults to true. Set to false only when host system changes or installs are explicitly required."
                     }
                 },
                 "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current local date and time from EidosBot's internal clock (no shell command needed).",
+            "parameters": {
+                "type": "object",
+                "properties": {}
             }
         }
     },
@@ -176,44 +193,6 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "cursor_action",
-            "description": "Automate Cursor IDE (open file at line/col, open workspace, trigger Command Palette, open diff).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["open_file", "open_workspace", "open_diff", "command_palette", "focus"],
-                        "description": "Action to perform in Cursor IDE."
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Target file or workspace path."
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "Line number to jump to."
-                    },
-                    "col": {
-                        "type": "integer",
-                        "description": "Column number to jump to."
-                    },
-                    "command_name": {
-                        "type": "string",
-                        "description": "Name of command to run in Cursor Command Palette (e.g. 'View: Toggle Terminal')."
-                    },
-                    "file_b": {
-                        "type": "string",
-                        "description": "Second file path when action is open_diff."
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "web_search",
             "description": "Search the live web using Brave / DuckDuckGo search. Returns relevant titles, URLs, and snippets.",
             "parameters": {
@@ -256,6 +235,444 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "browser_open",
+            "description": "Launch headless Chromium (or reuse active session) and navigate to the target URL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Target webpage URL to open."
+                    },
+                    "headless": {
+                        "type": "boolean",
+                        "description": "Whether to run browser in headless background mode (default: true)."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_extract",
+            "description": "Extract dense, readable Markdown content from the active browser page or specific CSS selector using trafilatura.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "Optional CSS selector to extract only a specific element or container."
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum length of extracted Markdown content (default: 8000)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_click",
+            "description": "Click an interactive element on the active browser page using CSS selector or text matcher.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector or text matcher for the element to click (e.g. 'button#submit', 'a.next', 'text=Sign In')."
+                    }
+                },
+                "required": ["selector"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_type",
+            "description": "Type text into an input or textarea element on the active browser page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector of the input field (e.g. 'input[name=q]', '#search-box')."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text to fill into the input field."
+                    },
+                    "press_enter": {
+                        "type": "boolean",
+                        "description": "Whether to press Enter key after typing (default: false)."
+                    }
+                },
+                "required": ["selector", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_screenshot",
+            "description": "Capture a visual screenshot of the active browser webpage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "full_page": {
+                        "type": "boolean",
+                        "description": "Whether to capture the entire scrollable height or only the current viewport (default: false)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_evaluate",
+            "description": "Execute arbitrary JavaScript expression on the active browser page and return the evaluated result.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "script": {
+                        "type": "string",
+                        "description": "JavaScript code or expression to evaluate (e.g. 'document.title', 'window.scrollBy(0, 500)')."
+                    }
+                },
+                "required": ["script"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_close",
+            "description": "Close the active browser session and release memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "download_file",
+            "description": "Download a file (e.g. PDF, patent, dataset, document, image) directly off the internet into the user's workspace downloads directory (~/EidosWorkspace/downloads).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Direct HTTP/HTTPS URL of the file to download."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Optional custom filename (e.g. 'patent_US20140216326A1.pdf'). If omitted, automatically derived from URL."
+                    },
+                    "destination_dir": {
+                        "type": "string",
+                        "description": "Optional destination directory (defaults to '~/EidosWorkspace/downloads')."
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_in_browser",
+            "description": "Open a web URL or local file directly on the user's desktop screen using their default web browser or desktop document viewer (e.g. to pull up a patent, webpage, or PDF alongside the user).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "The URL (http:// or https://) or local file path to open on the user's desktop."
+                    }
+                },
+                "required": ["target"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "speak_aloud",
+            "description": "Speak a concise message or audible notification aloud to the user using the local Kokoro TTS engine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The concise sentence or alert to speak aloud."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_user_profile",
+            "description": (
+                "Save or update a single atomic fact in the user's local profile "
+                "(~/.eidos/user_profile.yaml). Use only when the user explicitly asks to remember "
+                "a preference, path, or identity detail."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["user_identity", "preferences", "environment_facts"],
+                        "description": "Profile section to update.",
+                    },
+                    "key": {
+                        "type": "string",
+                        "description": "Fact key within the category (e.g. primary_editor, projects_dir).",
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "Fact value to store.",
+                    },
+                },
+                "required": ["category", "key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_workflow_rule",
+            "description": (
+                "Append a workflow guideline bullet to the user profile. "
+                "Use when the user asks Eidos to remember a recurring habit or rule."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule": {
+                        "type": "string",
+                        "description": "Short, atomic workflow rule sentence.",
+                    }
+                },
+                "required": ["rule"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_workflow_rule",
+            "description": "Remove a workflow guideline from the user profile by exact rule text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule": {
+                        "type": "string",
+                        "description": "Exact workflow rule text to remove.",
+                    }
+                },
+                "required": ["rule"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_user_fact",
+            "description": "Remove a key from user_identity, preferences, or environment_facts in the user profile.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["user_identity", "preferences", "environment_facts"],
+                    },
+                    "key": {"type": "string", "description": "Key to delete from the category."},
+                },
+                "required": ["category", "key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "Discover all available human/bot co-authored skills and evaluation rubrics from ~/.eidos/skills/.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load a living SKILL.md procedure or evaluation rubric into context by skill name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill to load (e.g. 'invention-evaluator', 'code-auditor')."
+                    }
+                },
+                "required": ["skill_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "Create a new living skill directory and SKILL.md document with YAML frontmatter, procedures, and templates.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short identifier for the skill (e.g. 'patent-prior-art', 'pr-reviewer')."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Complete markdown content for SKILL.md including optional YAML frontmatter."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "project"],
+                        "description": "Where to store the skill ('global' = ~/.eidos/skills, 'project' = .eidos/skills). Defaults to global."
+                    }
+                },
+                "required": ["name", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_skill",
+            "description": "Update the markdown contents or rubric of an existing skill.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the existing skill to update."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Updated markdown content."
+                    }
+                },
+                "required": ["name", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "init_batch_job",
+            "description": "Initialize a domain-agnostic batch job queue (queue.json) from an item list, JSON string, or CSV/JSON file path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_name": {
+                        "type": "string",
+                        "description": "Human-readable label for the batch job."
+                    },
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Name of the skill procedure assigned to guide execution for each item."
+                    },
+                    "items_data": {
+                        "description": "Items to process: can be a JSON array, raw text lines, or a filepath to a .json/.csv file.",
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Optional destination directory for queue.json and generated artifacts."
+                    }
+                },
+                "required": ["job_name", "skill_name", "items_data"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "step_batch_job",
+            "description": "Execute the next pending item in a batch job queue with fresh item context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or path to queue.json. If omitted, steps the active job."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_status",
+            "description": "Inspect progress metrics, completed counts, and active items of a batch job queue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or queue directory. If omitted, checks active job."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pause_batch_job",
+            "description": "Pause processing of an active batch job queue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or queue directory."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_batch_job",
+            "description": "Resume execution of a paused batch job queue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or queue directory."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish_task",
             "description": "Signal that the user's task goal has been completed or cannot be completed further.",
             "parameters": {
@@ -273,24 +690,60 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
 ]
 
 
-def build_system_prompt(active_window_info: Dict[str, Any], current_dir: str) -> str:
+def build_system_prompt(
+    active_window_info: Dict[str, Any],
+    current_dir: str,
+    clock: Optional[EidosClock] = None,
+    user_profile_context: Optional[str] = None,
+    episodic_context: Optional[str] = None,
+    workspace_dir: Optional[str] = None,
+) -> str:
     """Construct dynamic system prompt with real desktop context."""
     win_title = active_window_info.get("title", "Unknown")
     win_class = active_window_info.get("class_name", "Unknown")
     win_geom = active_window_info.get("geometry", {})
+    internal_clock = clock or EidosClock()
+    current_datetime = internal_clock.format_for_prompt()
+    timezone = internal_clock.timezone_name
+
+    ws_dir = os.path.abspath(os.path.expanduser(workspace_dir or "~/EidosWorkspace"))
+    downloads_dir = os.path.join(ws_dir, "downloads")
+    documents_dir = os.path.join(ws_dir, "documents")
+
+    user_section = f"\n{user_profile_context.strip()}\n" if user_profile_context else ""
+    episodic_section = f"\n{episodic_context.strip()}\n" if episodic_context else ""
 
     return f"""You are EidosBot, an OS-level autonomous desktop co-pilot running locally on Linux Mint (X11).
 
 SYSTEM CONTEXT:
 - OS: Linux Mint (Cinnamon / X11)
-- Working Directory: {current_dir}
+- Current Date & Time: {current_datetime} ({timezone})
+- Workspace Directory: {ws_dir}
+- Workspace Downloads: {downloads_dir}
+- Workspace Documents: {documents_dir}
+- Codebase Directory: {current_dir}
 - Active Window: "{win_title}" (Class: {win_class})
 - Window Position: {win_geom.get('x', 0)},{win_geom.get('y', 0)} ({win_geom.get('width', 0)}x{win_geom.get('height', 0)})
 - Emergency Kill Switch: Active on Ctrl + Alt + Esc
-
+{user_section}{episodic_section}
 BEHAVIORAL PRINCIPLES:
-1. DETERMINISTIC TIER FIRST: If a task can be solved directly via shell commands (e.g., file inspection, git status, search, running scripts), use `execute_shell`. Never guess mouse clicks when a shell command is faster and 100% reliable.
+1. DETERMINISTIC TIER FIRST: If a task can be solved directly via shell commands (e.g., listing files, checking disk space, fetching URLs, running user-provided scripts), use `execute_shell`. Never guess mouse clicks when a shell command is faster and 100% reliable.
 2. ACCURATE GROUNDING: When interacting with the GUI, first use `take_screenshot` or `get_active_window` to understand the current visual state before clicking or typing.
 3. CONCISE REASONING: Explain what you plan to do, then emit the appropriate tool call.
-4. COMPLETION: Once the user's goal has been met, call `finish_task` with a concise summary.
+4. COMPLETION: Once the user's goal has been met, call `finish_task` with a concise summary. The summary is shown in chat and spoken aloud automatically.
+5. VOICE: Chat replies and `finish_task` summaries are spoken aloud automatically. Use `speak_aloud` only for mid-task alerts. Do not call it for the final summary.
+6. TIME: You have an internal clock. The current date and time are in SYSTEM CONTEXT above and stay up to date each step. Use `get_current_time` when you need a fresh timestamp; do not run shell `date` for this.
+7. USER MEMORY: Persist user-stated preferences with `update_user_profile`, `add_workflow_rule`, or `remove_user_fact` only after the user asks to remember or forget something. Profile writes require user confirmation in the HUD.
+8. EPISODIC LEARNING: If `<episodic_context>` is provided above, leverage proven tool patterns and heed cautionary pitfalls from past sessions before taking high-risk or multi-step actions.
+9. CONSCIOUS ACTIVE RECALL: If you are uncertain about a command, flag, tool pattern, or past solution during your thought process, you can emit `<recall>search keywords</recall>`. The system will intercept your query in mid-thought, search your episodic memory, and inject `<recalled_memory>...</recalled_memory>` so you can continue your reasoning with verified experience.
+10. DETERMINISTIC WEB AUTOMATION: For research, online forms, dynamic SPAs, and patent searches, prefer the headless browser tools (`browser_open`, `browser_extract`, `browser_click`, `browser_type`, `browser_screenshot`, `browser_close`). They interact directly with the DOM and extract clean Markdown via trafilatura, without needing fragile screen coordinates.
+11. SKILLS & BATCH QUEUES: For domain procedures, standardized rubrics, or repetitive multi-item projects (e.g. 300+ items), consult skills using `list_skills` and `load_skill`. Use `init_batch_job`, `step_batch_job`, and `get_job_status` to maintain durable progress via `queue.json` while running each item in an isolated context window.
+12. WORKSPACE DIRECTORY & FILE STORAGE:
+- Store all user documents, downloaded PDFs, patents, research notes, datasets, and generated files in your Workspace directory: `{ws_dir}` (use `{downloads_dir}` for downloads and `{documents_dir}` for notes/docs).
+- NEVER store downloads, documents, or temporary task files inside the `{current_dir}` repository codebase directory.
+13. SOURCE CITATIONS & CLICKABLE LINKS:
+- When researching, browsing, or referencing web sources, always include clickable Markdown links in the format `[Page Title](https://...)` in your responses and final summary so the user can easily click to open the page directly.
+14. DOWNLOADING & DESKTOP BROWSING:
+- To download files from the internet (patents, PDFs, datasets, images), use the dedicated `download_file` tool.
+- If the user asks to "pull it up on my PC", "show me the patent", or "open this in my browser", use `open_in_browser` to launch the URL or local file directly on their desktop.
 """

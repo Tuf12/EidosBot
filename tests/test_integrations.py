@@ -1,4 +1,4 @@
-"""Tests for EidosBot application integrations (OptimalX, Cursor, Web Research)."""
+"""Tests for EidosBot application integrations (OptimalX, Web Research)."""
 
 import json
 import os
@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from eidos.core.loop import AgentLoop
-from eidos.integrations.cursor_ide import CursorAdapter
+
 from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
@@ -56,40 +56,8 @@ def test_optimalx_cdp_unavailable_handling():
 
 
 # =============================================================================
-# Cursor IDE Tests
-# =============================================================================
-
-def test_cursor_adapter_installed():
-    adapter = CursorAdapter()
-    assert adapter.is_installed()
 
 
-def test_cursor_adapter_open_file_validation():
-    adapter = CursorAdapter()
-    # Non-existent file should return error
-    res = adapter.open_file("/non/existent/path/file.py", line=10)
-    assert not res["success"]
-    assert "does not exist" in res["error"]
-
-    # Existing file should return success
-    this_file = os.path.abspath(__file__)
-    with patch("subprocess.Popen") as mock_popen, patch.object(adapter, "focus_window", return_value=True):
-        res = adapter.open_file(this_file, line=25, col=5)
-        assert res["success"]
-        assert f"{this_file}:25:5" in res["target"]
-        mock_popen.assert_called_once()
-
-
-def test_cursor_adapter_diff_command():
-    adapter = CursorAdapter()
-    this_file = os.path.abspath(__file__)
-    with patch("subprocess.Popen") as mock_popen, patch.object(adapter, "focus_window", return_value=True):
-        res = adapter.open_diff(this_file, this_file)
-        assert res["success"]
-        mock_popen.assert_called_once()
-
-
-# =============================================================================
 # Web Research Engine Tests
 # =============================================================================
 
@@ -161,8 +129,8 @@ class MockPhase4Model(BaseModelClient):
             )
         elif self.step == 2:
             return ModelResponse(
-                content="Opening file in cursor",
-                tool_calls=[ToolCall(name="cursor_action", arguments={"action": "open_file", "file_path": __file__, "line": 10})]
+                content="Fetching a page",
+                tool_calls=[ToolCall(name="web_fetch", arguments={"url": "https://example.com", "max_chars": 1000})]
             )
         else:
             return ModelResponse(
@@ -187,8 +155,68 @@ def test_agent_loop_phase4_tool_dispatch():
             model_client=mock_model
         )
 
-        with patch("subprocess.Popen"), patch.object(agent.cursor, "focus_window", return_value=True):
+        with patch.object(agent.web, "fetch_webpage", return_value={"success": True, "title": "Example", "text": "ok"}):
             res = agent.run_task("Test phase 4 integrations", max_steps=5)
             assert res["success"] is True
             assert res["steps_taken"] == 3
             assert "Phase 4 loop test complete" in res["summary"]
+
+
+def test_web_research_download_file():
+    engine = WebResearchEngine()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        mock_resp = MagicMock()
+        mock_resp.iter_content = MagicMock(return_value=[b"%PDF-1.4 simulated pdf data\n"])
+        mock_resp.headers = {"content-type": "application/pdf"}
+        mock_resp.raise_for_status = MagicMock()
+
+        with patch("requests.get", return_value=mock_resp):
+            res = engine.download_file("https://example.com/patents/US12345.pdf", destination_path=tmp_dir)
+            assert res["success"] is True
+            assert "US12345.pdf" in res["filename"]
+            assert os.path.exists(res["path"])
+            assert res["bytes_downloaded"] > 0
+
+
+def test_agent_loop_download_and_browser_tools():
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+
+        class MockDownloadModel(BaseModelClient):
+            def __init__(self):
+                self.step = 0
+            def chat(self, messages, tools=None, model_override=None):
+                self.step += 1
+                if self.step == 1:
+                    return ModelResponse(
+                        content="Downloading patent",
+                        tool_calls=[ToolCall(name="download_file", arguments={"url": "https://example.com/test.pdf"})]
+                    )
+                elif self.step == 2:
+                    return ModelResponse(
+                        content="Opening in desktop browser",
+                        tool_calls=[ToolCall(name="open_in_browser", arguments={"target": "https://example.com/test.pdf"})]
+                    )
+                else:
+                    return ModelResponse(
+                        content="Done",
+                        tool_calls=[ToolCall(name="finish_task", arguments={"summary": "Downloaded and opened"})]
+                    )
+            def vision_chat(self, *args, **kwargs):
+                return ModelResponse(content="")
+
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=MockDownloadModel(),
+        )
+
+        with patch.object(agent.web, "download_file", return_value={"success": True, "path": "/tmp/test.pdf", "filename": "test.pdf", "size": "10 KB"}):
+            with patch.object(agent, "_open_in_desktop_browser", return_value={"success": True, "opened": True}):
+                res = agent.run_task("Download and view patent", max_steps=5)
+                assert res["success"] is True
+                assert res["steps_taken"] == 3
+                assert "Downloaded and opened" in res["summary"]
+

@@ -34,7 +34,17 @@ env/
 *.swp
 *.swo
 
-# EidosBot Runtime
+# EidosBot Runtime & Secrets
 .eidos/
 config.yaml
 !config.example.yaml
+.env
+*.env
+*.token
+*.key
+*.pem
+*.log
+*.sqlite
+*.db
+*.db-shm
+*.db-wal

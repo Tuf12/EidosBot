@@ -147,10 +147,12 @@ class ConfirmationDialog(QDialog):
         layout.addLayout(btn_layout)
 
         # Overall Dialog Theme
+        from eidos.ui.styles import GLOBAL_TOOLTIP_STYLE
+
         self.setStyleSheet(
             "QDialog { background-color: #282a36; color: #f8f8f2; } "
             "QPushButton:hover { opacity: 0.9; } "
-            "QCheckBox::indicator { width: 18px; height: 18px; }"
+            f"QCheckBox::indicator {{ width: 18px; height: 18px; }}\n{GLOBAL_TOOLTIP_STYLE}"
         )
 
     def _on_approve(self):

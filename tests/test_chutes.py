@@ -99,3 +99,80 @@ def test_model_router_auto_escalation_on_error():
     # Router should catch local failure and escalate to cloud
     assert resp.model == "chutes_cloud"
     assert router.last_provider_used == "chutes"
+
+
+def test_chutes_list_models():
+    from unittest.mock import MagicMock, patch
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "object": "list",
+        "data": [
+            {"id": "google/gemma-4-31B-turbo-TEE"},
+            {"id": "moonshotai/Kimi-K2.6-TEE"},
+            {"id": "Qwen/Qwen3.5-397B-A17B-TEE"},
+        ]
+    }
+
+    client = ChutesClient(api_key="test_key")
+    with patch("requests.get", return_value=mock_resp):
+        models = client.list_models()
+
+    assert models == [
+        "Qwen/Qwen3.5-397B-A17B-TEE",
+        "google/gemma-4-31B-turbo-TEE",
+        "moonshotai/Kimi-K2.6-TEE",
+    ]
+
+
+def test_chutes_stream_openai_chat():
+    import json
+    from unittest.mock import MagicMock, patch
+
+    mock_resp = MagicMock()
+    mock_resp.iter_lines.return_value = [
+        b'data: {"choices":[{"delta":{"content":"Hello "}}]}',
+        b'data: {"choices":[{"delta":{"content":"world!"}}]}',
+        b'data: [DONE]',
+    ]
+
+    client = ChutesClient(api_key="test_key", stream=True)
+    with patch("requests.post", return_value=mock_resp):
+        resp = client.chat([{"role": "user", "content": "hi"}])
+
+    assert resp.content == "Hello world!"
+
+
+def test_chutes_with_recall_interceptor():
+    from unittest.mock import MagicMock
+
+    mock_interceptor = MagicMock()
+    mock_interceptor.execute_openai_chat_with_recall.return_value = ModelResponse(
+        content="Recalled content from Chutes",
+        thinking="Thoughts",
+        tool_calls=[],
+        model="google/gemma-4-31B-turbo-TEE",
+    )
+
+    client = ChutesClient(api_key="test_key", recall_interceptor=mock_interceptor)
+    resp = client.chat([{"role": "user", "content": "adjust screen"}])
+
+    assert mock_interceptor.execute_openai_chat_with_recall.called
+    assert resp.content == "Recalled content from Chutes"
+    assert resp.thinking == "Thoughts"
+
+
+def test_model_router_propagates_recall_interceptor():
+    from unittest.mock import MagicMock
+
+    mock_interceptor = MagicMock()
+    client_ollama = MagicMock()
+    client_chutes = MagicMock()
+
+    router = ModelRouter(ollama_client=client_ollama, chutes_client=client_chutes)
+    router.recall_interceptor = mock_interceptor
+
+    assert client_ollama.recall_interceptor == mock_interceptor
+    assert client_chutes.recall_interceptor == mock_interceptor
+

@@ -18,7 +18,7 @@ This document details the software architecture, subsystem components, data pipe
 ```
                               ┌─────────────────────────────────────────┐
                               │               USER INPUT                │
-                              │   (Floating HUD, CLI, or Hotkey)        │
+                              │   (Floating HUD, CLI, Hotkey, Telegram) │
                               └────────────────────┬────────────────────┘
                                                    │
                                                    ▼
@@ -28,13 +28,12 @@ This document details the software architecture, subsystem components, data pipe
 │   ┌────────────────────────┐      ┌────────────────────────┐      ┌────────────────────────────────┐   │
 │   │   PERCEPTION ENGINE    │      │    COGNITIVE ROUTER    │      │       ACTION DISPATCHER        │   │
 │   │                        │      │                        │      │                                │   │
-│   │ • X11 Screen Capture   │────▶ │ • Ollama (Local)       │────▶ │ • Tier 1: Shell / CLI / APIs   │   │
-│   │ • Window Info (xdotool)│      │   - gemma4-26b (Plan)  │      │ • Tier 2: DOM / AT-SPI Tree    │   │
-│   │ • Visual Grounder / SoM│      │   - gemma4-12b (Vision)│      │ • Tier 3: Synthetic Mouse/Keys │   │
-│   │ • Clipboard & SysInfo  │      │ • Chutes AI (Cloud)    │      └────────────────┬───────────────┘   │
-│   └────────────────────────┘      │   - Qwen 2.5-VL 72B    │                       │                   │
-│                                   │   - DeepSeek-R1        │                       │                   │
-│                                   └────────────────────────┘                       │                   │
+│   │ • X11 Screen Capture   │────▶ │ • Ollama (Local LLM)   │────▶ │ • Tier 1: Sandboxed Shell      │   │
+│   │ • Window Info (xdotool)│      │   - gemma4-26b (Plan)  │      │   (bwrap kernel isolation)     │   │
+│   │ • Playwright DOM Reader│      │   - gemma4-12b (Vision)│      │ • Tier 2: Headless Browser     │   │
+│   │ • Skills & Rubric RAG  │      │ • Chutes AI (Cloud)    │      │   (Playwright / CDP DOM)       │   │
+│   │ • Episodic Memory RAG  │      │ • Batch Job State Q    │      │ • Tier 3: Synthetic Mouse/Keys │   │
+│   └────────────────────────┘      └────────────────────────┘      └────────────────┬───────────────┘   │
 └────────────────────────────────────────────────────────────────────────────────────┼───────────────────┘
                                                                                      │
                                                                                      ▼
@@ -42,22 +41,21 @@ This document details the software architecture, subsystem components, data pipe
                                                                     │       SAFETY GATEKEEPER        │
                                                                     │                                │
                                                                     │ • Global Kill Switch (Ctrl+    │
-                                                                    │   Alt+Esc)                     │
-                                                                    │ • Level 0: Auto-Allowed        │
-                                                                    │ • Level 1: UI Action Check     │
-                                                                    │ • Level 2: Shell Allowlist     │
-                                                                    │ • Level 3: Hard Locked Confirm │
+                                                                    │   Alt+Esc / Telegram /kill)    │
+                                                                    │ • Sandboxed Workspace: AUTO    │
+                                                                    │ • Host Shell: Allowlist/Prompt │
+                                                                    │ • Destructive: Hard Confirm    │
                                                                     └────────────────┬───────────────┘
                                                                                      │
                                             ┌────────────────────────────────────────┴───────────────────┐
                                             ▼                                                            ▼
                              ┌──────────────────────────────┐                            ┌──────────────────────────────┐
-                             │       EXECUTION TARGETS      │                            │          PyQt6 HUD           │
+                             │       EXECUTION TARGETS      │                            │      FEEDBACK & CONTROLS     │
                              │                              │                            │                              │
-                             │ • Linux Mint OS / X11 System │                            │ • Transparent Overlay        │
-                             │ • OptimalX Desktop (CDP DOM) │ ◀───────────────────────── │ • Click Reticle & Bounding   │
-                             │ • Cursor IDE (CLI/Palette)   │      Visual Feedback       │ • Floating Status Pill       │
-                             │ • Browsers & Generic Apps    │                            │ • Command Confirmation Popup │
+                             │ • Linux Mint OS / X11 System │                            │ • PyQt6 Transparent Overlay  │
+                             │ • Sandboxed Job Workspace    │ ◀───────────────────────── │ • Floating Status Pill & Chat│
+                             │ • Headless Chromium Browser  │      Visual & Remote       │ • Telegram Gateway (Mobile   │
+                             │ • OptimalX Desktop (CDP)     │      Feedback Loops        │   Approvals & Milestone Push)│
                              └──────────────────────────────┘                            └──────────────────────────────┘
 ```
 
@@ -91,12 +89,12 @@ Every interaction cycle executes through a six-stage pipeline:
 
 - **`screen.py` (Screen Capture):**
   - Utilizes `mss` (leveraging X11 Shared Memory extension, MIT-SHM) for ultra-fast, low-overhead captures (<15ms per frame at 1080p/1440p).
-  - Handles multi-monitor setups (identifies active monitor based on cursor or active window location).
+  - Handles multi-monitor setups (identifies active monitor based on mouse pointer or active window location).
   - Implements downscaling, compression, and region-of-interest (ROI) cropping to minimize prompt token usage when calling vision models.
 - **`window_info.py` (X11 Window & Process Context):**
   - Uses `xdotool` and `xprop` to retrieve:
     - Active window ID and name.
-    - Application `WM_CLASS` (e.g., `google-chrome`, `cursor`, `optimalx`).
+    - Application `WM_CLASS` (e.g., `google-chrome`, `firefox`, `optimalx`).
     - Window bounding box `(x, y, width, height)`.
     - Process ID (PID) and resource usage.
 - **`grounder.py` (Coordinate Grounding & Set-of-Mark):**
@@ -183,6 +181,63 @@ Every interaction cycle executes through a six-stage pipeline:
   - Dedicated management window to view all previously approved Level 2 commands.
   - Allows user to search commands, check execution frequency, and click `[Revoke Permission]` to place a command back into required confirmation.
 
+### 4.6. Memory & Episodic Learning Subsystem (`eidos/memory/`)
+
+*(Detailed specifications in [EPISODIC_MEMORY.md](EPISODIC_MEMORY.md))*
+
+- **`user_store.py` (Tier B: Atomic User Profile):**
+  - Manages `~/.eidos/user_profile.yaml` storing explicit, human-readable user habits, paths, and workflow rules.
+  - Renders compact fact lists into prompt context (~60 tokens) and exposes direct CRUD operations for GUI editing.
+- **`trajectory_logger.py` (LoRA Dataset Recorder):**
+  - Appends full multi-step decision trajectories to `~/.eidos/trajectories/episodes.jsonl`.
+  - Captures goals, system states, raw `<thought>` tokens, tool calls, results, and outcome evaluation for future SFT and DPO training.
+- **`episodic_store.py` (Tier A: Vector RAG):**
+  - Local vector database (SQLite with `sqlite-vec` or LanceDB) using `nomic-embed-text:latest` running locally on Ollama.
+  - Distills raw trajectories using observation analysis (`_is_tool_observation_successful`): separates verified successful action chains (preserved in full forward order) from exploratory dead ends (cached as the top 2–3 pitfalls with cleaned error messages).
+  - Performs macro retrieval at task start to inject top golden paths and cautionary pitfalls into `<episodic_context>`.
+  - Automatically syncs and reindexes trajectory logs on startup.
+- **`reflector.py` (Post-Task Synthesizer):**
+  - Analyzes completed or failed cycles to extract dense lessons and pitfalls avoided.
+- **`recall_stream.py` (Active Recall & Stream Splicer):**
+  - Intercepts `<recall>query</recall>` tags generated inside model thought streams (supports both local Ollama and cloud Chutes AI SSE streams).
+  - Pauses token generation, executes local vector search, splices the recalled memory (including dead ends and proven tool patterns) into the stream, and resumes autoregressive reasoning.
+
+### 4.7. Kernel Sandboxing Subsystem (`eidos/sandbox/`)
+
+*(Detailed specifications in [SANDBOXING.md](SANDBOXING.md))*
+
+- **`bwrap.py` (Bubblewrap Isolation):**
+  - Uses unprivileged Linux namespaces (`bwrap`) to enforce read-only protection over `/`, `/usr`, `/etc`, and `~`.
+  - Designates only specific workspace directories (e.g. `~/EidosWorkspace` or job target directories) as read-write.
+  - Auto-allows sandboxed operations without prompt fatigue while physically preventing destructive file deletions or system alterations.
+
+### 4.8. Headless Browser Subsystem (`eidos/browser/`)
+
+*(Detailed specifications in [PLAYWRIGHT_AUTOMATION.md](PLAYWRIGHT_AUTOMATION.md))*
+
+- **`manager.py` (Playwright Engine):**
+  - Replaces fragile coordinate-based mouse clicking for web research with deterministic DOM navigation.
+  - Executes dynamic client-side JavaScript, handles Single Page Applications (SPAs), patent databases, and web forms.
+  - Converts live page content to dense, token-efficient Markdown using `trafilatura`.
+
+### 4.9. Skills & Collaborative Job Runner (`eidos/skills/` & `eidos/jobs/`)
+
+*(Detailed specifications in [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md))*
+
+- **`skills/manager.py`:**
+  - Manages human-and-agent editable `SKILL.md` documents containing standard operating procedures, rubrics, and templates.
+- **`jobs/runner.py`:**
+  - State machine batch runner managing `queue.json` for processing large-scale projects (e.g., 300 Inventions evaluation) item by item with fresh contexts, checkpointing, and pause/resume.
+
+### 4.10. Remote Telegram Gateway (`eidos/gateway/telegram_bot.py`)
+
+*(Detailed specifications in [TELEGRAM_GATEWAY.md](TELEGRAM_GATEWAY.md))*
+
+- **Bi-Directional Mobile Companion:**
+  - Connects the user's phone to the local Ollama agent loop via Telegram Bot API with strict user ID authentication.
+  - Presents interactive inline buttons (`[Approve]`, `[Reject]`, `[Kill]`) for host-level or destructive commands.
+  - Streams periodic milestone progress updates and clarifying questions during batch job runs.
+
 ---
 
 ## 5. Application Integration Bridges (`eidos/integrations/`)
@@ -199,12 +254,9 @@ Because **OptimalX Desktop** is an Electron application built by the user, Eidos
 3. **IPC Bridge Fallback:**
    - If CDP is not used, a lightweight local Unix domain socket (`/tmp/optimalx-eidos.sock`) can allow OptimalX and EidosBot to exchange JSON-RPC messages directly.
 
-### 5.2. Cursor IDE Bridge (`cursor_bridge.py`)
 
-EidosBot interacts with Cursor via:
-- **CLI Invocations:** `cursor -g /path/to/file:line:col` or opening workspace folders.
-- **Command Palette Injection:** Sends synthetic `Ctrl+Shift+P` followed by typed command and `Enter`.
-- **Terminal Control:** Inspects Cursor's integrated terminal processes or invokes tasks directly.
+
+
 
 ---
 
@@ -219,7 +271,13 @@ EidosBot/
 ├── docs/
 │   ├── ARCHITECTURE.md             # This document
 │   ├── FEATURES.md                 # Feature breakdown & safety matrix
-│   └── ROADMAP.md                  # Implementation roadmap
+│   ├── ROADMAP.md                  # Implementation roadmap
+│   ├── EPISODIC_MEMORY.md          # Episodic memory, recall & LoRA training spec
+│   ├── SKILLS_AND_JOBS.md          # Skills, rubrics & batch job runner spec
+│   ├── SANDBOXING.md               # Kernel filesystem isolation (bwrap) spec
+│   ├── PLAYWRIGHT_AUTOMATION.md    # Headless browser automation spec
+│   ├── TELEGRAM_GATEWAY.md         # Telegram mobile companion & approvals spec
+│   └── IMPLEMENTATION_GUIDE.md     # Step-by-step master implementation plan
 ├── eidos/
 │   ├── __init__.py
 │   ├── main.py                     # Main CLI and application launcher
@@ -227,6 +285,7 @@ EidosBot/
 │   │   ├── __init__.py
 │   │   ├── loop.py                 # Core agent cycle (Sense -> Reason -> Act)
 │   │   ├── context.py              # Conversation history & active task state
+│   │   ├── clock.py                # Internal high-accuracy date & time tracking
 │   │   └── types.py                # Pydantic schemas for actions, tools, and events
 │   ├── perception/
 │   │   ├── __init__.py
@@ -238,6 +297,18 @@ EidosBot/
 │   │   ├── mouse_keyboard.py       # pynput / pyautogui input simulation
 │   │   ├── shell.py                # Safe subprocess execution
 │   │   └── cdp.py                  # Chrome DevTools Protocol helper for Electron/Browsers
+│   ├── sandbox/
+│   │   ├── __init__.py
+│   │   └── bwrap.py                # Bubblewrap kernel isolation wrapper
+│   ├── browser/
+│   │   ├── __init__.py
+│   │   └── manager.py              # Headless Playwright engine & DOM parser
+│   ├── skills/
+│   │   ├── __init__.py
+│   │   └── manager.py              # Human/Bot co-authored SKILL.md manager
+│   ├── jobs/
+│   │   ├── __init__.py
+│   │   └── runner.py               # Persistent queue state machine (queue.json)
 │   ├── safety/
 │   │   ├── __init__.py
 │   │   ├── kill_switch.py          # Background global hotkey listener (Ctrl+Alt+Esc)
@@ -251,20 +322,52 @@ EidosBot/
 │   │   ├── ollama_client.py        # Local Ollama connector (gemma4, mistral, etc.)
 │   │   ├── chutes_client.py        # Cloud Chutes AI connector (Qwen 2.5-VL, DeepSeek)
 │   │   └── router.py               # Model routing and fallback logic
+│   ├── memory/
+│   │   ├── __init__.py
+│   │   ├── conversation_store.py   # SQLite persistent conversation & message store (~/.eidos/eidos.db)
+│   │   ├── user_store.py           # Atomic YAML user profile manager
+│   │   ├── trajectory_logger.py    # Append-only JSONL episode recorder
+│   │   ├── episodic_store.py       # Vector DB interface (nomic-embed-text)
+│   │   ├── reflector.py            # Post-task critic & lesson synthesizer
+│   │   ├── recall_stream.py        # Active recall token stream interceptor
+│   │   └── types.py                # Pydantic schemas for episodes and facts
+│   ├── voice/
+│   │   ├── __init__.py
+│   │   ├── voice_manager.py        # Audio coordination & push-to-talk listener
+│   │   ├── tts.py                  # Local Kokoro-82M neural TTS
+│   │   ├── stt.py                  # Local NVIDIA Parakeet TDT 0.6B ONNX STT
+│   │   ├── audio_capture.py        # ALSA/ffmpeg 16kHz mono recording
+│   │   ├── speech_stream.py        # Progressive TTS chunk streaming
+│   │   └── chunker.py              # Sentence & clause streaming chunker
+│   ├── gateway/
+│   │   ├── __init__.py
+│   │   ├── server.py               # Mobile REST & WebSocket gateway server
+│   │   └── telegram_bot.py         # Telegram bot & remote approval bridge
 │   ├── integrations/
 │   │   ├── __init__.py
 │   │   ├── optimalx.py             # OptimalX Desktop Electron bridge
-│   │   └── cursor_ide.py           # Cursor IDE automation adapter
+│   │   
+│   │   └── web_research.py         # Web search and content fetcher
 │   └── ui/
 │       ├── __init__.py
 │       ├── app.py                  # PyQt6 application lifecycle
 │       ├── hud.py                  # Transparent click-through overlay
-│       ├── pill.py                 # Draggable status pill
+│       ├── pill.py                 # Draggable status pill with voice controls
+│       ├── chat.py                 # Integrated conversation UI
+│       ├── conversations_dialog.py # Past conversations manager GUI
 │       ├── dialogs.py              # Level 2/3 confirmation modals
+│       ├── settings_dialog.py      # Live settings configuration dialog
 │       └── allowlist_dialog.py     # Allowed command review & revocation UI
+├── training/
+│   ├── export_sft.py               # Export trajectories to ShareGPT / ChatML
+│   ├── export_dpo.py               # Extract preference pairs from mistakes
+│   └── train_lora.py               # Local LoRA fine-tuning runner
 └── tests/
     ├── test_screen.py              # Test screen capture
     ├── test_window_info.py         # Test X11 window detection
     ├── test_safety.py              # Test kill switch and risk classifier
-    └── test_allowlist.py           # Test allowlist serialization & revocation
+    ├── test_allowlist.py           # Test allowlist serialization & revocation
+    ├── test_voice.py               # Test TTS & STT voice pipelines
+    ├── test_gateway.py             # Test mobile gateway server
+    └── test_memory.py              # Test episodic vector store & trajectories
 ```

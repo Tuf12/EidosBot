@@ -1,4 +1,7 @@
 # EidosBot Dependencies
+# to install all dependencies, run:
+# source venv/bin/activate && pip install -r requirements.txt
+
 
 # Core & Async
 pydantic>=2.7.0
@@ -12,13 +15,28 @@ pynput>=1.7.6
 pyautogui>=0.9.54
 Pillow>=10.2.0
 
+playwright install chromium
+
 # UI & HUD
 PyQt6>=6.6.0
+
+# Voice playback (progressive TTS — thread-safe, low-latency chunks)
+sounddevice>=0.4.6
+soundfile>=0.12.1
+numpy>=1.26.0
 
 # Integrations & CDP
 websockets>=12.0
 playwright>=1.42.0
 beautifulsoup4>=4.12.0
+
+# Memory & Vector Storage
+sqlite-vec>=0.1.0
+
+#text
+playwright>=1.40.0
+trafilatura>=1.6.0
+python-telegram-bot>=21.0
 
 # Testing
 pytest>=8.0.0

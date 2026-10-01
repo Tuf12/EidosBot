@@ -21,7 +21,6 @@
 - **PyQt6 Click-Through HUD:** A transparent overlay that draws target bounding boxes/reticles on elements before clicking, accompanied by a floating status pill showing what the agent is currently doing.
 - **Target Integrations:**
   - **OptimalX Desktop 1.0:** Direct Electron DOM/CDP integration for ultra-fast, robust interaction.
-  - **Cursor IDE:** Command palette, file navigation, and CLI integration.
   - **General Desktop & Web Research:** Autonomous browser automation and cross-app workflows.
 
 ---
@@ -67,7 +66,7 @@ EidosBot/
 │   ├── perception/           # Screen capture, X11 window info, visual grounding
 │   ├── actions/              # Mouse, keyboard, and shell execution engine
 │   ├── models/               # Ollama and Chutes AI API connectors
-│   ├── integrations/         # OptimalX Desktop & Cursor bridge adapters
+│   ├── integrations/         # OptimalX Desktop & web research bridges
 │   └── ui/                   # PyQt6 HUD overlay, confirmation dialogs, settings UI
 └── tests/                    # Unit and integration test suite
 ```

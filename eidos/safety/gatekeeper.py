@@ -10,6 +10,13 @@ from eidos.safety.risk_classifier import RiskClassifier, RiskLevel
 
 logger = logging.getLogger(__name__)
 
+PROFILE_MEMORY_ACTIONS = frozenset({
+    "update_user_profile",
+    "add_workflow_rule",
+    "remove_workflow_rule",
+    "remove_user_fact",
+})
+
 
 class Gatekeeper:
     """Evaluates actions against policies, allowlists, and user confirmations."""
@@ -21,12 +28,14 @@ class Gatekeeper:
         kill_switch: Optional[KillSwitch] = None,
         confirm_level_1_ui: bool = False,
         confirm_level_2_shell: bool = True,
+        confirm_profile_writes: bool = True,
     ):
         self.allowlist = allowlist or AllowlistManager()
         self.audit = audit_logger or AuditLogger()
         self.kill_switch = kill_switch or KillSwitch()
         self.confirm_level_1_ui = confirm_level_1_ui
         self.confirm_level_2_shell = confirm_level_2_shell
+        self.confirm_profile_writes = confirm_profile_writes
         # Optional custom confirmation callback (e.g. for PyQt6 dialogs)
         # Signature: prompt_callback(action_type, details, risk_level, reason) -> Tuple[bool, bool]
         # returns (approved: bool, remember_allowlist: bool)
@@ -42,6 +51,20 @@ class Gatekeeper:
             return False, "Action aborted: Global kill switch is active."
 
         risk_level, reason = RiskClassifier.classify_action(action_type, details)
+
+        if action_type in PROFILE_MEMORY_ACTIONS:
+            if not self.confirm_profile_writes:
+                self.audit.log(action_type, details, int(risk_level), "auto_allowed", reason)
+                return True, "Auto-allowed (profile memory write)"
+            approved, _ = self._request_confirmation(
+                action_type,
+                details,
+                risk_level,
+                f"Save to local user profile (~/.eidos/user_profile.yaml): {reason}",
+            )
+            decision = "user_approved" if approved else "user_denied"
+            self.audit.log(action_type, details, int(risk_level), decision, reason)
+            return approved, "Approved by user" if approved else "Denied by user"
 
         # Level 0: Always allowed automatically
         if risk_level == RiskLevel.LEVEL_0_PASSIVE:

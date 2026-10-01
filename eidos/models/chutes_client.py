@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -25,16 +25,20 @@ class ChutesClient(BaseModelClient):
         api_key: Optional[str] = None,
         base_url: str = "https://llm.chutes.ai/v1",
         vision_model: str = "Qwen/Qwen3.5-397B-A17B-TEE",
-        fast_vision_model: str = "google/gemma-4-31B-turbo-TEE",
         reasoning_model: str = "moonshotai/Kimi-K2.6-TEE",
         timeout: float = 90.0,
+        stream: bool = True,
+        recall_interceptor: Optional[Any] = None,
+        on_recall_callback: Optional[Callable[[str, str], None]] = None,
     ):
         self.api_key = api_key or os.environ.get("CHUTES_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.vision_model = vision_model
-        self.fast_vision_model = fast_vision_model
         self.reasoning_model = reasoning_model
         self.timeout = timeout
+        self.stream = stream
+        self.recall_interceptor = recall_interceptor
+        self.on_recall_callback = on_recall_callback
 
     @property
     def is_configured(self) -> bool:
@@ -64,6 +68,24 @@ class ChutesClient(BaseModelClient):
             logger.debug("Chutes connection check failed: %s", e)
             return False
 
+    def list_models(self) -> List[str]:
+        """Fetch available models from Chutes AI."""
+        if not self.is_configured:
+            return []
+        try:
+            resp = requests.get(
+                f"{self.base_url}/models",
+                headers=self._get_headers(),
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m.get("id") for m in data.get("data", []) if m.get("id")]
+                return sorted(models)
+        except Exception as e:
+            logger.error("Failed to list Chutes models: %s", e)
+        return []
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -79,25 +101,41 @@ class ChutesClient(BaseModelClient):
             )
 
         model_name = model_override or self.reasoning_model
+
+        # If Active Recall interceptor is configured, stream SSE and intercept <recall> tags
+        if self.recall_interceptor is not None:
+            return self.recall_interceptor.execute_openai_chat_with_recall(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                model_name=model_name,
+                messages=messages,
+                tools=tools,
+                timeout=self.timeout,
+                on_recall_callback=self.on_recall_callback,
+            )
+
         payload: Dict[str, Any] = {
             "model": model_name,
             "messages": messages,
-            "stream": False,
         }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 
         try:
-            resp = requests.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._get_headers(),
-                json=payload,
-                timeout=self.timeout
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return self._parse_openai_response(data, model_name)
+            if self.stream:
+                return self._stream_openai_chat(model_name, payload)
+            else:
+                payload["stream"] = False
+                resp = requests.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self._get_headers(),
+                    json=payload,
+                    timeout=self.timeout
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                return self._parse_openai_response(data, model_name)
         except Exception as e:
             logger.error("Chutes chat error with model %s: %s", model_name, e)
             return ModelResponse(
@@ -106,23 +144,155 @@ class ChutesClient(BaseModelClient):
                 raw={"error": str(e)}
             )
 
+    def _stream_openai_chat(
+        self,
+        model_name: str,
+        payload: Dict[str, Any],
+    ) -> ModelResponse:
+        """Stream chat completion via SSE, accumulating tokens, thoughts, and tool calls."""
+        payload["stream"] = True
+        resp = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers=self._get_headers(),
+            json=payload,
+            stream=True,
+            timeout=self.timeout
+        )
+        resp.raise_for_status()
+
+        total_content = ""
+        total_thinking = ""
+        tool_call_deltas: Dict[int, Dict[str, Any]] = {}
+        raw_final_data: Dict[str, Any] = {}
+
+        try:
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8") if isinstance(line, bytes) else line
+                if not line_str.startswith("data:"):
+                    continue
+                body = line_str[5:].strip()
+                if not body:
+                    continue
+                if body == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(body)
+                except Exception:
+                    continue
+
+                raw_final_data = chunk
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta", {})
+
+                if delta.get("content"):
+                    total_content += delta["content"]
+                if delta.get("reasoning_content"):
+                    total_thinking += delta["reasoning_content"]
+
+                tc_deltas = delta.get("tool_calls", [])
+                if tc_deltas and isinstance(tc_deltas, list):
+                    for tc in tc_deltas:
+                        idx = tc.get("index", 0)
+                        if idx not in tool_call_deltas:
+                            tool_call_deltas[idx] = {
+                                "id": tc.get("id") or f"call_{idx}",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        if tc.get("id"):
+                            tool_call_deltas[idx]["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            tool_call_deltas[idx]["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            tool_call_deltas[idx]["arguments"] += fn["arguments"]
+        finally:
+            resp.close()
+
+        accumulated_tool_calls: List[ToolCall] = []
+        for idx in sorted(tool_call_deltas.keys()):
+            tc_data = tool_call_deltas[idx]
+            args_str = tc_data["arguments"]
+            try:
+                parsed_args = json.loads(args_str) if args_str else {}
+            except Exception:
+                parsed_args = {"raw_input": args_str}
+            if tc_data["name"]:
+                accumulated_tool_calls.append(
+                    ToolCall(
+                        name=tc_data["name"],
+                        arguments=parsed_args,
+                        id=tc_data["id"]
+                    )
+                )
+
+        if not accumulated_tool_calls:
+            accumulated_tool_calls = self._extract_json_tool_calls(total_content)
+
+        thought_match = re.search(
+            r"<(?:thought|thinking)>(.*?)</(?:thought|thinking)>", total_content, re.DOTALL
+        )
+        if thought_match:
+            total_thinking = (total_thinking + "\n" + thought_match.group(1).strip()).strip()
+            total_content = re.sub(
+                r"<(?:thought|thinking)>.*?</(?:thought|thinking)>", "", total_content, flags=re.DOTALL
+            ).strip()
+
+        return ModelResponse(
+            content=total_content,
+            tool_calls=accumulated_tool_calls,
+            thinking=total_thinking,
+            model=model_name,
+            raw=raw_final_data,
+        )
+
+    def _extract_json_tool_calls(self, text: str) -> List[ToolCall]:
+        """Fallback tool extraction from markdown codeblocks or JSON snippets."""
+        extracted: List[ToolCall] = []
+        code_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        for block in code_blocks:
+            try:
+                parsed = json.loads(block)
+                if isinstance(parsed, dict) and "name" in parsed:
+                    args = parsed.get("arguments", parsed.get("parameters", {}))
+                    extracted.append(ToolCall(name=parsed["name"], arguments=args))
+            except Exception:
+                pass
+
+        tag_blocks = re.findall(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL)
+        for block in tag_blocks:
+            try:
+                parsed = json.loads(block)
+                if isinstance(parsed, dict) and "name" in parsed:
+                    args = parsed.get("arguments", {})
+                    extracted.append(ToolCall(name=parsed["name"], arguments=args))
+            except Exception:
+                pass
+
+        return extracted
+
     def vision_chat(
         self,
         prompt: str,
         image_base64: str,
         system_prompt: Optional[str] = None,
         model_override: Optional[str] = None,
-        fast_mode: bool = False,
     ) -> ModelResponse:
         """Send multimodal visual query to Chutes AI."""
         if not self.is_configured:
             return ModelResponse(
                 content="Chutes API key not configured.",
-                model=model_override or (self.fast_vision_model if fast_mode else self.vision_model),
+                model=model_override or self.vision_model,
                 raw={"error": "missing_api_key"}
             )
 
-        model_name = model_override or (self.fast_vision_model if fast_mode else self.vision_model)
+        model_name = model_override or self.vision_model
 
         # Build OpenAI multimodal content
         image_url = (

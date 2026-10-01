@@ -27,7 +27,7 @@ class InputSimulator:
         return self.gatekeeper.evaluate(action_type, details)
 
     def move(self, x: int, y: int, duration: float = 0.1) -> Dict[str, Any]:
-        """Move cursor to (x, y)."""
+        """Move mouse pointer to (x, y)."""
         allowed, reason = self._check_safety("move_mouse", {"x": x, "y": y})
         if not allowed:
             return {"success": False, "error": reason}

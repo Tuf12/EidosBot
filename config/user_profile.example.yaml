@@ -1,0 +1,21 @@
+# Example user profile for EidosBot (copy is NOT automatic).
+# On first run, Eidos creates ~/.eidos/user_profile.yaml on this machine only.
+# Edit via Settings → User Memory, the setup wizard, or ask Eidos to remember facts.
+
+onboarding_complete: true
+
+user_identity:
+  name: "developer"
+  os: "Linux (X11)"
+
+preferences:
+  interaction_style: "Concise, action-oriented, direct execution"
+  tool_preference: "Deterministic shell over GUI clicking when possible"
+
+environment_facts:
+  primary_editor: "Cursor IDE"
+  projects_dir: "~/Projects"
+
+workflow_rules:
+  - "Prefer terminal commands for file queries and inspection"
+  - "Always check git status before committing or pulling"

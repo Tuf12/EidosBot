@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -21,13 +21,16 @@ class OllamaClient(BaseModelClient):
         reasoning_model: str = "batiai/gemma4-26b:iq4",
         vision_model: str = "batiai/gemma4-12b:q6",
         chat_model: str = "gpt-oss:20b",
-        timeout: float = 60.0
+        timeout: float = 60.0,
+        recall_interceptor: Optional[Any] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.reasoning_model = reasoning_model
         self.vision_model = vision_model
         self.chat_model = chat_model
         self.timeout = timeout
+        self.recall_interceptor = recall_interceptor
+        self.on_recall_callback: Optional[Callable[[str, str], None]] = None
 
     def check_connection(self) -> bool:
         """Verify Ollama server is reachable."""
@@ -56,6 +59,18 @@ class OllamaClient(BaseModelClient):
     ) -> ModelResponse:
         """Send chat completion request with optional tool definitions."""
         model_name = model_override or self.reasoning_model
+
+        # If Active Recall interceptor is configured, stream and intercept <recall> tags
+        if self.recall_interceptor is not None:
+            return self.recall_interceptor.execute_chat_with_recall(
+                base_url=self.base_url,
+                model_name=model_name,
+                messages=messages,
+                tools=tools,
+                timeout=self.timeout,
+                on_recall_callback=self.on_recall_callback,
+            )
+
         payload = {
             "model": model_name,
             "messages": messages,

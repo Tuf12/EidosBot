@@ -1,0 +1,7 @@
+kokoro>=0.9.4
+soundfile>=0.12
+numpy>=1.24
+# Prefer an existing CUDA torch (cu128 for Blackwell). setup.sh installs
+# https://download.pytorch.org/whl/cu128 when compute capability >= 12.
+torch
+sherpa-onnx>=1.12.0

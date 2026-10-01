@@ -52,6 +52,19 @@ def test_shell_executor_allowlist_command():
         assert not res["denied"]
 
 
+def test_shell_executor_background_command():
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, confirm_level_2_shell=False)
+        executor = ShellExecutor(gatekeeper=gatekeeper)
+
+        res = executor.execute("sleep 30 &")
+        assert res["success"] is True
+        assert res.get("background") is True
+        assert res.get("pid")
+        assert res["duration_ms"] < 5000
+
+
 def test_shell_executor_kill_switch_during_run():
     with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
         allowlist = AllowlistManager(storage_path=tmp_allow.name)

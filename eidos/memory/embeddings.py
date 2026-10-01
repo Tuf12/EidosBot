@@ -1,0 +1,124 @@
+"""Embedding client for local vector representations via Ollama nomic-embed-text."""
+
+import hashlib
+import logging
+from typing import List, Optional
+import requests
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_EMBEDDING_MODEL = "nomic-embed-text:latest"
+DEFAULT_EMBEDDING_DIM = 768
+
+
+class OllamaEmbeddingClient:
+    """Client for generating text embeddings using local Ollama nomic-embed-text."""
+
+    def __init__(
+        self,
+        base_url: str = "http://localhost:11434",
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        dimension: int = DEFAULT_EMBEDDING_DIM,
+        timeout: float = 15.0,
+        fallback_to_dummy: bool = False,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.dimension = dimension
+        self.timeout = timeout
+        self.fallback_to_dummy = fallback_to_dummy
+
+    def is_available(self) -> bool:
+        """Check if Ollama is reachable and has the requested embedding model installed."""
+        try:
+            resp = requests.get(f"{self.base_url}/api/tags", timeout=3.0)
+            if resp.status_code == 200:
+                models = [m.get("name") for m in resp.json().get("models", [])]
+                # Match full name or base name before colon
+                base_target = self.model.split(":")[0]
+                return any(
+                    self.model == m or m.startswith(f"{base_target}:") or m == base_target
+                    for m in models
+                )
+        except Exception:
+            pass
+        return False
+
+    def embed_text(self, text: str) -> List[float]:
+        """Generate a single 768-dimensional embedding vector for the given text."""
+        cleaned = text.strip()
+        if not cleaned:
+            # Return zero vector for empty text
+            return [0.0] * self.dimension
+
+        vectors = self.embed_batch([cleaned])
+        return vectors[0]
+
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for a batch of strings."""
+        if not texts:
+            return []
+
+        # 1. Try modern Ollama /api/embed endpoint
+        try:
+            payload = {
+                "model": self.model,
+                "input": texts,
+            }
+            resp = requests.post(
+                f"{self.base_url}/api/embed",
+                json=payload,
+                timeout=self.timeout,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                embeddings = data.get("embeddings", [])
+                if len(embeddings) == len(texts):
+                    return embeddings
+        except Exception as e:
+            logger.debug("Ollama /api/embed failed, trying fallback /api/embeddings: %s", e)
+
+        # 2. Try legacy /api/embeddings endpoint (single prompt per call)
+        results: List[List[float]] = []
+        try:
+            for t in texts:
+                resp = requests.post(
+                    f"{self.base_url}/api/embeddings",
+                    json={"model": self.model, "prompt": t},
+                    timeout=self.timeout,
+                )
+                if resp.status_code == 200:
+                    emb = resp.json().get("embedding")
+                    if emb and len(emb) == self.dimension:
+                        results.append(emb)
+                    else:
+                        raise ValueError(f"Unexpected embedding dimension: {len(emb) if emb else 0}")
+                else:
+                    raise RuntimeError(f"Ollama returned HTTP {resp.status_code}")
+
+            if len(results) == len(texts):
+                return results
+        except Exception as e:
+            logger.warning("Failed to generate embeddings via Ollama (%s): %s", self.model, e)
+            if self.fallback_to_dummy:
+                logger.info("Using deterministic fallback embedding generator.")
+                return [self._pseudo_embed(t) for t in texts]
+            raise
+
+        if self.fallback_to_dummy:
+            return [self._pseudo_embed(t) for t in texts]
+        raise RuntimeError(f"Failed to generate embeddings for batch of size {len(texts)}")
+
+    def _pseudo_embed(self, text: str) -> List[float]:
+        """Deterministic pseudo-embedding for testing or offline recovery."""
+        h = hashlib.sha256(text.encode("utf-8")).digest()
+        # Expand 32-byte hash deterministically to 768 floats
+        vec: List[float] = []
+        for i in range(self.dimension):
+            byte_val = h[i % len(h)]
+            mult = (i // len(h)) + 1
+            val = ((byte_val * mult) % 256) / 128.0 - 1.0
+            vec.append(val)
+        # Normalize
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]

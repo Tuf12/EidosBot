@@ -9,6 +9,7 @@ import yaml
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -20,13 +21,18 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QDoubleSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from eidos.memory.types import INTERACTION_STYLE_CHOICES
+from eidos.memory.user_store import UserStore
 from eidos.models.chutes_client import ChutesClient
 from eidos.models.ollama_client import OllamaClient
+from eidos.ui.profile_onboarding_dialog import ProfileOnboardingDialog
+from eidos.voice.tts import KokoroTTS
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,7 @@ CHUTES_VISION_PRESETS = [
 
 CHUTES_REASONING_PRESETS = [
     "moonshotai/Kimi-K2.6-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
     "Qwen/Qwen3-32B-TEE",
     "zai-org/GLM-5.1-TEE",
@@ -63,19 +70,23 @@ class SettingsDialog(QDialog):
         self,
         config: Optional[Dict[str, Any]] = None,
         config_path: str = "config.yaml",
+        user_store: Optional[UserStore] = None,
         parent=None,
     ):
         super().__init__(parent)
         self.config = copy.deepcopy(config or {})
         self.config_path = config_path
+        mem_path = self.config.get("memory", {}).get("user_profile_file")
+        self.user_store = user_store or UserStore(storage_path=mem_path)
         self._init_ui()
         self.load_from_config()
         # Query installed local models asynchronously or on init
         self._refresh_ollama_models(silent=True)
+        self._refresh_chutes_models(silent=True)
 
     def _init_ui(self):
         self.setWindowTitle("EidosBot Settings")
-        self.setMinimumSize(660, 560)
+        self.setMinimumSize(700, 580)
         self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
 
         main_layout = QVBoxLayout(self)
@@ -100,15 +111,24 @@ class SettingsDialog(QDialog):
 
         self.tab_models = QWidget()
         self.tab_safety = QWidget()
+        self.tab_voice = QWidget()
         self.tab_display = QWidget()
+        self.tab_memory = QWidget()
+        self.tab_telegram = QWidget()
 
         self._build_models_tab()
         self._build_safety_tab()
+        self._build_voice_tab()
         self._build_display_tab()
+        self._build_memory_tab()
+        self._build_telegram_tab()
 
         self.tabs.addTab(self.tab_models, "🤖 Models & Cloud")
         self.tabs.addTab(self.tab_safety, "🛡️ Safety & Confirmations")
+        self.tabs.addTab(self.tab_voice, "🎙️ Voice & Speech")
         self.tabs.addTab(self.tab_display, "🖥️ Display & HUD")
+        self.tabs.addTab(self.tab_memory, "🧠 User Memory")
+        self.tabs.addTab(self.tab_telegram, "📱 Telegram")
 
         main_layout.addWidget(self.tabs, stretch=1)
 
@@ -134,13 +154,16 @@ class SettingsDialog(QDialog):
 
         main_layout.addLayout(bottom_box)
 
+        from eidos.ui.styles import GLOBAL_TOOLTIP_STYLE
+
         self.setStyleSheet(
             "QDialog { background-color: #1e1f29; color: #f8f8f2; } "
             "QGroupBox { font-weight: bold; border: 1px solid #44475a; border-radius: 6px; margin-top: 10px; padding-top: 12px; } "
             "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 5px; color: #8be9fd; } "
             "QLineEdit, QComboBox, QSpinBox { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; border-radius: 4px; padding: 6px; } "
             "QLineEdit:focus, QComboBox:focus { border: 1px solid #bd93f9; } "
-            "QPushButton:hover { opacity: 0.9; }"
+            "QPushButton:hover { opacity: 0.9; }\n"
+            f"{GLOBAL_TOOLTIP_STYLE}"
         )
 
     # -------------------------------------------------------------
@@ -319,7 +342,79 @@ class SettingsDialog(QDialog):
         layout.addStretch()
 
     # -------------------------------------------------------------
-    # TAB 3: DISPLAY & HUD
+    # TAB 3: VOICE & SPEECH
+    # -------------------------------------------------------------
+    def _build_voice_tab(self):
+        layout = QVBoxLayout(self.tab_voice)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(14)
+
+        voice_group = QGroupBox("Text-to-Speech (Kokoro-82M)")
+        voice_layout = QVBoxLayout(voice_group)
+        voice_layout.setSpacing(10)
+
+        self.chk_voice_enabled = QCheckBox("Enable voice subsystem (push-to-talk + TTS playback)")
+        self.chk_voice_enabled.setStyleSheet("color: #f8f8f2; font-size: 13px;")
+        voice_layout.addWidget(self.chk_voice_enabled)
+
+        self.chk_auto_speak = QCheckBox("Automatically speak chat responses (Recommended: ON)")
+        self.chk_auto_speak.setStyleSheet("color: #f8f8f2; font-size: 13px;")
+        voice_layout.addWidget(self.chk_auto_speak)
+
+        self.chk_auto_submit = QCheckBox("Auto-send transcribed speech as the next chat turn (Recommended: ON)")
+        self.chk_auto_submit.setStyleSheet("color: #f8f8f2; font-size: 13px;")
+        voice_layout.addWidget(self.chk_auto_submit)
+
+        voice_form = QFormLayout()
+        voice_form.setSpacing(8)
+
+        self.combo_tts_voice = QComboBox()
+        self.combo_tts_voice.setEditable(True)
+        self.combo_tts_voice.addItems([
+            "bm_george", "bm_daniel", "bm_fable", "bm_lewis",
+            "af_bella", "af_heart", "af_nicole", "af_sky",
+            "am_adam", "am_echo", "am_eric", "am_michael",
+        ])
+        voice_form.addRow("TTS Voice:", self.combo_tts_voice)
+
+        self.spin_tts_speed = QDoubleSpinBox()
+        self.spin_tts_speed.setRange(0.5, 2.0)
+        self.spin_tts_speed.setSingleStep(0.1)
+        self.spin_tts_speed.setDecimals(1)
+        voice_form.addRow("Speech Speed:", self.spin_tts_speed)
+
+        voice_layout.addLayout(voice_form)
+
+        tts_test_box = QHBoxLayout()
+        self.btn_test_tts = QPushButton("🔊 Test Speech")
+        self.btn_test_tts.setStyleSheet(
+            "background-color: #6272a4; color: #f8f8f2; padding: 5px 12px; border-radius: 4px;"
+        )
+        self.btn_test_tts.clicked.connect(self._test_tts)
+        self.lbl_tts_status = QLabel("")
+        self.lbl_tts_status.setStyleSheet("font-size: 11px;")
+        tts_test_box.addWidget(self.btn_test_tts)
+        tts_test_box.addWidget(self.lbl_tts_status, stretch=1)
+        voice_layout.addLayout(tts_test_box)
+
+        voice_hint = QLabel(
+            "When auto-speak is on, Eidos reads each chat reply aloud in short-then-longer clips "
+            "so speech starts a moment after text appears and continues without a long buffer pause. "
+            "Push-to-talk (pill microphone or Ctrl+Alt+Space) transcribes your speech and, with "
+            "auto-send on, immediately starts the next turn."
+        )
+        voice_hint.setWordWrap(True)
+        voice_hint.setStyleSheet(
+            "background-color: #282a36; color: #bfbfbf; border: 1px solid #44475a; "
+            "border-radius: 4px; padding: 10px; font-size: 12px;"
+        )
+        voice_layout.addWidget(voice_hint)
+
+        layout.addWidget(voice_group)
+        layout.addStretch()
+
+    # -------------------------------------------------------------
+    # TAB 4: DISPLAY & HUD
     # -------------------------------------------------------------
     def _build_display_tab(self):
         layout = QVBoxLayout(self.tab_display)
@@ -344,6 +439,228 @@ class SettingsDialog(QDialog):
         hud_form.addRow("Default Status Pill Position:", self.combo_pill_pos)
 
         layout.addWidget(hud_group)
+        layout.addStretch()
+
+    # -------------------------------------------------------------
+    # TAB 5: USER PROFILE MEMORY
+    # -------------------------------------------------------------
+    def _build_memory_tab(self):
+        layout = QVBoxLayout(self.tab_memory)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        intro = QLabel(
+            "Atomic facts stored at <b>~/.eidos/user_profile.yaml</b> on this machine only. "
+            "Eidos injects them into the system prompt; the agent can update them with your approval."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #bd93f9; font-size: 12px;")
+        layout.addWidget(intro)
+
+        form_group = QGroupBox("Profile Facts")
+        form = QFormLayout(form_group)
+        form.setSpacing(8)
+
+        self.edit_profile_name = QLineEdit()
+        form.addRow("Display name:", self.edit_profile_name)
+
+        self.edit_profile_projects = QLineEdit()
+        form.addRow("Projects directory:", self.edit_profile_projects)
+
+        self.edit_profile_editor = QLineEdit()
+        form.addRow("Primary editor:", self.edit_profile_editor)
+
+        self.combo_profile_style = QComboBox()
+        self.combo_profile_style.setEditable(True)
+        self.combo_profile_style.addItems(list(INTERACTION_STYLE_CHOICES))
+        form.addRow("Interaction style:", self.combo_profile_style)
+
+        self.edit_profile_tools = QLineEdit()
+        form.addRow("Tool preference:", self.edit_profile_tools)
+
+        layout.addWidget(form_group)
+
+        rules_group = QGroupBox("Workflow rules (one per line)")
+        rules_layout = QVBoxLayout(rules_group)
+        from PyQt6.QtWidgets import QTextEdit
+
+        self.edit_profile_rules = QTextEdit()
+        self.edit_profile_rules.setPlaceholderText("Always run pytest with -v before finishing code tasks")
+        self.edit_profile_rules.setMaximumHeight(120)
+        rules_layout.addWidget(self.edit_profile_rules)
+        layout.addWidget(rules_group)
+
+        self.lbl_profile_path = QLabel("")
+        self.lbl_profile_path.setStyleSheet("color: #8be9fd; font-size: 11px;")
+        layout.addWidget(self.lbl_profile_path)
+
+        btn_row = QHBoxLayout()
+        self.btn_run_onboarding = QPushButton("Run setup wizard…")
+        self.btn_run_onboarding.setStyleSheet(
+            "background-color: #6272a4; color: #f8f8f2; padding: 6px 12px; border-radius: 4px;"
+        )
+        self.btn_run_onboarding.clicked.connect(self._open_profile_wizard)
+        btn_row.addWidget(self.btn_run_onboarding)
+
+        self.btn_save_profile = QPushButton("Save user profile")
+        self.btn_save_profile.setStyleSheet(
+            "background-color: #50fa7b; color: #282a36; font-weight: bold; padding: 6px 16px; border-radius: 4px;"
+        )
+        self.btn_save_profile.clicked.connect(self._save_user_profile_from_tab)
+        btn_row.addWidget(self.btn_save_profile)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+        layout.addStretch()
+
+    def _load_user_profile_tab(self):
+        profile = self.user_store.load(force_reload=True)
+        self.edit_profile_name.setText(str(profile.user_identity.get("name", "")))
+        self.edit_profile_projects.setText(str(profile.environment_facts.get("projects_dir", "")))
+        self.edit_profile_editor.setText(str(profile.environment_facts.get("primary_editor", "")))
+        style = str(profile.preferences.get("interaction_style", ""))
+        if style:
+            idx = self.combo_profile_style.findText(style)
+            if idx >= 0:
+                self.combo_profile_style.setCurrentIndex(idx)
+            else:
+                self.combo_profile_style.setEditText(style)
+        else:
+            self.combo_profile_style.setCurrentIndex(0)
+        self.edit_profile_tools.setText(str(profile.preferences.get("tool_preference", "")))
+        self.edit_profile_rules.setPlainText("\n".join(profile.workflow_rules))
+        self.lbl_profile_path.setText(f"File: {self.user_store.path}")
+
+    def _save_user_profile_from_tab(self):
+        try:
+            rules = [
+                line.strip()
+                for line in self.edit_profile_rules.toPlainText().splitlines()
+                if line.strip()
+            ]
+            profile = self.user_store.load(force_reload=True)
+            profile.user_identity["name"] = self.edit_profile_name.text().strip()
+            if self.edit_profile_projects.text().strip():
+                profile.environment_facts["projects_dir"] = os.path.expanduser(
+                    self.edit_profile_projects.text().strip()
+                )
+            if self.edit_profile_editor.text().strip():
+                profile.environment_facts["primary_editor"] = self.edit_profile_editor.text().strip()
+            if self.combo_profile_style.currentText().strip():
+                profile.preferences["interaction_style"] = (
+                    self.combo_profile_style.currentText().strip()
+                )
+            if self.edit_profile_tools.text().strip():
+                profile.preferences["tool_preference"] = self.edit_profile_tools.text().strip()
+            profile.workflow_rules = rules
+            profile.onboarding_complete = True
+            self.user_store.save(profile)
+            self.status_msg.setText("User profile saved.")
+            self.status_msg.setStyleSheet("color: #50fa7b; font-size: 12px;")
+        except Exception as exc:
+            QMessageBox.critical(self, "Profile Error", f"Could not save profile: {exc}")
+
+    def _open_profile_wizard(self):
+        dialog = ProfileOnboardingDialog(user_store=self.user_store, parent=self)
+        if dialog.exec():
+            self._load_user_profile_tab()
+
+    # -------------------------------------------------------------
+    # TAB 6: TELEGRAM GATEWAY
+    # -------------------------------------------------------------
+    def _build_telegram_tab(self):
+        layout = QVBoxLayout(self.tab_telegram)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        # Overview / Guide Box
+        guide_box = QLabel(
+            "📱 <b>Telegram Remote Gateway & Human-in-the-Loop</b><br>"
+            "Control EidosBot from your mobile phone, receive task summaries, and approve Level 2/3 host commands "
+            "remotely using interactive inline buttons (<code>[Approve]</code> / <code>[Reject]</code>).<br><br>"
+            "<b>Setup Guide:</b><br>"
+            "1. Search <b>@BotFather</b> in Telegram, send <code>/newbot</code>, and copy your <b>Bot Token</b>.<br>"
+            "2. Search <b>@userinfobot</b> in Telegram to find your numeric <b>User ID</b>.<br>"
+            "3. Paste both below and click <b>⚡ Test Bot Token</b> to verify."
+        )
+        guide_box.setWordWrap(True)
+        guide_box.setStyleSheet(
+            "background-color: #282a36; color: #8be9fd; border: 1px solid #44475a; "
+            "border-radius: 6px; padding: 12px; font-size: 12px;"
+        )
+        layout.addWidget(guide_box)
+
+        # Credentials Group
+        cred_group = QGroupBox("Bot Credentials & Access Control")
+        cred_layout = QVBoxLayout(cred_group)
+        cred_layout.setSpacing(10)
+
+        self.chk_telegram_enabled = QCheckBox("Enable Telegram Remote Companion")
+        self.chk_telegram_enabled.setStyleSheet("color: #50fa7b; font-weight: bold; font-size: 13px;")
+        cred_layout.addWidget(self.chk_telegram_enabled)
+
+        cred_form = QFormLayout()
+        cred_form.setSpacing(10)
+
+        # Bot API Token with show/hide
+        token_box = QHBoxLayout()
+        self.edit_telegram_token = QLineEdit()
+        self.edit_telegram_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_telegram_token.setPlaceholderText("e.g. 1234567890:ABCdefGhIJKlmNoPQRsTUVwxyZ")
+        self.btn_toggle_tg_token = QPushButton("👁️")
+        self.btn_toggle_tg_token.setFixedWidth(36)
+        self.btn_toggle_tg_token.setStyleSheet("background-color: #44475a; color: #f8f8f2; border-radius: 4px;")
+        self.btn_toggle_tg_token.clicked.connect(self._toggle_tg_token_visibility)
+        token_box.addWidget(self.edit_telegram_token)
+        token_box.addWidget(self.btn_toggle_tg_token)
+        cred_form.addRow("Bot API Token:", token_box)
+
+        # Allowed User IDs
+        self.edit_telegram_user_ids = QLineEdit()
+        self.edit_telegram_user_ids.setPlaceholderText("e.g. 123456789, 987654321")
+        cred_form.addRow("Allowed User ID(s):", self.edit_telegram_user_ids)
+
+        cred_hint = QLabel("🔒 <i>Strict Security: Messages from any user ID not in this list are completely ignored and blocked.</i>")
+        cred_hint.setStyleSheet("color: #6272a4; font-size: 11px;")
+        cred_form.addRow("", cred_hint)
+
+        # Test Token Button
+        test_btn_box = QHBoxLayout()
+        self.btn_test_telegram = QPushButton("⚡ Test Bot Token")
+        self.btn_test_telegram.setStyleSheet(
+            "background-color: #50fa7b; color: #282a36; font-weight: bold; padding: 6px 14px; border-radius: 4px;"
+        )
+        self.btn_test_telegram.clicked.connect(self._test_telegram_connection)
+        self.lbl_telegram_status = QLabel("")
+        self.lbl_telegram_status.setStyleSheet("font-size: 12px;")
+        test_btn_box.addWidget(self.btn_test_telegram)
+        test_btn_box.addWidget(self.lbl_telegram_status, stretch=1)
+        cred_form.addRow("", test_btn_box)
+
+        cred_layout.addLayout(cred_form)
+        layout.addWidget(cred_group)
+
+        # Remote Controls & Notifications Group
+        ctrl_group = QGroupBox("Remote Controls & Notification Rules")
+        ctrl_layout = QVBoxLayout(ctrl_group)
+        ctrl_layout.setSpacing(8)
+
+        self.chk_tg_remote_kill = QCheckBox("Enable Remote Kill Switch (/kill command & button)")
+        self.chk_tg_remote_kill.setStyleSheet("color: #f8f8f2; font-size: 12px;")
+        ctrl_layout.addWidget(self.chk_tg_remote_kill)
+
+        self.chk_tg_risk_approval = QCheckBox("Push interactive cards with [Approve] / [Reject] buttons for Level 2 & 3 commands")
+        self.chk_tg_risk_approval.setStyleSheet("color: #f8f8f2; font-size: 12px;")
+        ctrl_layout.addWidget(self.chk_tg_risk_approval)
+
+        self.chk_tg_job_milestones = QCheckBox("Push batch job milestone progress updates to your phone")
+        self.chk_tg_job_milestones.setStyleSheet("color: #f8f8f2; font-size: 12px;")
+        ctrl_layout.addWidget(self.chk_tg_job_milestones)
+
+        self.chk_tg_task_completed = QCheckBox("Push final summary notification when an autonomous task completes")
+        self.chk_tg_task_completed.setStyleSheet("color: #f8f8f2; font-size: 12px;")
+        ctrl_layout.addWidget(self.chk_tg_task_completed)
+
+        layout.addWidget(ctrl_group)
         layout.addStretch()
 
     # -------------------------------------------------------------
@@ -382,6 +699,14 @@ class SettingsDialog(QDialog):
         self.chk_confirm_ui.setChecked(bool(safety_cfg.get("confirm_level_1_ui", False)))
         self.chk_confirm_shell.setChecked(bool(safety_cfg.get("confirm_level_2_shell", True)))
 
+        # Voice
+        voice_cfg = self.config.get("voice", {})
+        self.chk_voice_enabled.setChecked(bool(voice_cfg.get("enabled", True)))
+        self.chk_auto_speak.setChecked(bool(voice_cfg.get("auto_speak_responses", True)))
+        self.chk_auto_submit.setChecked(bool(voice_cfg.get("auto_submit_transcription", True)))
+        self.combo_tts_voice.setEditText(voice_cfg.get("tts_voice", "bm_george"))
+        self.spin_tts_speed.setValue(float(voice_cfg.get("tts_speed", 1.0)))
+
         # Display
         ui_cfg = self.config.get("ui", {})
         self.chk_hud_enabled.setChecked(bool(ui_cfg.get("hud_overlay_enabled", True)))
@@ -390,6 +715,29 @@ class SettingsDialog(QDialog):
         idx = self.combo_pill_pos.findText(pill_pos)
         if idx >= 0:
             self.combo_pill_pos.setCurrentIndex(idx)
+
+        # Telegram Gateway
+        gw_cfg = self.config.get("gateway", {})
+        tg_cfg = gw_cfg.get("telegram", {})
+        self.chk_telegram_enabled.setChecked(bool(tg_cfg.get("enabled", False)))
+        self.edit_telegram_token.setText(tg_cfg.get("bot_token", ""))
+
+        user_ids = tg_cfg.get("allowed_user_ids", [])
+        if isinstance(user_ids, list):
+            self.edit_telegram_user_ids.setText(", ".join(str(u) for u in user_ids))
+        elif user_ids:
+            self.edit_telegram_user_ids.setText(str(user_ids))
+        else:
+            self.edit_telegram_user_ids.setText("")
+
+        self.chk_tg_remote_kill.setChecked(bool(tg_cfg.get("remote_kill_switch_enabled", True)))
+
+        notifs = tg_cfg.get("notifications", {})
+        self.chk_tg_risk_approval.setChecked(bool(notifs.get("on_risk_approval", True)))
+        self.chk_tg_job_milestones.setChecked(bool(notifs.get("on_job_milestones", True)))
+        self.chk_tg_task_completed.setChecked(bool(notifs.get("on_task_completed", True)))
+
+        self._load_user_profile_tab()
 
     def extract_config(self) -> Dict[str, Any]:
         """Extract updated values from GUI widgets into config dictionary."""
@@ -425,6 +773,15 @@ class SettingsDialog(QDialog):
         cfg["safety"]["confirm_level_2_shell"] = self.chk_confirm_shell.isChecked()
         cfg["safety"]["confirm_level_3_destructive"] = True  # Hard-locked
 
+        # Voice
+        if "voice" not in cfg:
+            cfg["voice"] = {}
+        cfg["voice"]["enabled"] = self.chk_voice_enabled.isChecked()
+        cfg["voice"]["auto_speak_responses"] = self.chk_auto_speak.isChecked()
+        cfg["voice"]["auto_submit_transcription"] = self.chk_auto_submit.isChecked()
+        cfg["voice"]["tts_voice"] = self.combo_tts_voice.currentText().strip()
+        cfg["voice"]["tts_speed"] = float(self.spin_tts_speed.value())
+
         # UI
         if "ui" not in cfg:
             cfg["ui"] = {}
@@ -433,6 +790,35 @@ class SettingsDialog(QDialog):
         if "status_pill" not in cfg["ui"]:
             cfg["ui"]["status_pill"] = {}
         cfg["ui"]["status_pill"]["position"] = self.combo_pill_pos.currentText()
+
+        # Telegram Gateway
+        if "gateway" not in cfg:
+            cfg["gateway"] = {}
+        if "telegram" not in cfg["gateway"]:
+            cfg["gateway"]["telegram"] = {}
+
+        tg_cfg = cfg["gateway"]["telegram"]
+        tg_cfg["enabled"] = self.chk_telegram_enabled.isChecked()
+        tg_cfg["bot_token"] = self.edit_telegram_token.text().strip()
+
+        raw_uids = self.edit_telegram_user_ids.text().strip()
+        parsed_uids = []
+        if raw_uids:
+            for part in raw_uids.replace(";", ",").split(","):
+                part_clean = part.strip()
+                if part_clean:
+                    try:
+                        parsed_uids.append(int(part_clean))
+                    except ValueError:
+                        parsed_uids.append(part_clean)
+        tg_cfg["allowed_user_ids"] = parsed_uids
+        tg_cfg["remote_kill_switch_enabled"] = self.chk_tg_remote_kill.isChecked()
+
+        if "notifications" not in tg_cfg:
+            tg_cfg["notifications"] = {}
+        tg_cfg["notifications"]["on_risk_approval"] = self.chk_tg_risk_approval.isChecked()
+        tg_cfg["notifications"]["on_job_milestones"] = self.chk_tg_job_milestones.isChecked()
+        tg_cfg["notifications"]["on_task_completed"] = self.chk_tg_task_completed.isChecked()
 
         return cfg
 
@@ -505,8 +891,39 @@ class SettingsDialog(QDialog):
             self.lbl_ollama_status.setText("❌ Cannot connect to Ollama server")
             self.lbl_ollama_status.setStyleSheet("color: #ff5555; font-size: 11px;")
 
+    def _refresh_chutes_models(self, silent: bool = False):
+        """Fetch model names from Chutes AI and populate dropdowns."""
+        api_key = self.edit_chutes_key.text().strip()
+        base_url = self.edit_chutes_url.text().strip()
+        if not api_key:
+            return
+
+        client = ChutesClient(api_key=api_key, base_url=base_url)
+        models = client.list_models()
+        if models:
+            curr_reasoning = self.combo_chutes_reasoning.currentText().strip()
+            curr_vision = self.combo_chutes_vision.currentText().strip()
+
+            self.combo_chutes_reasoning.clear()
+            self.combo_chutes_vision.clear()
+
+            self.combo_chutes_reasoning.addItems(models)
+            self.combo_chutes_vision.addItems(models)
+
+            if curr_reasoning:
+                self.combo_chutes_reasoning.setEditText(curr_reasoning)
+            if curr_vision:
+                self.combo_chutes_vision.setEditText(curr_vision)
+
+            self.lbl_chutes_status.setText(f"✅ Loaded {len(models)} Chutes models")
+            self.lbl_chutes_status.setStyleSheet("color: #50fa7b; font-size: 11px;")
+        else:
+            if not silent:
+                self.lbl_chutes_status.setText("❌ Failed to fetch Chutes models")
+                self.lbl_chutes_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+
     def _test_chutes_connection(self):
-        """Test Chutes AI authentication."""
+        """Test Chutes AI authentication and refresh models list."""
         api_key = self.edit_chutes_key.text().strip()
         base_url = self.edit_chutes_url.text().strip()
 
@@ -517,8 +934,74 @@ class SettingsDialog(QDialog):
 
         client = ChutesClient(api_key=api_key, base_url=base_url)
         if client.check_connection():
+            self._refresh_chutes_models(silent=True)
             self.lbl_chutes_status.setText("✅ Chutes API key verified & authenticated!")
             self.lbl_chutes_status.setStyleSheet("color: #50fa7b; font-size: 11px;")
         else:
             self.lbl_chutes_status.setText("❌ Authentication failed or invalid key")
             self.lbl_chutes_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+
+    def _test_tts(self):
+        """Test Kokoro TTS playback with current voice settings."""
+        voice_cfg = self.config.get("voice", {})
+        tts = KokoroTTS(
+            python_path=voice_cfg.get("python_path"),
+            voice_dir=voice_cfg.get("optimalx_voice_dir"),
+            default_voice=self.combo_tts_voice.currentText().strip() or "bm_george",
+            default_speed=float(self.spin_tts_speed.value()),
+            device=voice_cfg.get("device", "cpu"),
+        )
+        if not tts.is_available:
+            self.lbl_tts_status.setText("❌ Kokoro TTS not found (check python_path / optimalx_voice_dir in config.yaml)")
+            self.lbl_tts_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+            return
+
+        ok = tts.speak("Eidos voice test successful.", blocking=True)
+        runtime = getattr(tts, "_voice_runtime", None)
+        path_hint = ""
+        if runtime and runtime.scripts_dir:
+            path_hint = f" ({runtime.python_path})"
+        if ok:
+            self.lbl_tts_status.setText(f"✅ Speech played successfully{path_hint}")
+            self.lbl_tts_status.setStyleSheet("color: #50fa7b; font-size: 11px;")
+        else:
+            self.lbl_tts_status.setText("❌ TTS synthesis or playback failed (check logs)")
+            self.lbl_tts_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+
+    def _toggle_tg_token_visibility(self):
+        if self.edit_telegram_token.echoMode() == QLineEdit.EchoMode.Password:
+            self.edit_telegram_token.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.btn_toggle_tg_token.setText("🔒")
+        else:
+            self.edit_telegram_token.setEchoMode(QLineEdit.EchoMode.Password)
+            self.btn_toggle_tg_token.setText("👁️")
+
+    def _test_telegram_connection(self):
+        """Test Telegram Bot Token via Telegram getMe API."""
+        token = self.edit_telegram_token.text().strip()
+        if not token:
+            self.lbl_telegram_status.setText("⚠️ Please enter a Bot Token first")
+            self.lbl_telegram_status.setStyleSheet("color: #ffb86c; font-size: 11px;")
+            return
+
+        self.lbl_telegram_status.setText("⏳ Testing bot token with Telegram API...")
+        self.lbl_telegram_status.setStyleSheet("color: #8be9fd; font-size: 11px;")
+        QApplication.processEvents()
+
+        try:
+            import requests
+            resp = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+            data = resp.json()
+            if resp.status_code == 200 and data.get("ok"):
+                bot_user = data.get("result", {}).get("username", "UnknownBot")
+                bot_name = data.get("result", {}).get("first_name", "Bot")
+                self.lbl_telegram_status.setText(f"✅ Bot connected: @{bot_user} ({bot_name})")
+                self.lbl_telegram_status.setStyleSheet("color: #50fa7b; font-size: 11px; font-weight: bold;")
+            else:
+                desc = data.get("description", "Unauthorized or invalid token")
+                self.lbl_telegram_status.setText(f"❌ Verification failed: {desc}")
+                self.lbl_telegram_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+        except Exception as e:
+            self.lbl_telegram_status.setText(f"❌ Connection error: {str(e)[:60]}")
+            self.lbl_telegram_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+

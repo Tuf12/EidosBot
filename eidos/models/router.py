@@ -41,6 +41,28 @@ class ModelRouter(BaseModelClient):
         """Update provider preference ('local', 'cloud', 'auto')."""
         self.preference = ProviderPreference(preference.lower())
 
+    @property
+    def recall_interceptor(self):
+        return getattr(self.ollama, "recall_interceptor", None) or getattr(self.chutes, "recall_interceptor", None)
+
+    @recall_interceptor.setter
+    def recall_interceptor(self, value):
+        if hasattr(self.ollama, "recall_interceptor"):
+            self.ollama.recall_interceptor = value
+        if hasattr(self.chutes, "recall_interceptor"):
+            self.chutes.recall_interceptor = value
+
+    @property
+    def on_recall_callback(self):
+        return getattr(self.ollama, "on_recall_callback", None) or getattr(self.chutes, "on_recall_callback", None)
+
+    @on_recall_callback.setter
+    def on_recall_callback(self, value):
+        if hasattr(self.ollama, "on_recall_callback"):
+            self.ollama.on_recall_callback = value
+        if hasattr(self.chutes, "on_recall_callback"):
+            self.chutes.on_recall_callback = value
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
