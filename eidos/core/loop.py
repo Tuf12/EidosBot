@@ -14,7 +14,7 @@ from eidos.core.clock import EidosClock
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
 from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
-from eidos.jobs.runner import BatchJobRunner
+from eidos.jobs import BatchJobRunner, SkillJobProcessor
 from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.episodic_store import EpisodicStore
 from eidos.memory.recall_stream import RecallStreamInterceptor
@@ -111,6 +111,18 @@ class AgentLoop:
         if self.conversation_store:
             self.active_conversation_id = self.conversation_store.get_or_create_active_conversation_id()
 
+        self.windows = WindowDetector()
+
+        # Integrations
+        opt_cfg = self.config.get("integrations", {}).get("optimalx", {})
+        self.optimalx = OptimalXBridge(
+            config_path=opt_cfg.get("config_path"),
+            db_path=opt_cfg.get("db_path"),
+            notex_dir=opt_cfg.get("notex_dir"),
+            cdp_port=opt_cfg.get("cdp_port", 9222),
+            window_detector=self.windows,
+        )
+
         self.ollama = OllamaClient(
             base_url=local_cfg.get("base_url", "http://localhost:11434"),
             reasoning_model=local_cfg.get("reasoning_model", "batiai/gemma4-26b:iq4"),
@@ -120,9 +132,10 @@ class AgentLoop:
 
         # Active Recall Interceptor (mid-stream <recall> query splicing)
         self.recall_interceptor: Optional[RecallStreamInterceptor] = None
-        if self.memory_enabled and self.episodic_store:
+        if (self.memory_enabled and self.episodic_store) or self.optimalx:
             self.recall_interceptor = RecallStreamInterceptor(
                 episodic_store=self.episodic_store,
+                optimalx_bridge=self.optimalx,
                 max_recalls_per_turn=int(mem_cfg.get("max_recalls_per_turn", 3)),
                 min_similarity=float(mem_cfg.get("recall_min_similarity", 0.20)),
             )
@@ -151,7 +164,6 @@ class AgentLoop:
         self.screen = ScreenCapture(
             scale_factor=self.config.get("perception", {}).get("screen_scale_factor", 1.0)
         )
-        self.windows = WindowDetector()
         clock_cfg = self.config.get("clock", {})
         self.clock = EidosClock(timezone_name=clock_cfg.get("timezone"))
         self.grounder = VisualGrounder(model_router=self.router)
@@ -177,13 +189,6 @@ class AgentLoop:
             sandbox_config=self.config.get("sandbox"),
         )
         self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
-
-        # Integrations
-        opt_cfg = self.config.get("integrations", {}).get("optimalx", {})
-        self.optimalx = OptimalXBridge(
-            cdp_port=opt_cfg.get("cdp_port", 9222),
-            window_detector=self.windows
-        )
         self.web = WebResearchEngine(model_router=self.router)
 
         # Headless Browser Subsystem (Playwright)
@@ -200,10 +205,19 @@ class AgentLoop:
             skills_dir=skills_cfg.get("directory"),
             project_skills_dir=skills_cfg.get("project_directory"),
         )
+        self.job_processor = SkillJobProcessor(
+            model_router=self.router,
+            web_research_engine=self.web,
+            browser_manager=self.browser,
+            optimalx_bridge=self.optimalx,
+            config=self.config,
+        )
         jobs_cfg = self.config.get("jobs", {})
         self.jobs = BatchJobRunner(
             skills_manager=self.skills,
             default_jobs_dir=jobs_cfg.get("default_output_dir"),
+            default_processor=self.job_processor.process_item,
+            kill_switch=self.kill_switch,
         )
 
         # Voice Subsystem
@@ -233,6 +247,7 @@ class AgentLoop:
             "on_response": [],
             "on_task_finish": [],
             "on_conversation_title_changed": [],
+            "on_conversation_changed": [],
         }
         self.conversation_history: List[Dict[str, Any]] = []
 
@@ -260,8 +275,13 @@ class AgentLoop:
     def clear_history(self):
         """Clear conversational turn history and stored messages for active conversation."""
         self.conversation_history.clear()
+        title = "New Chat"
         if self.conversation_store and self.active_conversation_id:
             self.conversation_store.clear_conversation_messages(self.active_conversation_id)
+            conv = self.conversation_store.get_conversation(self.active_conversation_id)
+            if conv:
+                title = conv.get("title", "New Chat")
+        self._emit("on_conversation_changed", self.active_conversation_id, title)
 
     def cancel_task(self) -> None:
         """Request graceful cancellation of the running agent task."""
@@ -270,6 +290,11 @@ class AgentLoop:
         try:
             if self.voice:
                 self.voice.stop_speaking()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "jobs") and self.jobs and self.jobs.is_worker_running():
+                self.jobs.stop_background_worker(timeout=2.0)
         except Exception:
             pass
 
@@ -286,6 +311,7 @@ class AgentLoop:
             self.active_conversation_id = None
         self.conversation_history.clear()
         self._emit("on_conversation_title_changed", title)
+        self._emit("on_conversation_changed", self.active_conversation_id, title)
         return self.active_conversation_id or ""
 
     def switch_conversation(self, conversation_id: str) -> bool:
@@ -302,7 +328,9 @@ class AgentLoop:
             role = (m.get("role") or "").lower()
             if role in ("user", "assistant"):
                 self.conversation_history.append({"role": role, "content": m.get("content", "")})
-        self._emit("on_conversation_title_changed", conv.get("title", "New Chat"))
+        title = conv.get("title", "New Chat")
+        self._emit("on_conversation_title_changed", title)
+        self._emit("on_conversation_changed", conversation_id, title)
         return True
 
     def rename_conversation(self, conversation_id: str, new_title: str) -> bool:
@@ -414,9 +442,11 @@ class AgentLoop:
                 )
             if self.recall_interceptor:
                 self.recall_interceptor.episodic_store = self.episodic_store
-            elif self.memory_enabled and self.episodic_store:
+                self.recall_interceptor.optimalx = self.optimalx
+            elif (self.memory_enabled and self.episodic_store) or self.optimalx:
                 self.recall_interceptor = RecallStreamInterceptor(
                     episodic_store=self.episodic_store,
+                    optimalx_bridge=self.optimalx,
                     max_recalls_per_turn=int(mem_cfg.get("max_recalls_per_turn", 3)),
                     min_similarity=float(mem_cfg.get("recall_min_similarity", 0.20)),
                 )
@@ -428,6 +458,20 @@ class AgentLoop:
                 conv_db_p = mem_cfg.get("conversations_db_path") or mem_cfg.get("conversation_db_path")
                 self.conversation_store = ConversationStore(db_path=conv_db_p)
                 self.active_conversation_id = self.conversation_store.get_or_create_active_conversation_id()
+
+        if "integrations" in new_config and "optimalx" in new_config["integrations"]:
+            opt_cfg = new_config["integrations"]["optimalx"]
+            self.optimalx = OptimalXBridge(
+                config_path=opt_cfg.get("config_path"),
+                db_path=opt_cfg.get("db_path"),
+                notex_dir=opt_cfg.get("notex_dir"),
+                cdp_port=opt_cfg.get("cdp_port", 9222),
+                window_detector=self.windows,
+            )
+            if self.recall_interceptor:
+                self.recall_interceptor.optimalx = self.optimalx
+            if hasattr(self, "job_processor") and self.job_processor:
+                self.job_processor.optimalx = self.optimalx
 
         logger.info("AgentLoop successfully reconfigured with updated settings.")
 
@@ -463,9 +507,14 @@ class AgentLoop:
             return None
 
     def _on_kill_stop_voice(self) -> None:
-        """Stop TTS immediately when the emergency kill switch fires."""
+        """Stop TTS and batch workers immediately when the emergency kill switch fires."""
         try:
             self.voice.stop_speaking()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "jobs") and self.jobs:
+                self.jobs._on_kill_switch_triggered()
         except Exception:
             pass
 
@@ -476,8 +525,10 @@ class AgentLoop:
             return False
         return bool(voice_cfg.get("auto_speak_responses", True))
 
-    def _speak_task_summary(self, text: str) -> None:
+    def _speak_task_summary(self, text: str, speak_summary: bool = True) -> None:
         """Speak a chat reply / task summary using progressive TTS clips."""
+        if not speak_summary:
+            return
         clean_text = (text or "").strip()
         if not clean_text or not self._should_auto_speak():
             return
@@ -492,7 +543,31 @@ class AgentLoop:
         else:
             self.voice.speak(clean_text, blocking=False)
 
-    def run_task(self, user_goal: str, max_steps: int = 15) -> Dict[str, Any]:
+    def _compact_context_if_needed(self, messages: List[Dict[str, Any]], max_chars: int = 48000) -> None:
+        """Prune older tool observations to prevent prompt context bloat on long multi-step tasks."""
+        total_chars = sum(len(m.get("content") or "") for m in messages)
+        if total_chars <= max_chars:
+            return
+
+        # Compact older tool messages (keep the most recent 2 tool messages untouched)
+        tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+        if len(tool_indices) > 2:
+            older_tool_indices = tool_indices[:-2]
+            for idx in older_tool_indices:
+                content = messages[idx].get("content") or ""
+                if len(content) > 1200:
+                    tool_name = messages[idx].get("name", "tool")
+                    messages[idx]["content"] = (
+                        content[:600]
+                        + f"\n... [Historical observation from {tool_name} pruned to conserve context ({len(content)} chars total)]"
+                    )
+
+    def run_task(
+        self,
+        user_goal: str,
+        max_steps: int = 15,
+        speak_summary: bool = True,
+    ) -> Dict[str, Any]:
         """Run autonomous agent loop until goal achieved or max_steps reached."""
         logger.info("Starting EidosBot task: %s", user_goal)
         self._stop_requested.clear()
@@ -624,6 +699,9 @@ class AgentLoop:
                 "clock": self.clock.snapshot().to_dict(),
             }
 
+            # Prune context if older tool outputs are accumulating
+            self._compact_context_if_needed(messages, max_chars=48000)
+
             # 2. Reason: Call model
             response = self.model.chat(messages=messages, tools=EIDOS_TOOLS)
 
@@ -644,24 +722,68 @@ class AgentLoop:
                 ]
             messages.append(assistant_msg)
 
-            # 3. Check if done without tool calls
+            # 3. Check if done without tool calls or encountered model error
             if not response.has_tool_calls:
-                if response.content:
-                    task_summary = response.content
-                    self._emit("on_response", task_summary)
-                    self._speak_task_summary(task_summary)
-                if self.memory_enabled and episode_id:
-                    step_rec = StepRecord(
-                        step=step,
-                        state_snapshot=state_snapshot,
-                        model_thinking=response.thinking or "",
-                        model_content=response.content or "",
-                        tool_calls=[],
-                        tool_observations=[],
-                        duration_seconds=round(max(0.0, time.monotonic() - step_start_time), 3),
+                is_model_error = bool(
+                    response.content
+                    and (
+                        response.content.startswith("Error communicating with")
+                        or "429 Client Error" in response.content
+                        or "Rate limit" in response.content
+                        or "Read timed out" in response.content
+                        or "timed out" in response.content.lower()
                     )
-                    self.trajectory_logger.log_step(episode_id, step_rec)
-                break
+                )
+
+                if is_model_error and step < max_steps:
+                    logger.warning("Model communication error encountered on step %d: %s", step, response.content)
+                    # Attempt recovery: aggressively compact context and retry with Chutes if available
+                    self._compact_context_if_needed(messages, max_chars=24000)
+                    chutes_client = getattr(getattr(self, "router", None), "chutes", None)
+                    if chutes_client and chutes_client.is_configured:
+                        logger.info("Retrying step %d with cloud model Chutes AI...", step)
+                        # Pop the error assistant message from messages so we don't pollute context
+                        if messages and messages[-1].get("role") == "assistant":
+                            messages.pop()
+                        try:
+                            retry_response = chutes_client.chat(messages=messages, tools=EIDOS_TOOLS)
+                            if retry_response and (
+                                retry_response.has_tool_calls
+                                or (retry_response.content and not retry_response.content.startswith("Error communicating with"))
+                            ):
+                                response = retry_response
+                                assistant_msg = {"role": "assistant", "content": response.content}
+                                if response.has_tool_calls:
+                                    assistant_msg["tool_calls"] = [
+                                        {
+                                            "id": tc.id or f"call_{i}",
+                                            "type": "function",
+                                            "function": {"name": tc.name, "arguments": tc.arguments},
+                                        }
+                                        for i, tc in enumerate(response.tool_calls)
+                                    ]
+                                messages.append(assistant_msg)
+                                is_model_error = False
+                        except Exception as retry_exc:
+                            logger.error("Step %d retry with Chutes also encountered error: %s", step, retry_exc)
+
+                if not response.has_tool_calls:
+                    if response.content:
+                        task_summary = response.content
+                        self._emit("on_response", task_summary)
+                        self._speak_task_summary(task_summary, speak_summary=speak_summary)
+                    if self.memory_enabled and episode_id:
+                        step_rec = StepRecord(
+                            step=step,
+                            state_snapshot=state_snapshot,
+                            model_thinking=response.thinking or "",
+                            model_content=response.content or "",
+                            tool_calls=[],
+                            tool_observations=[],
+                            duration_seconds=round(max(0.0, time.monotonic() - step_start_time), 3),
+                        )
+                        self.trajectory_logger.log_step(episode_id, step_rec)
+                    break
 
             # 4. Dispatch Tool Calls
             task_finished = False
@@ -684,10 +806,20 @@ class AgentLoop:
                     task_finished = True
                     self._emit("on_response", task_summary)
 
-                # Append tool result to conversation history
+                # Append tool result to conversation history with observation capping
+                raw_tool_content = json.dumps(tool_result)
+                if len(raw_tool_content) > 20000:
+                    truncated_notice = (
+                        f"\n... [Output truncated: showing first 14,000 and last 3,000 of {len(raw_tool_content)} total characters. "
+                        f"Tip: Use execute_shell with a python script to process full data directly into files.]"
+                    )
+                    capped_content = raw_tool_content[:14000] + truncated_notice + raw_tool_content[-3000:]
+                else:
+                    capped_content = raw_tool_content
+
                 messages.append({
                     "role": "tool",
-                    "content": json.dumps(tool_result),
+                    "content": capped_content,
                     "name": tc.name,
                 })
 
@@ -713,7 +845,7 @@ class AgentLoop:
                         "steps_taken": step,
                     }
                 self._finish_and_index_episode(episode_id, outcome="success", final_summary=task_summary)
-                self._speak_task_summary(task_summary)
+                self._speak_task_summary(task_summary, speak_summary=speak_summary)
                 if task_summary:
                     self.conversation_history.append({"role": "assistant", "content": task_summary})
                     if self.conversation_store and self.active_conversation_id:
@@ -731,12 +863,18 @@ class AgentLoop:
             self.conversation_history.append({"role": "assistant", "content": task_summary})
             if self.conversation_store and self.active_conversation_id:
                 self.conversation_store.add_message(self.active_conversation_id, role="assistant", content=task_summary)
-        success = bool(task_summary)
+
+        is_model_error = bool(
+            task_summary.startswith("Error communicating with")
+            or "429 Client Error" in task_summary
+            or "Rate limit" in task_summary
+        )
+        success = bool(task_summary) and not is_model_error
         summary = task_summary or f"Reached max steps limit ({max_steps})."
-        outcome = "success" if success else "max_steps"
+        outcome = "success" if success else ("failed" if is_model_error else "max_steps")
         self._finish_and_index_episode(episode_id, outcome=outcome, final_summary=summary)
-        if not success:
-            self._speak_task_summary(summary)
+        if not success and not is_model_error:
+            self._speak_task_summary(summary, speak_summary=speak_summary)
         self._emit("on_task_finish", summary, success)
         return {
             "success": success,
@@ -882,6 +1020,161 @@ class AgentLoop:
                 return self.optimalx.evaluate_js_sync(expr), False
             else:
                 return {"error": f"Unknown optimalx action: '{action}'"}, False
+
+        # OptimalX Knowledge Ecosystem & Safe Mutation Engine
+        if name == "optimalx_search_notes":
+            query = args.get("query", "")
+            limit = int(args.get("limit", 5))
+            parent_folder = args.get("parent_folder")
+            prefer_offline = bool(args.get("prefer_offline", False))
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_search_notes",
+                {"query": query, "limit": limit, "parent_folder": parent_folder, "prefer_offline": prefer_offline}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            results = self.optimalx.search_notes(
+                query=query,
+                limit=limit,
+                parent_filter=parent_folder,
+                prefer_offline=prefer_offline,
+            )
+            return {"query": query, "count": len(results), "results": results}, False
+
+        if name == "optimalx_read_note":
+            subfolder_id = args.get("subfolder_id")
+            title = args.get("title")
+            note_id = args.get("note_id")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_read_note",
+                {"subfolder_id": subfolder_id, "title": title, "note_id": note_id}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.read_note(
+                subfolder_id=int(subfolder_id) if subfolder_id is not None else None,
+                note_id=int(note_id) if note_id is not None else None,
+                title=title,
+            )
+            if res is None:
+                return {"error": "Note not found"}, False
+            return res, False
+
+        if name == "optimalx_list_folders":
+            parent_folder_id = args.get("parent_folder_id")
+            include_subfolders = bool(args.get("include_subfolders", True))
+            query = args.get("query")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_list_folders",
+                {"parent_folder_id": parent_folder_id, "include_subfolders": include_subfolders, "query": query}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.list_folders(
+                parent_folder_id=int(parent_folder_id) if parent_folder_id is not None else None,
+                include_subfolders=include_subfolders,
+                query=query,
+            )
+            return {"count": len(res), "folders": res}, False
+
+        if name == "optimalx_write_note":
+            content = args.get("content", "")
+            subfolder_id = args.get("subfolder_id")
+            subfolder_title = args.get("subfolder_title")
+            parent_name = args.get("parent_name")
+            parent_folder_id = args.get("parent_folder_id")
+            mode = args.get("mode", "auto")
+            allow_direct_append = bool(args.get("allow_direct_append", False))
+            label = args.get("label")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_write_note",
+                {
+                    "content": content[:100] + "..." if len(content) > 100 else content,
+                    "subfolder_id": subfolder_id,
+                    "subfolder_title": subfolder_title,
+                    "parent_name": parent_name,
+                    "mode": mode,
+                }
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.write_note(
+                content=content,
+                subfolder_id=int(subfolder_id) if subfolder_id is not None else None,
+                subfolder_title=subfolder_title,
+                parent_name=parent_name,
+                parent_folder_id=int(parent_folder_id) if parent_folder_id is not None else None,
+                mode=mode,
+                allow_direct_append=allow_direct_append,
+                label=label,
+                conversation_id=None,
+            )
+            return res, False
+
+        if name == "optimalx_read_notex_doc":
+            subfolder_id = args.get("subfolder_id")
+            doc_path = args.get("doc_path", "")
+            start_line = args.get("start_line")
+            end_line = args.get("end_line")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_read_notex_doc",
+                {"subfolder_id": subfolder_id, "doc_path": doc_path}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.read_notex_doc(
+                subfolder_id=int(subfolder_id),
+                doc_path=doc_path,
+                start_line=int(start_line) if start_line is not None else None,
+                end_line=int(end_line) if end_line is not None else None,
+            )
+            return res, False
+
+        if name == "optimalx_list_notex_docs":
+            subfolder_id = args.get("subfolder_id")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_list_notex_docs",
+                {"subfolder_id": subfolder_id}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.list_notex_docs(subfolder_id=int(subfolder_id))
+            return res, False
+
+        if name == "optimalx_list_pending_reviews":
+            subfolder_id = args.get("subfolder_id")
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_list_pending_reviews",
+                {"subfolder_id": subfolder_id}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            items = self.optimalx.list_pending_reviews(
+                subfolder_id=int(subfolder_id) if subfolder_id is not None else None
+            )
+            return {"count": len(items), "pending_reviews": items}, False
+
+        if name == "optimalx_accept_pending_review":
+            item_id = int(args.get("item_id", 0))
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_accept_pending_review",
+                {"item_id": item_id}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.accept_pending_review(item_id=item_id)
+            return res, False
+
+        if name == "optimalx_reject_pending_review":
+            item_id = int(args.get("item_id", 0))
+            allowed, reason = self.gatekeeper.evaluate(
+                "optimalx_reject_pending_review",
+                {"item_id": item_id}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.optimalx.reject_pending_review(item_id=item_id)
+            return res, False
 
         if name == "web_search":
             query = args.get("query", "")
@@ -1040,6 +1333,47 @@ class AgentLoop:
             except Exception as e:
                 return {"success": False, "error": str(e)}, False
 
+        if name == "run_batch_job":
+            job_id = args.get("job_id")
+            background = args.get("background", True)
+            if isinstance(background, str):
+                background = background.lower() in ("true", "1", "yes")
+            pause_sec = args.get("pause_between_items_sec")
+            if pause_sec is not None:
+                try:
+                    pause_sec = float(pause_sec)
+                except (ValueError, TypeError):
+                    pause_sec = None
+            max_items = args.get("max_items")
+            if max_items is not None:
+                try:
+                    max_items = int(max_items)
+                except (ValueError, TypeError):
+                    max_items = None
+
+            allowed, reason = self.gatekeeper.evaluate(
+                "run_batch_job",
+                {"job_id": job_id, "background": background, "pause_sec": pause_sec, "max_items": max_items}
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            if background:
+                res = self.jobs.run_in_background(
+                    job_id_or_path=job_id,
+                    pause_between_items_sec=pause_sec,
+                    max_items=max_items,
+                )
+            else:
+                res = self.jobs.run_job(
+                    job_id_or_path=job_id,
+                    pause_between_items_sec=pause_sec,
+                    max_items=max_items,
+                    kill_switch_checker=self.kill_switch.is_triggered,
+                    stop_event=self._stop_requested,
+                )
+            return res, False
+
         if name == "step_batch_job":
             job_id = args.get("job_id")
             allowed, reason = self.gatekeeper.evaluate("step_batch_job", {"job_id": job_id})
@@ -1067,6 +1401,14 @@ class AgentLoop:
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
             res = self.jobs.resume(job_id_or_path=job_id)
+            return res, False
+
+        if name == "generate_batch_summary":
+            job_id = args.get("job_id")
+            allowed, reason = self.gatekeeper.evaluate("generate_batch_summary", {"job_id": job_id})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            res = self.jobs.generate_summary(job_id_or_path=job_id)
             return res, False
 
         if name == "speak_aloud":

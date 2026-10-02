@@ -8,9 +8,12 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Union
 import uuid
 
+from eidos.jobs.summary import RankingSummaryGenerator
 from eidos.jobs.types import JobQueue, JobSettings, QueueItem
 from eidos.skills.manager import SkillManager
 
@@ -24,13 +27,58 @@ class BatchJobRunner:
         self,
         skills_manager: Optional[SkillManager] = None,
         default_jobs_dir: Optional[str] = None,
+        default_processor: Optional[Callable[[QueueItem, Dict[str, Any]], Dict[str, Any]]] = None,
+        kill_switch: Optional[Any] = None,
+        summary_generator: Optional[RankingSummaryGenerator] = None,
     ):
         self.skills = skills_manager or SkillManager()
         self.default_jobs_dir = Path(
             os.path.abspath(os.path.expanduser(default_jobs_dir or "~/EidosWorkspace/jobs"))
         )
+        self.default_processor = default_processor
+        self.summary_generator = summary_generator or RankingSummaryGenerator()
         self.active_job: Optional[JobQueue] = None
         self.milestone_listeners: List[Callable[[JobQueue, QueueItem], None]] = []
+
+        # Background worker management & kill switch responsiveness
+        self._worker_thread: Optional[threading.Thread] = None
+        self._worker_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._active_worker_job_id: Optional[str] = None
+        self.kill_switch: Optional[Any] = None
+        if kill_switch:
+            self.set_kill_switch(kill_switch)
+
+    def set_kill_switch(self, kill_switch: Any) -> None:
+        """Register kill switch callback for emergency halts."""
+        self.kill_switch = kill_switch
+        if hasattr(kill_switch, "register_callback"):
+            try:
+                kill_switch.register_callback(self._on_kill_switch_triggered)
+            except Exception as e:
+                logger.debug("Could not register kill switch callback in BatchJobRunner: %s", e)
+
+    def _on_kill_switch_triggered(self) -> None:
+        """Emergency callback triggered when the kill switch is triggered."""
+        logger.warning("Emergency kill switch fired: halting batch runner worker.")
+        self._stop_event.set()
+        if self._active_worker_job_id:
+            try:
+                self.pause(self._active_worker_job_id)
+            except Exception as e:
+                logger.debug("Failed to pause batch job on kill switch: %s", e)
+
+    def is_worker_running(self) -> bool:
+        """Return True if a background worker thread is actively executing."""
+        with self._worker_lock:
+            return self._worker_thread is not None and self._worker_thread.is_alive()
+
+    def get_active_worker_job_id(self) -> Optional[str]:
+        """Return the job_id currently being executed by the background worker, if any."""
+        with self._worker_lock:
+            if self._worker_thread is not None and self._worker_thread.is_alive():
+                return self._active_worker_job_id
+            return None
 
     def add_milestone_listener(self, listener: Callable[[JobQueue, QueueItem], None]) -> None:
         """Register a callback invoked when an item milestone or job completion occurs."""
@@ -207,6 +255,8 @@ class BatchJobRunner:
                 active_item = {"id": it.id, "input": it.input, "started_at": it.started_at}
                 break
 
+        is_bg = self.is_worker_running() and (self._active_worker_job_id == queue.job_id)
+
         return {
             "job_id": queue.job_id,
             "job_name": queue.job_name,
@@ -220,6 +270,7 @@ class BatchJobRunner:
             "progress_percent": queue.get_progress_percent(),
             "output_dir": queue.output_dir,
             "active_item": active_item,
+            "is_running_in_background": is_bg,
         }
 
     def step_next(
@@ -256,10 +307,15 @@ class BatchJobRunner:
 
         if not pending_item:
             # Check if all items are resolved
+            summary_info = None
             if queue.get_pending_count() == 0 and queue.get_in_progress_count() == 0:
                 queue.status = "completed" if queue.failed_items == 0 else "completed_with_errors"
                 queue.updated_at = datetime.now(timezone.utc).isoformat()
                 self.save_queue(queue)
+                try:
+                    summary_info = self.summary_generator.generate(queue)
+                except Exception as e:
+                    logger.warning("Failed to auto-generate ranking summary for %s: %s", queue.job_id, e)
             return {
                 "success": True,
                 "done": True,
@@ -268,6 +324,7 @@ class BatchJobRunner:
                 "progress_percent": queue.get_progress_percent(),
                 "completed_items": queue.completed_items,
                 "total_items": queue.total_items,
+                "summary": summary_info,
             }
 
         # Transition item to in_progress
@@ -289,8 +346,9 @@ class BatchJobRunner:
 
         # Process the item
         try:
-            if processor:
-                result_payload = processor(pending_item, context)
+            active_proc = processor or self.default_processor
+            if active_proc:
+                result_payload = active_proc(pending_item, context)
             else:
                 # Default generic execution outcome
                 result_payload = {
@@ -357,13 +415,22 @@ class BatchJobRunner:
         if not queue:
             return {"success": False, "error": f"Job '{target}' could not be loaded."}
 
+        # Signal background worker to halt after current item if it matches
+        with self._worker_lock:
+            if self._active_worker_job_id == queue.job_id:
+                self._stop_event.set()
+
         queue.status = "paused"
         queue.updated_at = datetime.now(timezone.utc).isoformat()
         self.save_queue(queue)
         logger.info("Paused batch job %s", queue.job_id)
         return {"success": True, "status": "paused", "job_id": queue.job_id}
 
-    def resume(self, job_id_or_path: Optional[str] = None) -> Dict[str, Any]:
+    def resume(
+        self,
+        job_id_or_path: Optional[str] = None,
+        run_in_background: bool = False,
+    ) -> Dict[str, Any]:
         """Resume execution of a paused job."""
         target = job_id_or_path or (self.active_job.job_id if self.active_job else None)
         if not target:
@@ -377,4 +444,301 @@ class BatchJobRunner:
         queue.updated_at = datetime.now(timezone.utc).isoformat()
         self.save_queue(queue)
         logger.info("Resumed batch job %s", queue.job_id)
+
+        if run_in_background:
+            return self.run_in_background(job_id_or_path=queue.job_id)
+
         return {"success": True, "status": "in_progress", "job_id": queue.job_id}
+
+    def generate_summary(self, job_id_or_path: Optional[str] = None) -> Dict[str, Any]:
+        """Compile or regenerate ranking leaderboard summary for a batch job."""
+        target = job_id_or_path or (self.active_job.job_id if self.active_job else None)
+        if not target:
+            return {"success": False, "error": "No active batch job found to summarize."}
+
+        queue = self.load_job(target) if (not self.active_job or self.active_job.job_id != target) else self.active_job
+        if not queue:
+            return {"success": False, "error": f"Job '{target}' could not be loaded."}
+
+        try:
+            return self.summary_generator.generate(queue)
+        except Exception as e:
+            logger.error("Failed compiling ranking summary for %s: %s", queue.job_id, e)
+            return {"success": False, "error": str(e)}
+
+    def run_job(
+        self,
+        job_id_or_path: Optional[str] = None,
+        processor: Optional[Callable[[QueueItem, Dict[str, Any]], Dict[str, Any]]] = None,
+        pause_between_items_sec: Optional[float] = None,
+        max_items: Optional[int] = None,
+        kill_switch_checker: Optional[Callable[[], bool]] = None,
+        stop_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
+        """Execute queue items sequentially until completion, pause, max_items, or stop signal.
+
+        Args:
+            job_id_or_path: Target job ID or queue.json path.
+            processor: Optional per-item processor (defaults to self.default_processor).
+            pause_between_items_sec: Delay between items in seconds (defaults to queue settings or 2.0s).
+            max_items: Optional limit on number of items to process in this run.
+            kill_switch_checker: Optional callable returning True if kill switch triggered.
+            stop_event: Optional threading.Event signaling stop/cancellation.
+
+        Returns:
+            Dict summary of execution metrics and status.
+        """
+        target = job_id_or_path or (self.active_job.job_id if self.active_job else None)
+        if not target:
+            return {"success": False, "error": "No active batch job to run."}
+
+        queue = self.load_job(target) if (not self.active_job or self.active_job.job_id != target) else self.active_job
+        if not queue:
+            return {"success": False, "error": f"Job '{target}' could not be loaded."}
+
+        if queue.get_pending_count() == 0 and queue.get_in_progress_count() == 0:
+            return {
+                "success": True,
+                "done": True,
+                "status": queue.status,
+                "job_id": queue.job_id,
+                "completed_items": queue.completed_items,
+                "total_items": queue.total_items,
+                "progress_percent": queue.get_progress_percent(),
+                "message": "All items in batch job have already been processed.",
+            }
+
+        pause_sec = (
+            pause_between_items_sec
+            if pause_between_items_sec is not None
+            else (queue.settings.pause_between_items_sec if queue.settings else 2.0)
+        )
+
+        items_processed_in_run = 0
+        logger.info(
+            "Starting continuous batch run for '%s' (%s) with %d pending items (pacing: %.1fs).",
+            queue.job_name,
+            queue.job_id,
+            queue.get_pending_count(),
+            pause_sec,
+        )
+
+        while True:
+            # 1. Check emergency kill switch
+            is_killed = False
+            if kill_switch_checker and kill_switch_checker():
+                is_killed = True
+            elif self.kill_switch and hasattr(self.kill_switch, "is_triggered") and self.kill_switch.is_triggered():
+                is_killed = True
+
+            if is_killed:
+                logger.warning("run_job halted by emergency kill switch on job %s", queue.job_id)
+                self.pause(queue.job_id)
+                return {
+                    "success": False,
+                    "aborted": True,
+                    "reason": "kill_switch_triggered",
+                    "job_id": queue.job_id,
+                    "status": "paused",
+                    "completed_items": queue.completed_items,
+                    "total_items": queue.total_items,
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": "Execution halted by emergency kill switch.",
+                }
+
+            # 2. Check stop signals
+            if (stop_event and stop_event.is_set()) or self._stop_event.is_set():
+                logger.info("run_job halted by stop event on job %s", queue.job_id)
+                self.pause(queue.job_id)
+                return {
+                    "success": True,
+                    "paused": True,
+                    "status": "paused",
+                    "job_id": queue.job_id,
+                    "completed_items": queue.completed_items,
+                    "total_items": queue.total_items,
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": "Execution paused by request.",
+                }
+
+            # 3. Check if queue was paused externally
+            if queue.status == "paused":
+                logger.info("run_job observed paused status for job %s", queue.job_id)
+                return {
+                    "success": True,
+                    "paused": True,
+                    "status": "paused",
+                    "job_id": queue.job_id,
+                    "completed_items": queue.completed_items,
+                    "total_items": queue.total_items,
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": "Job is currently paused.",
+                }
+
+            # 4. Check max_items limit
+            if max_items is not None and items_processed_in_run >= max_items:
+                return {
+                    "success": True,
+                    "done": False,
+                    "status": queue.status,
+                    "job_id": queue.job_id,
+                    "completed_items": queue.completed_items,
+                    "total_items": queue.total_items,
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": f"Processed {items_processed_in_run} items (hit limit of {max_items}).",
+                }
+
+            # 5. Step next item
+            step_res = self.step_next(job_id_or_path=queue.job_id, processor=processor)
+
+            if step_res.get("done"):
+                summary_res = step_res.get("summary")
+                if not summary_res:
+                    try:
+                        summary_res = self.generate_summary(queue.job_id)
+                    except Exception as e:
+                        logger.warning("Failed generating summary in run_job: %s", e)
+
+                return {
+                    "success": True,
+                    "done": True,
+                    "status": step_res.get("status", "completed"),
+                    "job_id": queue.job_id,
+                    "completed_items": step_res.get("completed_items", queue.completed_items),
+                    "total_items": step_res.get("total_items", queue.total_items),
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": "All items in batch job have been processed.",
+                    "summary": summary_res,
+                }
+
+            if not step_res.get("success") and step_res.get("status") == "paused":
+                return {
+                    "success": True,
+                    "paused": True,
+                    "status": "paused",
+                    "job_id": queue.job_id,
+                    "completed_items": queue.completed_items,
+                    "total_items": queue.total_items,
+                    "progress_percent": queue.get_progress_percent(),
+                    "items_processed_in_run": items_processed_in_run,
+                    "message": "Job is currently paused.",
+                }
+
+            items_processed_in_run += 1
+
+            # 6. Interruptible cool-down sleep
+            if pause_sec > 0:
+                elapsed = 0.0
+                slice_interval = 0.1
+                while elapsed < pause_sec:
+                    if (stop_event and stop_event.is_set()) or self._stop_event.is_set():
+                        break
+                    if (kill_switch_checker and kill_switch_checker()) or (
+                        self.kill_switch and hasattr(self.kill_switch, "is_triggered") and self.kill_switch.is_triggered()
+                    ):
+                        break
+                    time.sleep(min(slice_interval, pause_sec - elapsed))
+                    elapsed += slice_interval
+
+    def run_in_background(
+        self,
+        job_id_or_path: Optional[str] = None,
+        processor: Optional[Callable[[QueueItem, Dict[str, Any]], Dict[str, Any]]] = None,
+        pause_between_items_sec: Optional[float] = None,
+        max_items: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Launch autonomous continuous batch processing in a dedicated background worker thread."""
+        with self._worker_lock:
+            if self.is_worker_running():
+                return {
+                    "success": False,
+                    "error": f"A batch job is already running in the background (Job ID: {self._active_worker_job_id}).",
+                    "active_job_id": self._active_worker_job_id,
+                }
+
+            target = job_id_or_path or (self.active_job.job_id if self.active_job else None)
+            if not target:
+                return {"success": False, "error": "No active batch job to run."}
+
+            queue = self.load_job(target) if (not self.active_job or self.active_job.job_id != target) else self.active_job
+            if not queue:
+                return {"success": False, "error": f"Job '{target}' could not be loaded."}
+
+            if queue.status == "paused":
+                queue.status = "in_progress"
+                queue.updated_at = datetime.now(timezone.utc).isoformat()
+                self.save_queue(queue)
+
+            self._stop_event.clear()
+            self._active_worker_job_id = queue.job_id
+
+            def _worker_target():
+                try:
+                    logger.info("Batch background worker started for job %s", queue.job_id)
+                    self.run_job(
+                        job_id_or_path=queue.job_id,
+                        processor=processor,
+                        pause_between_items_sec=pause_between_items_sec,
+                        max_items=max_items,
+                        stop_event=self._stop_event,
+                    )
+                except Exception as e:
+                    logger.error("Error in batch background worker for %s: %s", queue.job_id, e)
+                finally:
+                    with self._worker_lock:
+                        self._active_worker_job_id = None
+                    logger.info("Batch background worker finished for job %s", queue.job_id)
+
+            self._worker_thread = threading.Thread(
+                target=_worker_target,
+                name=f"BatchJobWorker-{queue.job_id}",
+                daemon=True,
+            )
+            self._worker_thread.start()
+
+            return {
+                "success": True,
+                "status": "running_in_background",
+                "job_id": queue.job_id,
+                "job_name": queue.job_name,
+                "skill_name": queue.skill_name,
+                "total_items": queue.total_items,
+                "completed_items": queue.completed_items,
+                "pending_items": queue.get_pending_count(),
+                "progress_percent": queue.get_progress_percent(),
+                "message": f"Started background batch worker for job '{queue.job_name}' ({queue.job_id}).",
+            }
+
+    def stop_background_worker(self, timeout: float = 5.0) -> Dict[str, Any]:
+        """Request the active background worker to stop cleanly."""
+        self._stop_event.set()
+        active_id = self._active_worker_job_id
+        if active_id:
+            try:
+                self.pause(active_id)
+            except Exception as e:
+                logger.debug("Failed pausing job during worker stop: %s", e)
+
+        worker = self._worker_thread
+        if worker and worker.is_alive():
+            worker.join(timeout=timeout)
+            still_alive = worker.is_alive()
+        else:
+            still_alive = False
+
+        with self._worker_lock:
+            if not still_alive:
+                self._worker_thread = None
+                self._active_worker_job_id = None
+
+        return {
+            "success": True,
+            "stopped": not still_alive,
+            "job_id": active_id,
+            "message": "Background worker stopped." if not still_alive else "Worker stop requested (finishing active item).",
+        }

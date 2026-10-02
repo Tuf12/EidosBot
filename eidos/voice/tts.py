@@ -129,6 +129,10 @@ class KokoroTTS:
                 )
                 if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                     return out_path
+                logger.warning(
+                    "Warm Kokoro worker did not produce non-empty WAV at %s; falling back to speak.py",
+                    out_path,
+                )
             except Exception as exc:
                 logger.warning("Warm Kokoro worker failed, falling back to speak.py: %s", exc)
 
@@ -198,13 +202,14 @@ class KokoroTTS:
             out_path,
         ]
 
-        logger.debug("Running Kokoro synthesis: %s", cmd)
+        timeout_s = max(180, int(len(clean_text) * 0.35))
+        logger.debug("Running Kokoro synthesis (timeout=%ss): %s", timeout_s, cmd)
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=60,
+            timeout=timeout_s,
             cwd=self.voice_dir,
         )
 

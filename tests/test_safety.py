@@ -21,12 +21,25 @@ def test_risk_classifier_levels():
     level, _ = RiskClassifier.classify_shell_command("git status")
     assert level == RiskLevel.LEVEL_0_PASSIVE
 
+    # Level 0 OptimalX read-only tools
+    for opt_tool in (
+        "optimalx_search_notes", "optimalx_read_note", "optimalx_list_folders",
+        "optimalx_read_notex_doc", "optimalx_list_notex_docs", "optimalx_list_pending_reviews"
+    ):
+        lvl, _ = RiskClassifier.classify_action(opt_tool, {})
+        assert lvl == RiskLevel.LEVEL_0_PASSIVE
+
     # Level 1
     level, _ = RiskClassifier.classify_action("click", {"x": 100, "y": 200})
     assert level == RiskLevel.LEVEL_1_UI
 
     level, _ = RiskClassifier.classify_action("type_text", {"text": "hello"})
     assert level == RiskLevel.LEVEL_1_UI
+
+    # Level 1 OptimalX mutation/review tools
+    for opt_write in ("optimalx_write_note", "optimalx_accept_pending_review", "optimalx_reject_pending_review"):
+        lvl, _ = RiskClassifier.classify_action(opt_write, {})
+        assert lvl == RiskLevel.LEVEL_1_UI
 
     # Level 2
     level, _ = RiskClassifier.classify_shell_command("mkdir new_folder")

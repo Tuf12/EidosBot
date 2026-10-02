@@ -17,15 +17,17 @@ RECALL_TAG_PATTERN = re.compile(r"<recall>(.*?)</recall>", re.DOTALL | re.IGNORE
 
 
 class RecallStreamInterceptor:
-    """Interceps `<recall>query</recall>` tags during token streaming and splices episodic memory."""
+    """Interceps `<recall>query</recall>` tags during token streaming and splices episodic memory & OptimalX notes."""
 
     def __init__(
         self,
         episodic_store: Optional[EpisodicStore] = None,
+        optimalx_bridge: Optional[Any] = None,
         max_recalls_per_turn: int = 3,
         min_similarity: float = 0.20,
     ):
         self.episodic_store = episodic_store
+        self.optimalx = optimalx_bridge
         self.max_recalls_per_turn = max_recalls_per_turn
         self.min_similarity = min_similarity
 
@@ -47,13 +49,30 @@ class RecallStreamInterceptor:
             logger.warning("Error querying episodic store for recall '%s': %s", cleaned_query, e)
             return None
 
+    def lookup_optimalx_notes(self, query: str, limit: int = 2) -> List[Dict[str, Any]]:
+        """Search personal OptimalX notes and knowledge bases for active recall context."""
+        if not self.optimalx:
+            return []
+        cleaned_query = query.strip()
+        if not cleaned_query:
+            return []
+        try:
+            return self.optimalx.search_notes(query=cleaned_query, limit=limit)
+        except Exception as e:
+            logger.warning("Error querying OptimalX notes for recall '%s': %s", cleaned_query, e)
+            return []
+
     def format_recalled_memory(
         self,
         result: Optional[EpisodicSearchResult],
         query: str,
+        optimalx_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """Format matching episodic memory into XML block for mid-stream splicing."""
-        if result is None:
+        """Format matching episodic memory and/or OptimalX notes into XML blocks for mid-stream splicing."""
+        has_episodic = result is not None
+        has_notes = bool(optimalx_notes)
+
+        if not has_episodic and not has_notes:
             return (
                 "\n<recalled_memory>\n"
                 f'No past experience found matching query: "{query.strip()}".\n'
@@ -61,21 +80,39 @@ class RecallStreamInterceptor:
                 "</recalled_memory>\nContinuing plan: "
             )
 
-        lines = [f'\n<recalled_memory episode="{result.episode_id}">']
-        lines.append(f"- Past Task: {result.task_goal}")
-        lines.append(f"- Outcome: {result.outcome}")
-        if result.summary:
-            lines.append(f"- Resolution Summary: {result.summary}")
-        if result.pitfalls_avoided:
-            lines.append(f"- Dead Ends / Pitfalls Avoided: {result.pitfalls_avoided}")
-        if result.lessons_learned:
-            lines.append(f"- Lessons / Gotchas: {result.lessons_learned}")
-        if result.key_actions:
-            actions_str = " -> ".join(result.key_actions)
-            lines.append(f"- Proven Tool Pattern: {actions_str}")
-        lines.append("</recalled_memory>\nContinuing plan: ")
+        parts: List[str] = []
 
-        return "\n".join(lines)
+        if has_episodic and result is not None:
+            lines = [f'\n<recalled_memory episode="{result.episode_id}">']
+            lines.append(f"- Past Task: {result.task_goal}")
+            lines.append(f"- Outcome: {result.outcome}")
+            if result.summary:
+                lines.append(f"- Resolution Summary: {result.summary}")
+            if result.pitfalls_avoided:
+                lines.append(f"- Dead Ends / Pitfalls Avoided: {result.pitfalls_avoided}")
+            if result.lessons_learned:
+                lines.append(f"- Lessons / Gotchas: {result.lessons_learned}")
+            if result.key_actions:
+                actions_str = " -> ".join(result.key_actions)
+                lines.append(f"- Proven Tool Pattern: {actions_str}")
+            lines.append("</recalled_memory>")
+            parts.append("\n".join(lines))
+
+        if has_notes and optimalx_notes:
+            notes_lines = ["\n<recalled_notes>"]
+            for note in optimalx_notes:
+                loc = note.get("location") or note.get("title") or "Personal Note"
+                snip = note.get("snippet") or note.get("text") or note.get("summary") or ""
+                snip_clean = snip.strip()
+                if len(snip_clean) > 300:
+                    snip_clean = snip_clean[:300] + "..."
+                notes_lines.append(f"[OptimalX Note: {loc}]")
+                notes_lines.append(f'"{snip_clean}"')
+            notes_lines.append("</recalled_notes>")
+            parts.append("\n".join(notes_lines))
+
+        parts.append("Continuing plan: ")
+        return "\n".join(parts)
 
     def extract_recall_query(self, text: str) -> Optional[str]:
         """Extract the query string from the first complete `<recall>...</recall>` block."""
@@ -90,7 +127,7 @@ class RecallStreamInterceptor:
         model_name: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        timeout: float = 60.0,
+        timeout: float = 120.0,
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
     ) -> ModelResponse:
         """Stream chat completion, intercepting `<recall>` tags and splicing memories until complete."""
@@ -173,9 +210,10 @@ class RecallStreamInterceptor:
                             # Close HTTP stream immediately
                             resp.close()
 
-                            # Perform vector lookup
+                            # Perform vector & notes lookup
                             mem_result = self.lookup_memory(query)
-                            splice_text = self.format_recalled_memory(mem_result, query)
+                            notes_result = self.lookup_optimalx_notes(query, limit=2)
+                            splice_text = self.format_recalled_memory(mem_result, query, optimalx_notes=notes_result)
 
                             if on_recall_callback:
                                 try:
@@ -261,7 +299,7 @@ class RecallStreamInterceptor:
         model_name: str,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
-        timeout: float = 90.0,
+        timeout: float = 180.0,
         headers: Optional[Dict[str, str]] = None,
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
     ) -> ModelResponse:
@@ -368,7 +406,8 @@ class RecallStreamInterceptor:
                             resp.close()
 
                             mem_result = self.lookup_memory(query)
-                            splice_text = self.format_recalled_memory(mem_result, query)
+                            notes_result = self.lookup_optimalx_notes(query, limit=2)
+                            splice_text = self.format_recalled_memory(mem_result, query, optimalx_notes=notes_result)
 
                             if on_recall_callback:
                                 try:
@@ -400,10 +439,15 @@ class RecallStreamInterceptor:
                         resp.close()
                     except Exception:
                         pass
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                if status_code == 429 or "429" in str(exc):
+                    err_text = "Error communicating with Chutes AI: 429 Client Error (Rate limit or concurrency quota exceeded on Chutes AI). Please wait a moment or switch provider preference to 'local' in Settings."
+                else:
+                    err_text = f"Error communicating with Chutes AI: {str(exc)}"
                 return ModelResponse(
-                    content=f"Error communicating with Chutes AI: {str(exc)}",
+                    content=err_text,
                     model=model_name,
-                    raw={"error": str(exc)},
+                    raw={"error": str(exc), "status_code": status_code},
                 )
             finally:
                 if resp is not None:

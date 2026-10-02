@@ -27,7 +27,9 @@ This guide provides an end-to-end blueprint for engineering, testing, and rollin
 │                         │ • tests/test_browser.py       │                              │
 ├─────────────────────────┼───────────────────────────────┼──────────────────────────────┤
 │ 3. Skills & Job Runner  │ • eidos/skills/manager.py     │ pyyaml, pydantic             │
-│                         │ • eidos/jobs/runner.py        │ json, asyncio                │
+│    & Research Pipeline  │ • eidos/jobs/runner.py        │ json, asyncio, threading     │
+│                         │ • eidos/jobs/processor.py     │ brave search api, playwright │
+│                         │ • eidos/jobs/summary.py       │                              │
 │                         │ • ~/.eidos/skills/*/SKILL.md  │                              │
 │                         │ • tests/test_jobs.py          │                              │
 ├─────────────────────────┼───────────────────────────────┼──────────────────────────────┤
@@ -135,8 +137,21 @@ playwright install chromium
    - Initialize a mock job with 3 generic test items (e.g., summarizing 3 test notes).
    - Step through execution and verify `queue.json` transitions from `pending` $\rightarrow$ `completed`.
    - Verify artifacts and result summaries are recorded generically in `queue.json`.
-4. **Author Example Case Study Skill (Optional):**
-   - Provide `invention-evaluator/SKILL.md` as a user-level demonstration skill, demonstrating how rubrics and templates are passed at runtime without touching system code.
+4. **Author Example Case Study Skill (Completed):**
+   - Created `~/.eidos/skills/invention-evaluator/SKILL.md` defining the 4-dimension commercial viability rubric, patent search steps, and portfolio template.
+5. **Build Fresh-Context Sub-Agent Processor (`eidos/jobs/processor.py`):**
+   - Implement `SkillJobProcessor` to execute individual items with pristine reasoning context.
+   - Integrate `WebResearchEngine` (Brave Search API) and `PlaywrightManager` (Google Patents headless Chromium extraction).
+   - Query `ModelRouter` with structured scoring prompt returning JSON evaluation for Dimensions A, B, C, and D with justifications.
+   - Format and write standardized markdown portfolio files (`<output_dir>/portfolios/<item_id>.md`).
+6. **Autonomous Background Batch Execution Loop (`eidos/jobs/runner.py`):**
+   - Add `run_job()` and daemon thread background runner to `BatchJobRunner`.
+   - Implement cool-down pacing delay (`pause_between_items_sec`, default 2.0s) to protect API limits and GPU thermals.
+   - Expose `run_batch_job` tool in `eidos/core/context.py` and wire dispatcher in `eidos/core/loop.py`.
+   - Check emergency kill switch (`<ctrl>+<alt>+<esc>`), `/pause`, and `/kill` between each step.
+7. **Build Leaderboard Aggregator (`eidos/jobs/summary.py`):**
+   - Compile `RANKING_SUMMARY.md` and `RANKING_SUMMARY.csv` upon batch completion.
+   - Categorize evaluated inventions into Tier 1 (80–100), Tier 2 (60–79), and Tier 3 (<60).
 
 ---
 
@@ -165,29 +180,79 @@ playwright install chromium
 
 ---
 
-## 🔄 Step 5: End-to-End Inventions Project Execution Walkthrough
+## 🌐 Step 5: Mobile PWA Gateway & Tailscale Private Mesh (`web/` & `eidos/gateway/server.py`)
 
-Once all steps are implemented, the 300 Inventions workflow proceeds seamlessly:
+### Objectives
+- Build an installable Progressive Web App (PWA) running on both Android (via Chrome WebAPK) and iPhone (via Safari Home Screen).
+- Connect securely across cellular and Wi-Fi networks via **Tailscale** WireGuard private mesh without open router ports.
+- Deliver real-time typewriter token streaming and collapsible `<thought>` / `<recall>` reasoning accordions.
+- Provide interactive Level 2/3 safety approval cards with syntax-highlighted commands, affected directories, and 1-tap Approve / Always Allow / Reject / Kill actions.
+- Mirror desktop screenshots in real time with viewport zoom and tactile emergency stop controls.
 
-```bash
-# 1. Start EidosBot with Sandbox & Telegram enabled
-python3 -m eidos.main --with-telegram
+### Tasks:
+1. **Frontend Scaffolding (`web/`):**
+   - Initialize Vite + React + TypeScript + Tailwind CSS project in `web/`.
+   - Configure Dracula theme tokens matching EidosBot PyQt6 desktop HUD.
+   - Configure Web App Manifest (`manifest.json`), service worker, and app icons (192px & 512px) for Android & iOS standalone installation.
+2. **Real-time WebSocket & State Layer (`web/src/hooks/useEidosWS.ts`):**
+   - Resilient WebSocket connection to `ws://100.x.y.z:8420/ws` with exponential backoff reconnect.
+   - Manage real-time message stream, active agent state (`idle`, `thinking`, `executing`, `killed`), and pending safety confirmations.
+3. **Interactive UI Components (`web/src/components/`):**
+   - `ChatView`: Typewriter token renderer, markdown support, code blocks with copy buttons.
+   - `ThoughtAccordion`: Collapsible cards for `<thought>` model deliberation and `<recall>` memory searches.
+   - `SafetyModal`: Rich confirmation card for Level 2 shell commands and Level 3 actions.
+   - `ScreenViewport`: Live desktop capture mirroring with refresh and zoom controls.
+   - `Header`: Dracula status pill and persistent tactile `[🛑 STOP]` emergency kill switch.
+4. **Backend Gateway Serving (`eidos/gateway/server.py`):**
+   - Update `RemoteGatewayServer` to serve compiled `web/dist/` assets with SPA fallback, retaining embedded HTML dashboard fallback when `web/dist` is not yet built.
+   - Expand WebSocket handler to broadcast token streams, thought chunks, and confirmation resolutions.
+5. **Multi-Device Installation & Verification:**
+   - Linux host Tailscale authentication (`tailscale up`).
+   - Android test: Chrome navigate $\rightarrow$ "Install App" (verify WebAPK standalone launch).
+   - iPhone test: Safari navigate $\rightarrow$ "Add to Home Screen" (verify iOS standalone launch).
 
-# 2. In chat (or via Telegram):
-User: "Eidos, let's review the invention-evaluator skill. Here is my inventions.csv with 300 concepts. Initialize the batch job in ~/Documents/Inventions/."
+---
 
-# 3. EidosBot verifies SKILL.md and initializes queue:
-Eidos: "Initialized job '2026_inventions' with 300 pending items. Sandboxed workspace set to ~/Documents/Inventions/. Starting execution."
+## 🔄 Step 6: End-to-End Inventions Project Execution Walkthrough
 
-# 4. User steps away from PC:
-- EidosBot runs in the bwrap sandbox.
-- It browses Google Patents and the web headlessly via Playwright.
-- Writes portfolios to ~/Documents/Inventions/portfolios/inv_001.md...
-- Sends Telegram updates every 10 items.
-- Asks clarifying questions via Telegram buttons when concepts are ambiguous.
+*(See full technical specification in [`docs/INVENTION_RESEARCH_PIPELINE.md`](INVENTION_RESEARCH_PIPELINE.md))*
 
-# 5. Final Output:
-- 300 individual markdown portfolios.
-- RANKING_SUMMARY.md sorted by composite Viability Score (100 to 0).
-- Zero accidental file deletions, zero prompt fatigue, zero context crashes.
+Once the sub-agent processor and background runner are wired, the complete 300 Inventions workflow executes autonomously:
+
+### 6.1. Ingesting Invention Concepts
+Place your invention list in the workspace (e.g., `~/EidosWorkspace/inventions.csv`):
+```csv
+id,title,category,description,target_audience
+INV-001,Solar Dew Condenser,Cleantech,"Atmospheric water extraction unit powered by portable solar collector with peltier cooling array.",Hikers & off-grid homesteaders
+INV-002,Ultrasonic Anti-Fouling Hull Ring,Marine,"Ring-shaped ultrasonic transducer collar preventing barnacle adhesion on boat hulls.",Recreational boat owners & marinas
 ```
+
+### 6.2. Launching Execution
+Launch via CLI, Desktop HUD chat, or Telegram:
+```bash
+# Via CLI
+python3 -m eidos.main --job-init "2026_Inventions" \
+                      --skill "invention-evaluator" \
+                      --items "~/EidosWorkspace/inventions.csv" \
+                      --run
+```
+Or in Desktop HUD / Telegram chat:
+> **User:** *"Eidos, review the invention-evaluator skill. Here is ~/EidosWorkspace/inventions.csv with 300 concepts. Initialize the batch job in ~/EidosWorkspace/jobs/inventions/ and start running in the background."*  
+> **Eidos:** *"Initialized job '2026_Inventions' with 300 pending items. Background runner started with 2.0s pacing. I'll push milestone updates to Telegram every 10 items."*
+
+### 6.3. Autonomous Sub-Agent Research & Scoring
+For every item in the queue:
+1. **Fresh Sub-Agent Session:** Spins up an isolated context window with `invention-evaluator/SKILL.md` injected.
+2. **Prior Art Search:** Queries Brave Search API and navigates Google Patents headlessly via Playwright Chromium.
+3. **Rubric Scoring:** ModelRouter scores Dimensions A, B, C, and D (0–25 each) with detailed justifications.
+4. **Portfolio Generation:** Writes `<output_dir>/portfolios/<item_id>.md`.
+5. **Atomic Checkpoint:** Updates `queue.json` immediately.
+
+### 6.4. Remote Telemetry & Human-in-the-Loop Clarification
+- Telegram pushes progress every 10 items with average scores and time estimates.
+- Ambiguous or malformed concepts transition to `needs_review` and alert the user via Telegram/PWA without halting the queue.
+
+### 6.5. Final Outputs & Ranked Leaderboard
+- **300 Portfolios:** Individual markdown files in `<output_dir>/portfolios/`.
+- **`RANKING_SUMMARY.md`:** Ranked leaderboard grouping inventions into Tier 1 (80–100), Tier 2 (60–79), and Tier 3 (<60).
+- **`RANKING_SUMMARY.csv`:** Structured export for spreadsheet analysis.

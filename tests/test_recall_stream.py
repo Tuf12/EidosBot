@@ -487,3 +487,116 @@ def test_execute_openai_chat_streaming_tool_call_chunks():
     assert response.tool_calls[0].arguments == {"command": "ls"}
 
 
+def test_recall_stream_optimalx_notes_only():
+    """Verify RecallStreamInterceptor correctly queries and splices OptimalX notes when no episodic match."""
+    mock_optimalx = MagicMock()
+    mock_optimalx.search_notes.return_value = [
+        {
+            "location": "Inventions > Smart Garden Solar Pump",
+            "snippet": "12V DC brushless pump with 50W solar panel and 18650 battery buffer.",
+        }
+    ]
+
+    interceptor = RecallStreamInterceptor(optimalx_bridge=mock_optimalx)
+
+    notes = interceptor.lookup_optimalx_notes("solar pump", limit=2)
+    assert len(notes) == 1
+    assert "Smart Garden Solar Pump" in notes[0]["location"]
+
+    formatted = interceptor.format_recalled_memory(result=None, query="solar pump", optimalx_notes=notes)
+    assert "<recalled_notes>" in formatted
+    assert "[OptimalX Note: Inventions > Smart Garden Solar Pump]" in formatted
+    assert "12V DC brushless pump" in formatted
+    assert "<recalled_memory>" not in formatted
+    assert "Continuing plan:" in formatted
+
+
+def test_recall_stream_both_episodic_and_optimalx_notes():
+    """Verify RecallStreamInterceptor splices both episodic memory and OptimalX notes together."""
+    mock_optimalx = MagicMock()
+    mock_optimalx.search_notes.return_value = [
+        {
+            "location": "Inventions > Linux Mint Bot",
+            "snippet": "Use bubblewrap bwrap sandbox for zero-egress bash execution.",
+        }
+    ]
+
+    episodic_res = EpisodicSearchResult(
+        episode_id="ep_bwrap_999",
+        task_goal="Run isolated command in sandbox",
+        outcome="success",
+        similarity=0.92,
+        summary="Mounted root as ro and workspace as rw",
+        lessons_learned="Requires /tmp and /dev/null bind mounts",
+        key_actions=["bwrap --ro-bind / / ..."],
+    )
+
+    interceptor = RecallStreamInterceptor(optimalx_bridge=mock_optimalx)
+    formatted = interceptor.format_recalled_memory(
+        result=episodic_res,
+        query="sandbox bwrap",
+        optimalx_notes=mock_optimalx.search_notes.return_value,
+    )
+
+    assert '<recalled_memory episode="ep_bwrap_999">' in formatted
+    assert "- Past Task: Run isolated command in sandbox" in formatted
+    assert "<recalled_notes>" in formatted
+    assert "[OptimalX Note: Inventions > Linux Mint Bot]" in formatted
+    assert "bubblewrap bwrap sandbox" in formatted
+    assert "Continuing plan:" in formatted
+
+
+def test_execute_chat_with_optimalx_recall_streaming():
+    """Verify streaming Ollama chat intercepts <recall> and splices OptimalX note context."""
+    mock_optimalx = MagicMock()
+    mock_optimalx.search_notes.return_value = [
+        {
+            "location": "Research > Kokoro TTS",
+            "snippet": "Run Kokoro TTS via local ONNX model with voice bm_george.",
+        }
+    ]
+
+    interceptor = RecallStreamInterceptor(optimalx_bridge=mock_optimalx)
+
+    resp1 = MagicMock()
+    resp1.iter_lines.return_value = [
+        json.dumps({
+            "message": {"role": "assistant", "thinking": "Let me check user preferences... <recall>kokoro voice settings</recall>"},
+            "done": False,
+        }).encode()
+    ]
+
+    resp2 = MagicMock()
+    resp2.iter_lines.return_value = [
+        json.dumps({
+            "message": {"role": "assistant", "content": "I will configure Kokoro with bm_george voice."},
+            "done": True,
+        }).encode()
+    ]
+
+    callback_calls = []
+    def on_recall(query, mem_text):
+        callback_calls.append((query, mem_text))
+
+    call_count = [0]
+    def mock_post(url, *args, **kwargs):
+        call_count[0] += 1
+        return resp1 if call_count[0] == 1 else resp2
+
+    with patch("requests.post", side_effect=mock_post):
+        response = interceptor.execute_chat_with_recall(
+            base_url="http://localhost:11434",
+            model_name="test-model",
+            messages=[{"role": "user", "content": "Configure voice"}],
+            on_recall_callback=on_recall,
+        )
+
+    assert call_count[0] == 2
+    assert len(callback_calls) == 1
+    assert callback_calls[0][0] == "kokoro voice settings"
+    assert "<recalled_notes>" in callback_calls[0][1]
+    assert "bm_george" in callback_calls[0][1]
+    assert "configure Kokoro with bm_george voice" in response.content
+
+
+

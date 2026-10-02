@@ -87,6 +87,25 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 │  • Interactive inline approval cards ([Approve], [Reject], [Kill])     │
 │  • Batch job milestone progress streaming & remote question handling   │
 │  • Remote emergency stop (/kill) and status inspection                 │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  PHASE 10: Mobile PWA Gateway & Tailscale Private Mesh Network         │
+│  • Standalone installable PWA for Android (WebAPK) & iOS Safari        │
+│  • Encrypted zero-trust remote connectivity via Tailscale WireGuard    │
+│  • Real-time typewriter token streaming & collapsible reasoning cards  │
+│  • Live desktop viewport mirroring & interactive safety approval cards │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│  PHASE 11: OptimalX Bi-Directional Knowledge & Corpus Integration     │
+│  • Single source of truth in local SQLite WAL (~/OptimalX/data.db)     │
+│  • Dual-tier retrieval (online HTTP semantic search & offline WAL FTS) │
+│  • Human-in-the-loop Diff Review contract (auto-apply vs queued diff)  │
+│  • NoteX long-form markdown corpus tree navigation & reading           │
+│  • Cryptographic SHA-256 sync compatibility with OptimalX Mobile      │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -256,7 +275,7 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 ### Phase 8: Skills, Rubrics & Batch Job Runner (300 Inventions Project)
 **Goal:** Enable collaborative human/bot procedural guides and a resilient state-machine queue runner for executing multi-item projects without context degradation.
 
-*(See full specification in [`docs/SKILLS_AND_JOBS.md`](SKILLS_AND_JOBS.md))*
+*(See full specifications in [`docs/SKILLS_AND_JOBS.md`](SKILLS_AND_JOBS.md) and [`docs/INVENTION_RESEARCH_PIPELINE.md`](INVENTION_RESEARCH_PIPELINE.md))*
 
 #### Deliverables & Tasks:
 1. **Living Skill Documents (`eidos/skills/manager.py`):**
@@ -266,8 +285,20 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 2. **State-Machine Batch Runner (`eidos/jobs/runner.py`):**
    - Queue manager utilizing `queue.json` with status checkpoints (`pending`, `in_progress`, `completed`, `needs_review`).
    - Fresh context isolation per item, eliminating amnesia and token window saturation across 300+ items.
-   - Automatic generation of ranked summary leaderboards (`RANKING_SUMMARY.md`).
-   - Pause, resume, and retry controls.
+   - Pause, resume, retry, and atomic checkpoint controls.
+3. **Fresh-Context Sub-Agent Processor (`eidos/jobs/processor.py`):**
+   - Ephemeral per-item reasoning session loading the assigned `SKILL.md` and item data.
+   - Tool execution integrating `WebResearchEngine` (Brave API) and `PlaywrightManager` (Google Patents).
+   - Structured multi-dimensional scoring prompt returning JSON evaluation and justifications.
+   - Sandboxed markdown portfolio generation (`<output_dir>/portfolios/<item_id>.md`).
+4. **Autonomous Background Batch Loop & Throttling (`eidos/jobs/runner.py`):**
+   - Sequential item execution loop in background daemon thread (`run_job`).
+   - Configurable cool-down pacing (`pause_between_items_sec`) to respect rate limits and GPU thermals.
+   - Integrated with global kill switch and Telegram milestone broadcasts every $N$ items.
+5. **Leaderboard Aggregation & Ranking (`eidos/jobs/summary.py`):**
+   - Automatic generation of ranked summary leaderboards (`RANKING_SUMMARY.md`) sorted by composite viability score.
+   - Multi-tier categorization (Tier 1 High-Viability 80–100, Tier 2 Moderate 60–79, Tier 3 Speculative <60).
+   - Export to `RANKING_SUMMARY.csv` and `RANKING_SUMMARY.json`.
 
 ---
 
@@ -289,14 +320,94 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 
 ---
 
+### Phase 10: Mobile PWA Gateway & Tailscale Private Mesh
+**Goal:** Deliver an installable, high-bandwidth Progressive Web App (PWA) running on both Android and iPhone, providing real-time token streaming, live desktop mirroring, and rich safety interception modals over an encrypted Tailscale private mesh network.
+
+*(See full specification in [`docs/MOBILE_PWA_GATEWAY.md`](MOBILE_PWA_GATEWAY.md))*
+
+#### Deliverables & Tasks:
+1. **Frontend PWA Scaffolding (`web/`):**
+   - React 19 / 18 + Vite + TypeScript + Tailwind CSS with Dracula theme tokens.
+   - PWA manifest (`manifest.json`), service worker, and app icons for standalone Android (WebAPK) and iOS home screen launching.
+2. **Real-Time Streaming & State Layer:**
+   - Resilient WebSocket connection hook (`useEidosWS`) with exponential backoff reconnect.
+   - Live token typewriter stream, status transitions, and confirmation queues.
+3. **Interactive UI Views & Components:**
+   - Markdown chat with collapsible `<thought>` / `<recall>` reasoning accordions.
+   - Interactive Level 2/3 safety approval modals with bash command diffs and risk tags.
+   - Live desktop screenshot viewport with auto-refresh and pinch-to-zoom.
+   - Dracula status pill and persistent tactile emergency kill switch `[🛑 STOP]`.
+4. **Backend Gateway Static Serving (`eidos/gateway/server.py`):**
+   - Serve compiled `web/dist/` SPA bundle with fallback to embedded dashboard.
+   - Expand WebSocket handler to broadcast token streams, thought chunks, and confirmation resolutions.
+5. **Tailscale Private Networking Setup:**
+   - Zero-port-forwarding WireGuard mesh connecting Linux host, Android phone, and wife's iPhone.
+
+---
+
+### Phase 11: OptimalX Bi-Directional Knowledge & Corpus Integration (Desktop + Mobile Sync)
+**Goal:** Enable EidosBot to search, read, create, and propose edits to personal notes and knowledge bases created in OptimalX (synced from Android Mobile over Tailscale mesh and Desktop), backed by local SQLite WAL, live semantic search, and human-in-the-loop Diff Review.
+
+*(See full specification in [`docs/OPTIMALX_INTEGRATION.md`](OPTIMALX_INTEGRATION.md))*
+
+#### Deliverables & Tasks:
+1. **Core Read & Search Engine (`eidos/integrations/optimalx.py`):**
+   - Connect to local Express server on `http://127.0.0.1:7373` with Bearer auth loaded from `~/.config/optimalx-desktop/config.json`.
+   - **Tier 1 (Online):** Query `POST /api/v1/llm/search` for cosine-ranked snippet matches against pre-computed `nomic-embed-text` chunks.
+   - **Tier 2 (Offline / Cold-Start):** Fall back to direct SQLite queries on `file:/home/tuf/OptimalX/data.db?mode=ro` across `notes`, `subfolders`, and `parent_folders`.
+   - Enforce strict privacy filters: exclude soft-deleted notes (`deleted_at IS NOT NULL`) and private notes (`ai_blind = 1`).
+2. **NoteX Corpus & Hierarchy Navigation:**
+   - Implement `list_folders(parent_folder_id=None)` to map folder trees and resolve subfolder IDs.
+   - Implement `read_note(subfolder_id, title)` returning full markdown, word count, summary, and `ai_locked` status.
+   - Implement `read_notex_doc(subfolder_id, doc_path)` reading long-form project markdown from `~/OptimalX/notex/<globalId>/`.
+3. **Safe Mutation & Diff Review Applier:**
+   - Auto-apply direct writes when creating new notes or writing to empty notes (`shouldAutoApply == true`), generating SHA-256 `content_hash`, UUID `global_id`, and creating a checkpoint in `content_checkpoints`.
+   - Queue modifications to existing non-empty notes into `pending_change_items` (`status = 'pending'`) for human-in-the-loop review in the OptimalX desktop UI.
+   - Support direct append mode for machine logging and batch agent outputs.
+   - Preserve complete sync protocol compatibility so OptimalX Mobile pulls changes seamlessly over Tailscale WireGuard mesh.
+4. **Agent Tool Suite & Cognitive Routing:**
+   - Register tool schemas in `eidos/core/context.py`: `optimalx_search_notes`, `optimalx_read_note`, `optimalx_list_folders`, `optimalx_write_note`, `optimalx_read_notex_doc`.
+   - Route dispatches in `eidos/core/loop.py` to `self.optimalx`.
+   - Update `eidos/safety/risk_classifier.py`: Level 0 (Passive / Auto-allowed) for reads/search, Level 1 (Safe Action) for writes/proposals.
+5. **Episodic Memory RAG & Batch Job Integration:**
+   - Connect `<recall>` thought streams (`eidos/memory/recall_stream.py`) to query personal OptimalX notes when user projects are referenced.
+   - Allow batch job processors (`eidos/jobs/processor.py`) to pull reference notes during multi-item runs.
+6. **Comprehensive Verification & Test Suite:**
+   - Unit and integration tests in `tests/test_optimalx_notes.py`:
+     - Live and mocked HTTP semantic search on port 7373.
+     - Direct read-only SQLite WAL query verification against `data.db`.
+     - `ai_blind` privacy enforcement verification.
+     - New note direct-write vs existing note Diff Review queuing verification.
+     - Content hash cryptographic validity (SHA-256) matching mobile sync expectations.
+
+---
+
 ## 🚦 Recommended Next Steps
 
-With the architecture and full specifications in place, the immediate implementation roadmap is:
-1. **Install System Dependencies:** Install `bubblewrap` and `playwright` (`pip install playwright trafilatura python-telegram-bot && playwright install chromium`).
-2. **Deploy Kernel Sandboxing (`eidos/sandbox/bwrap.py`):** Hook into `ShellExecutor` so shell commands become safe by default, immediately removing allowlist prompt fatigue.
-3. **Deploy Headless Browser Subsystem (`eidos/browser/manager.py`):** Wire `browser_*` tools into `EIDOS_TOOLS` to enable web research without mouse clicks.
-4. **Deploy Skills & Job Runner (`eidos/skills/` & `eidos/jobs/`):** Set up the `invention-evaluator` `SKILL.md` and `queue.json` state machine for the 300 Inventions project.
-5. **Launch Telegram Bot Gateway (`eidos/gateway/telegram_bot.py`):** Wire the bot token and interactive inline approvals for remote human-in-the-loop operation.
-3. Build the vector database connector (`episodic_store.py`) backed by local `nomic-embed-text`.
-4. Implement `<recall>` tag interception in `ollama_client.py`.
-5. Add the User Profile manager tab to the PyQt6 Settings Dialog.
+With the core subsystems, processor, background batch runner, and ranking leaderboard generator fully deployed and verified, the status of the pipeline milestones is:
+
+1. [x] **Implement Fresh-Context Sub-Agent Processor (`eidos/jobs/processor.py`):**
+   - Created `SkillJobProcessor` to execute item-level research workflows.
+   - Wired `WebResearchEngine` (Brave Search) and `PlaywrightManager` (Google Patents / web DOM).
+   - Prompted `ModelRouter` to score the 4 dimensions defined in `invention-evaluator/SKILL.md` (Feasibility, Demand, Novelty, Margins).
+   - Standardized markdown portfolios (`<output_dir>/portfolios/<id>.md`) written inside sandboxed workspace.
+2. [x] **Build Continuous Batch Execution Loop & Controls (`eidos/jobs/runner.py`):**
+   - Added `run_job()` and background thread runner with pacing delays (`pause_between_items_sec`) to protect API limits and GPU thermals.
+   - Wired `run_batch_job` tool into `eidos/core/context.py` and `eidos/core/loop.py`.
+   - Maintained responsiveness to emergency kill switch (`<ctrl>+<alt>+<esc>`), `/pause`, `/resume`, and `/kill`.
+3. [x] **Build Ranking Leaderboard Generator (`eidos/jobs/summary.py`):**
+   - Scans `queue.json` upon completion (or on demand) to compile `RANKING_SUMMARY.md`, `RANKING_SUMMARY.csv`, and `RANKING_SUMMARY.json`.
+   - Categorizes evaluated inventions into Tier 1 (80–100), Tier 2 (60–79), and Tier 3 (<60), with a dedicated Needs Review section.
+   - Exposed via `generate_batch_summary` tool and Telegram companion command `/summary`.
+4. [x] **Implement OptimalX Bi-Directional Note & Knowledge Bridge (Phase 11):**
+   - [x] **Phase 11.1:** Build dual-tier read & search in `eidos/integrations/optimalx.py` (live port 7373 HTTP semantic vector search + direct SQLite WAL fallback on `~/OptimalX/data.db`).
+   - [x] **Phase 11.2:** Add folder hierarchy listing and NoteX markdown document reader.
+   - [x] **Phase 11.3:** Build safe mutation engine (direct write with SHA-256 and checkpoints for empty notes, queued `pending_change_items` Diff Review for existing notes, checkpoint pruning, accept/reject operations).
+   - [x] **Phase 11.4:** Register tools in `eidos/core/context.py` (`optimalx_search_notes`, `optimalx_read_note`, `optimalx_list_folders`, `optimalx_write_note`, `optimalx_read_notex_doc`, `optimalx_list_notex_docs`, `optimalx_list_pending_reviews`, `optimalx_accept_pending_review`, `optimalx_reject_pending_review`), route cognitive loop dispatches in `eidos/core/loop.py`, and classify risk levels in `eidos/safety/risk_classifier.py`.
+   - [x] **Phase 11.5:** Episodic Memory RAG & Batch Job Integration (extend `<recall>` streams in `recall_stream.py` and `jobs/processor.py` to cross-reference personal notes without database duplication).
+   - [x] **Phase 11.6:** End-to-end integration and regression testing across the entire pipeline.
+5. [ ] **Ingest Invention List & Launch Run:**
+   - Place target invention list (`inventions.csv` or `inventions.json`) in `~/EidosWorkspace/`.
+   - Initialize and launch batch job via GUI chat, CLI, or Telegram companion.
+   - Cross-reference prior OptimalX invention notes during batch scoring.
+   - Monitor live milestone telemetry and review generated portfolios.

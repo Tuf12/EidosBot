@@ -138,9 +138,8 @@ A compact, draggable HUD widget (positioned by default in the top-right corner o
   - **Tool & Action Cards:** Live log badges (`⚡ Action`) showing command invocations (shell, active window, screenshot) and execution previews.
   - **Multi-Turn Context & Automatic SQLite Persistence:** Conversations and message turns are immediately saved to `~/.eidos/eidos.db`. Upon kill and restart, the last active conversation and all its messages are automatically restored into the chat UI and loop reasoning memory.
   - **➕ New Chat:** Create a fresh conversation thread at any time while keeping past conversations safely stored.
-  - **📜 Past Conversations Manager (`ConversationsDialog`):** Full-featured window accessible via the `[📜 Past Chats]` button or context menu to search by topic or keyword, preview message snippets, open/resume any past chat, and delete old threads.
+  - **📜 Past Conversations Manager (`ConversationsDialog`):** Full-featured window accessible via the `[📜 Past Chats]` button or context menu to search by topic or keyword, preview message snippets, open/resume any past chat, and delete old threads with confirmation.
   - **Auto-Titling:** Intelligently derives human-readable conversation titles from the initial user prompt.
-  - **Clear Chat (`🗑️`):** One-click button in header and menu to clear visual bubbles and reset loop conversation history.
 - **Visual Status Indicator:**
   - 🟢 **Idle / Ready:** Waiting for user command or voice prompt.
   - 🟡 **Thinking:** LLM is reasoning (shows provider and active model).
@@ -150,7 +149,6 @@ A compact, draggable HUD widget (positioned by default in the top-right corner o
   - 🔴 **Killed / Error:** Stopped via `Ctrl+Alt+Esc` or encountered an exception.
 - **Controls on the Pill:**
   - **[ 💬 Expand / ▲ Collapse ]** button (toggles full chat view, `Ctrl+E`).
-  - **[ 🗑️ Clear ]** button (clears chat conversation history).
   - **[ 🛑 Stop / 🔄 Reset ]** button (GUI equivalent of emergency kill switch).
   - **[ 🛡️ Allowlist ]** button (opens the Command Allowlist Manager).
   - **[ ⚙️ Settings ]** button (opens Model & Safety preferences).
@@ -264,7 +262,7 @@ For full design specifications, see [EPISODIC_MEMORY.md](EPISODIC_MEMORY.md).
 
 ## 7. Skills & Collaborative Batch Job Runner
 
-For full design specifications, see [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md).
+For full design specifications, see [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md) and [INVENTION_RESEARCH_PIPELINE.md](INVENTION_RESEARCH_PIPELINE.md).
 
 ### 7.1. Living Human & Bot Editable Skills (`SKILL.md`)
 - Stored under `~/.eidos/skills/<skill-name>/SKILL.md` or in project workspaces.
@@ -310,5 +308,47 @@ For full design specifications, see [TELEGRAM_GATEWAY.md](TELEGRAM_GATEWAY.md).
 - Receive periodic batch job milestone summaries (e.g. every 10 items).
 - EidosBot can ask clarifying questions directly on Telegram when encountering ambiguous concepts during unattended runs.
 - Remote emergency stop command (`/kill`) instantly halts all running subprocesses and agent loops.
+
+---
+
+## 10. Mobile PWA Gateway & Tailscale Private Mesh
+
+For full design specifications, see [MOBILE_PWA_GATEWAY.md](MOBILE_PWA_GATEWAY.md).
+
+### 10.1. Interactive Progressive Web App (PWA)
+- Standalone installable companion on Android (WebAPK) and iOS (Safari Home Screen PWA).
+- Built with React 19/18, Vite, TypeScript, and Dracula Tailwind theme tokens.
+- Served directly by the local Python gateway server on port 8420.
+
+### 10.2. Real-Time Streaming & Visual Desktop Mirroring
+- Full typewriter token streaming over WebSockets without third-party rate limits.
+- Collapsible `<thought>` and `<recall>` accordions revealing the agent's internal reasoning.
+- Live desktop viewport mirroring with zoom controls and tactile emergency kill switch button.
+
+### 10.3. Tailscale Zero-Trust Mesh
+- Encrypted WireGuard private mesh connecting host machine, Android phone, and other devices without open router ports or public IP exposure.
+
+---
+
+## 11. OptimalX Bi-Directional Note & Knowledge Integration
+
+For full design specifications, see [OPTIMALX_INTEGRATION.md](OPTIMALX_INTEGRATION.md).
+
+### 11.1. Synchronized Single Source of Truth
+- **Universal Mobile & Desktop Sync:** Notes created on the go in OptimalX Mobile sync over Tailscale WireGuard to OptimalX Desktop.
+- **Local SQLite Single Source:** All synchronized notes, folders, and summaries converge in `~/OptimalX/data.db` (SQLite in WAL mode).
+- **Direct Offline Access:** EidosBot reads notes via `mode=ro` WAL queries even when OptimalX Desktop is closed.
+
+### 11.2. Dual-Tier Retrieval Engine
+- **Tier 1 (Online):** When OptimalX Desktop Express server is running on port 7373, EidosBot queries `POST /api/v1/llm/search` for cosine-ranked snippet matches against pre-computed `nomic-embed-text` chunks.
+- **Tier 2 (Offline / Cold-Start):** Direct SQLite WAL queries across `notes`, `subfolders`, and `parent_folders`.
+- **NoteX Corpus Reader:** Multi-file project traversal under `~/OptimalX/notex/<globalId>/`.
+
+### 11.3. Human-in-the-Loop Diff Review & Mutation Safety
+- **Auto-Apply on Empty Notes:** New notes or blank documents auto-write immediately with SHA-256 `content_hash` and `content_checkpoints`, allowing batch jobs to generate documentation without blocking.
+- **Diff Review for Existing Notes:** Modifications to existing non-empty notes queue into `pending_change_items` (`status = 'pending'`), requiring user approval in the OptimalX desktop UI.
+- **Mobile Sync Parity:** All writes strictly adhere to `content_hash` and `origin_device_id` conventions so OptimalX Mobile pulls changes seamlessly.
+- **Strict Privacy & Immutability:** Notes marked `ai_blind = 1` are completely invisible to EidosBot; notes marked `ai_locked = 1` are strictly read-only.
+
 
 

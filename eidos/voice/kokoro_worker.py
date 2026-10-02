@@ -38,7 +38,9 @@ class KokoroWorkerClient:
 
         self._proc: Optional[subprocess.Popen] = None
         self._reader: Optional[threading.Thread] = None
+        self._stderr_reader: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        self._cmd_lock = threading.RLock()
         self._ready = threading.Event()
         self._load_error: Optional[str] = None
         self._pending: list[dict] = []
@@ -77,19 +79,21 @@ class KokoroWorkerClient:
         speed: float,
     ) -> dict:
         self.ensure_started()
-        response = self._request(
-            {
-                "cmd": "speak",
-                "text": text,
-                "outPath": out_path,
-                "voice": voice,
-                "speed": speed,
-                "device": self.device,
-            }
-        )
-        if not response.get("ok", True):
-            raise RuntimeError(response.get("error") or "Kokoro synthesis failed")
-        return response
+        with self._cmd_lock:
+            response = self._request(
+                {
+                    "cmd": "speak",
+                    "text": text,
+                    "outPath": out_path,
+                    "voice": voice,
+                    "speed": speed,
+                    "device": self.device,
+                },
+                expected_key="outPath",
+            )
+            if not response.get("ok", True):
+                raise RuntimeError(response.get("error") or "Kokoro synthesis failed")
+            return response
 
     def synthesize_stream(
         self,
@@ -112,30 +116,31 @@ class KokoroWorkerClient:
         if pieces:
             payload["pieces"] = pieces
 
-        with self._pending_lock:
-            self._active_stream_id = stream_id
-            self._stream_chunks = []
-            self._stream_error = None
-            self._stream_done.clear()
-
-        self._write(payload)
-
-        while True:
+        with self._cmd_lock:
             with self._pending_lock:
-                if self._stream_chunks:
-                    chunk = self._stream_chunks.pop(0)
-                elif self._stream_done.is_set():
-                    if self._stream_error:
-                        raise RuntimeError(self._stream_error)
-                    return
-                else:
-                    chunk = None
-            if chunk is None:
-                time.sleep(0.01)
-                continue
-            if on_chunk:
-                on_chunk(chunk)
-            yield chunk
+                self._active_stream_id = stream_id
+                self._stream_chunks = []
+                self._stream_error = None
+                self._stream_done.clear()
+
+            self._write(payload)
+
+            while True:
+                with self._pending_lock:
+                    if self._stream_chunks:
+                        chunk = self._stream_chunks.pop(0)
+                    elif self._stream_done.is_set():
+                        if self._stream_error:
+                            raise RuntimeError(self._stream_error)
+                        return
+                    else:
+                        chunk = None
+                if chunk is None:
+                    time.sleep(0.01)
+                    continue
+                if on_chunk:
+                    on_chunk(chunk)
+                yield chunk
 
     def cancel_stream(self) -> None:
         if not self._proc or self._proc.poll() is not None:
@@ -187,6 +192,17 @@ class KokoroWorkerClient:
         )
         self._reader = threading.Thread(target=self._read_stdout, name="eidos-kokoro-worker", daemon=True)
         self._reader.start()
+        self._stderr_reader = threading.Thread(target=self._read_stderr, name="eidos-kokoro-worker-err", daemon=True)
+        self._stderr_reader.start()
+
+    def _read_stderr(self) -> None:
+        proc = self._proc
+        if not proc or not proc.stderr:
+            return
+        for raw in proc.stderr:
+            line = raw.strip()
+            if line:
+                logger.debug("Kokoro worker stderr: %s", line)
 
     def _read_stdout(self) -> None:
         proc = self._proc
@@ -227,8 +243,6 @@ class KokoroWorkerClient:
                     self._stream_error = msg.get("error") or "TTS stream failed"
                 self._active_stream_id = None
                 self._stream_done.set()
-            with self._pending_lock:
-                self._pending.append(msg)
             return
 
         with self._pending_lock:
@@ -241,7 +255,7 @@ class KokoroWorkerClient:
         proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         proc.stdin.flush()
 
-    def _request(self, payload: dict, timeout_s: float = 180.0) -> dict:
+    def _request(self, payload: dict, expected_key: Optional[str] = None, timeout_s: float = 180.0) -> dict:
         with self._pending_lock:
             self._pending.clear()
         self._write(payload)
@@ -249,7 +263,10 @@ class KokoroWorkerClient:
         while time.time() < deadline:
             with self._pending_lock:
                 if self._pending:
-                    return self._pending.pop(0)
+                    for i, item in enumerate(self._pending):
+                        if expected_key and expected_key not in item and not item.get("error"):
+                            continue
+                        return self._pending.pop(i)
             if self._proc and self._proc.poll() is not None:
                 break
             time.sleep(0.01)

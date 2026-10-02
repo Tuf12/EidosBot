@@ -208,21 +208,32 @@ def test_batch_job_input_formats():
 def test_agent_loop_skills_and_jobs_tool_dispatch():
     """Verify AgentLoop dispatches skills and batch job tools."""
     from eidos.core.loop import AgentLoop
-    from eidos.models.base import ToolCall
+    from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
     from eidos.safety.gatekeeper import Gatekeeper
     from eidos.safety.kill_switch import KillSwitch
+
+    class MockJobModelClient(BaseModelClient):
+        def chat(self, messages, tools=None, model_override=None):
+            return ModelResponse(content='{"summary": "Processed item", "artifact_markdown": "# Done"}')
+
+        def vision_chat(self, prompt, image_base64, system_prompt=None, model_override=None):
+            return ModelResponse(content="ok")
 
     with tempfile.TemporaryDirectory() as skills_dir, tempfile.TemporaryDirectory() as jobs_dir:
         kill_switch = KillSwitch()
         gatekeeper = Gatekeeper(kill_switch=kill_switch)
+        mock_model = MockJobModelClient()
         loop = AgentLoop(
             config={
                 "skills": {"directory": skills_dir},
                 "jobs": {"default_output_dir": jobs_dir},
             },
+            model_client=mock_model,
             gatekeeper=gatekeeper,
             kill_switch=kill_switch,
         )
+        if hasattr(loop, "job_processor") and loop.job_processor:
+            loop.job_processor.router = mock_model
 
         # 1. create_skill
         skill_content = "---\nname: summary-skill\ndescription: Unit test skill\n---\n# Summary\nDo it."
@@ -272,3 +283,122 @@ def test_agent_loop_skills_and_jobs_tool_dispatch():
         assert res["status"] == "paused"
         res, stop = loop._dispatch_tool(ToolCall(name="resume_batch_job", arguments={"job_id": job_id}))
         assert res["status"] == "in_progress"
+
+        # 8. run_batch_job (foreground)
+        res_run, stop = loop._dispatch_tool(
+            ToolCall(
+                name="run_batch_job",
+                arguments={"job_id": job_id, "background": False, "pause_between_items_sec": 0.01},
+            )
+        )
+        assert res_run["success"] is True
+        assert res_run["done"] is True
+        assert res_run["completed_items"] == 2
+
+
+def test_batch_job_runner_run_job_continuous():
+    """Verify run_job executes all pending items sequentially with pacing."""
+    with tempfile.TemporaryDirectory() as jobs_dir:
+        runner = BatchJobRunner(default_jobs_dir=jobs_dir)
+        queue = runner.initialize_job(
+            job_name="Continuous Run Test",
+            skill_name="generic-skill",
+            input_data=["item 1", "item 2", "item 3"],
+            output_dir=os.path.join(jobs_dir, "continuous_run"),
+        )
+        assert queue.completed_items == 0
+
+        res = runner.run_job(pause_between_items_sec=0.01)
+        assert res["success"] is True
+        assert res["done"] is True
+        assert res["completed_items"] == 3
+        assert res["total_items"] == 3
+
+        st = runner.get_status()
+        assert st["status"] == "completed"
+        assert st["completed_items"] == 3
+        assert st["pending_items"] == 0
+
+
+def test_batch_job_runner_run_job_max_items():
+    """Verify run_job respects max_items limit."""
+    with tempfile.TemporaryDirectory() as jobs_dir:
+        runner = BatchJobRunner(default_jobs_dir=jobs_dir)
+        queue = runner.initialize_job(
+            job_name="Max Items Test",
+            skill_name="generic-skill",
+            input_data=["A", "B", "C", "D"],
+            output_dir=os.path.join(jobs_dir, "max_items_run"),
+        )
+
+        res = runner.run_job(pause_between_items_sec=0.01, max_items=2)
+        assert res["success"] is True
+        assert res["done"] is False
+        assert res["completed_items"] == 2
+        assert res["total_items"] == 4
+
+        st = runner.get_status()
+        assert st["completed_items"] == 2
+        assert st["pending_items"] == 2
+
+
+def test_batch_job_runner_run_job_kill_switch():
+    """Verify run_job halts immediately when kill switch is triggered."""
+    from eidos.safety.kill_switch import KillSwitch
+
+    with tempfile.TemporaryDirectory() as jobs_dir:
+        kill_switch = KillSwitch()
+        runner = BatchJobRunner(default_jobs_dir=jobs_dir, kill_switch=kill_switch)
+        queue = runner.initialize_job(
+            job_name="Kill Switch Run Test",
+            skill_name="generic-skill",
+            input_data=["item 1", "item 2", "item 3"],
+            output_dir=os.path.join(jobs_dir, "kill_run"),
+        )
+
+        # Trigger kill switch before or during run
+        kill_switch.trigger()
+        res = runner.run_job(pause_between_items_sec=0.01)
+
+        assert res["success"] is False
+        assert res["aborted"] is True
+        assert res["reason"] == "kill_switch_triggered"
+        assert res["status"] == "paused"
+
+
+def test_batch_job_runner_background_worker_lifecycle():
+    """Verify background worker launch, status polling, and clean stopping."""
+    import time
+
+    with tempfile.TemporaryDirectory() as jobs_dir:
+        runner = BatchJobRunner(default_jobs_dir=jobs_dir)
+        queue = runner.initialize_job(
+            job_name="Background Worker Test",
+            skill_name="generic-skill",
+            input_data=[f"item_{i}" for i in range(10)],
+            output_dir=os.path.join(jobs_dir, "bg_run"),
+        )
+
+        # Launch in background with 0.1s pacing
+        bg_res = runner.run_in_background(pause_between_items_sec=0.1)
+        assert bg_res["success"] is True
+        assert bg_res["status"] == "running_in_background"
+        assert runner.is_worker_running() is True
+        assert runner.get_active_worker_job_id() == queue.job_id
+
+        # Verify get_status reports is_running_in_background=True
+        st = runner.get_status()
+        assert st["is_running_in_background"] is True
+
+        # Let it process 1-2 items
+        time.sleep(0.3)
+
+        # Stop worker
+        stop_res = runner.stop_background_worker(timeout=3.0)
+        assert stop_res["success"] is True
+        assert runner.is_worker_running() is False
+
+        st_after = runner.get_status()
+        assert st_after["is_running_in_background"] is False
+        assert st_after["completed_items"] >= 1
+

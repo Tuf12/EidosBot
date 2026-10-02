@@ -83,10 +83,15 @@ class ModelRouter(BaseModelClient):
             self.last_provider_used = "ollama"
             response = self.ollama.chat(messages=messages, tools=tools, model_override=model_override)
 
-            # Check if local response succeeded
-            if response.content and not response.content.startswith("Error communicating with Ollama"):
+            has_error = (
+                (bool(response.content) and response.content.startswith("Error communicating with Ollama"))
+                or (isinstance(response.raw, dict) and bool(response.raw.get("error")))
+            )
+
+            # Check if local response succeeded without error
+            if not has_error and (response.content or response.has_tool_calls or response.thinking):
                 return response
-            elif response.has_tool_calls:
+            elif not has_error and self.preference != ProviderPreference.AUTO:
                 return response
 
             # If failed and AUTO mode is enabled with Chutes configured -> Escalate
@@ -137,8 +142,15 @@ class ModelRouter(BaseModelClient):
                 model_override=model_override,
             )
 
-            # Check if local vision gave meaningful output
-            if response.content and not response.content.startswith("Error communicating with Ollama"):
+            has_error = (
+                (bool(response.content) and response.content.startswith("Error communicating with Ollama"))
+                or (isinstance(response.raw, dict) and bool(response.raw.get("error")))
+            )
+
+            # Check if local vision gave meaningful output without error
+            if not has_error and (response.content or response.has_tool_calls or response.thinking):
+                return response
+            elif not has_error and self.preference != ProviderPreference.AUTO:
                 return response
 
             # Escalate if local vision failed

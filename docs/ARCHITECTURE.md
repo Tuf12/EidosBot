@@ -238,21 +238,40 @@ Every interaction cycle executes through a six-stage pipeline:
   - Presents interactive inline buttons (`[Approve]`, `[Reject]`, `[Kill]`) for host-level or destructive commands.
   - Streams periodic milestone progress updates and clarifying questions during batch job runs.
 
+### 4.11. Mobile PWA Gateway & Tailscale Private Mesh (`web/` & `eidos/gateway/server.py`)
+
+*(Detailed specifications in [MOBILE_PWA_GATEWAY.md](MOBILE_PWA_GATEWAY.md))*
+
+- **Platform-Agnostic Mobile Companion (Android & iOS):**
+  - Standalone Progressive Web App (PWA) installable on Android (via Chrome WebAPK) and iPhone (via Safari Home Screen).
+  - Encrypted, zero-port-forwarding connectivity anywhere in the world via private Tailscale WireGuard mesh.
+  - Real-time typewriter token streaming and collapsible `<thought>` / `<recall>` reasoning accordions over WebSockets.
+  - Interactive Level 2 and Level 3 safety approval modals with bash command diffs, working directories, and risk badges.
+  - Live desktop screen mirroring with zoom controls and tactile emergency kill switch button.
+
 ---
 
 ## 5. Application Integration Bridges (`eidos/integrations/`)
 
-### 5.1. OptimalX Desktop 1.0 Bridge (`optimalx_bridge.py`)
+### 5.1. OptimalX Desktop 1.0 & Knowledge Ecosystem Bridge (`optimalx.py`)
 
-Because **OptimalX Desktop** is an Electron application built by the user, EidosBot can interface with it at maximum reliability:
+Because **OptimalX Desktop** and **OptimalX Mobile** are personally developed by the user and synchronized over a private Tailscale WireGuard mesh, EidosBot interfaces directly with the user's complete knowledge base:
 
-1. **Remote Debugging Hook:** OptimalX can be launched with `--remote-debugging-port=9222`.
-2. **Direct WebSocket CDP Connection:**
-   - EidosBot connects via `aiohttp` / `websockets` to `ws://localhost:9222/devtools/page/...`.
-   - Dispatches `DOM.getDocument`, `DOM.querySelector`, and `Runtime.evaluate`.
-   - Reads exact element boundaries without relying on computer vision.
-3. **IPC Bridge Fallback:**
-   - If CDP is not used, a lightweight local Unix domain socket (`/tmp/optimalx-eidos.sock`) can allow OptimalX and EidosBot to exchange JSON-RPC messages directly.
+1. **Local SQLite Single Source of Truth (`~/OptimalX/data.db`):**
+   - Direct read-only connection (`mode=ro`) via WAL mode ensures instantaneous offline note search and retrieval even when OptimalX Desktop is closed.
+   - Respects user privacy flags: strictly excludes `ai_blind = 1` and soft-deleted rows.
+2. **Online Semantic Vector Search (`POST /api/v1/llm/search`):**
+   - When the OptimalX Express server is running on port 7373, EidosBot queries pre-embedded vector chunks (`semantic_chunks` table) indexed via local `nomic-embed-text`.
+3. **Safe Mutation & Diff Review Safeguard:**
+   - Empty/new notes auto-apply directly to SQLite with SHA-256 `content_hash` and `content_checkpoints`.
+   - Edits to existing non-empty notes queue into `pending_change_items` for human-in-the-loop review in the OptimalX desktop UI.
+   - Seamless sync parity: OptimalX Mobile automatically pulls changes over Tailscale on subsequent sync cycles.
+4. **NoteX Long-Form Markdown Corpus Reader:**
+   - Navigates and reads multi-document projects under `~/OptimalX/notex/<global_id>/`.
+5. **Remote Debugging & DOM Inspection (CDP):**
+   - Connects to Chrome DevTools Protocol WebSocket on port 9222 for direct DOM inspection and UI state evaluation without relying solely on computer vision.
+
+*(See full specification in [`docs/OPTIMALX_INTEGRATION.md`](OPTIMALX_INTEGRATION.md))*
 
 
 
@@ -272,11 +291,14 @@ EidosBot/
 │   ├── ARCHITECTURE.md             # This document
 │   ├── FEATURES.md                 # Feature breakdown & safety matrix
 │   ├── ROADMAP.md                  # Implementation roadmap
+│   ├── OPTIMALX_INTEGRATION.md     # OptimalX bi-directional note & knowledge bridge spec
 │   ├── EPISODIC_MEMORY.md          # Episodic memory, recall & LoRA training spec
 │   ├── SKILLS_AND_JOBS.md          # Skills, rubrics & batch job runner spec
+│   ├── INVENTION_RESEARCH_PIPELINE.md # Inventions research & evaluation pipeline spec
 │   ├── SANDBOXING.md               # Kernel filesystem isolation (bwrap) spec
 │   ├── PLAYWRIGHT_AUTOMATION.md    # Headless browser automation spec
 │   ├── TELEGRAM_GATEWAY.md         # Telegram mobile companion & approvals spec
+│   ├── MOBILE_PWA_GATEWAY.md       # Mobile PWA companion & Tailscale spec
 │   └── IMPLEMENTATION_GUIDE.md     # Step-by-step master implementation plan
 ├── eidos/
 │   ├── __init__.py
@@ -362,6 +384,17 @@ EidosBot/
 │   ├── export_sft.py               # Export trajectories to ShareGPT / ChatML
 │   ├── export_dpo.py               # Extract preference pairs from mistakes
 │   └── train_lora.py               # Local LoRA fine-tuning runner
+├── web/                            # Mobile PWA companion frontend (React + Tailwind + Vite)
+│   ├── package.json
+│   ├── vite.config.ts
+│   ├── public/
+│   │   ├── manifest.json           # Web App Manifest (Android WebAPK & iOS Safari)
+│   │   └── icons/                  # 192x192 & 512x512 app launcher icons
+│   ├── src/
+│   │   ├── App.tsx                 # Root layout, status pill & views
+│   │   ├── hooks/useEidosWS.ts     # Resilient WebSocket connection hook
+│   │   └── components/             # ChatView, ScreenViewport, SafetyModal
+│   └── dist/                       # Compiled production bundle (served by server.py)
 └── tests/
     ├── test_screen.py              # Test screen capture
     ├── test_window_info.py         # Test X11 window detection

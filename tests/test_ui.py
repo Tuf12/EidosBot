@@ -408,7 +408,6 @@ def test_status_pill_expand_and_collapse(qapp):
     assert not pill.chat_container.isVisible()
     assert pill.btn_expand.text() == "💬"
     assert pill.details_label.isVisible()
-    assert not pill.btn_clear.isVisible()
     assert not pill.btn_collapse.isVisible()
 
     # Expand
@@ -417,7 +416,6 @@ def test_status_pill_expand_and_collapse(qapp):
     assert pill.chat_container.isVisible()
     assert pill.btn_expand.text() == "💬"
     assert not pill.details_label.isVisible()
-    assert pill.btn_clear.isVisible()
     assert pill.btn_collapse.isVisible()
     assert pill.btn_collapse.text() == "−"
 
@@ -703,6 +701,27 @@ def test_conversations_dialog(qapp):
     dialog._on_select_conversation(c2)
     assert len(selected) == 1
     assert selected[0] == c2
+
+    # Test delete confirmation dialog: "No" cancels deletion
+    from unittest.mock import patch
+    from PyQt6.QtWidgets import QMessageBox
+
+    deleted = []
+    dialog.signal_conversation_deleted.connect(lambda cid: deleted.append(cid))
+
+    with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.No):
+        dialog._on_delete_conversation(c2, "FastAPI Guide")
+        assert len(deleted) == 0
+        assert store.get_conversation(c2) is not None
+        assert dialog.table.rowCount() == 2
+
+    # Test delete confirmation dialog: "Yes" confirms deletion
+    with patch.object(QMessageBox, "exec", return_value=QMessageBox.StandardButton.Yes):
+        dialog._on_delete_conversation(c2, "FastAPI Guide")
+        assert len(deleted) == 1
+        assert deleted[0] == c2
+        assert store.get_conversation(c2) is None
+        assert dialog.table.rowCount() == 1
 
     dialog.close()
     store.close()

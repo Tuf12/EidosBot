@@ -248,14 +248,31 @@ class ConversationsDialog(QDialog):
         self.accept()
 
     def _on_delete_conversation(self, conversation_id: str, title: str):
-        """Confirm and delete a conversation from the database."""
-        reply = QMessageBox.question(
-            self,
-            "Delete Conversation",
-            f"Are you sure you want to delete conversation:\n\n\"{title}\"?\n\nThis will remove all associated messages.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        """Confirm with Yes/No before deleting a conversation from the database."""
+        display_title = title.strip() or "Untitled Chat"
+        if len(display_title) > 60:
+            display_title = display_title[:57] + "..."
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Delete Conversation")
+        msg_box.setIcon(QMessageBox.Icon.Warning)
+        msg_box.setText("Are you sure you want to delete this conversation?")
+        msg_box.setInformativeText(
+            f"\"{display_title}\"\n\nThis will permanently remove this conversation and all associated messages."
         )
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg_box.setDefaultButton(QMessageBox.StandardButton.No)
+        msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        msg_box.setStyleSheet(
+            "QMessageBox { background-color: #21222c; } "
+            "QLabel { color: #f8f8f2; font-size: 12px; } "
+            "QPushButton { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; "
+            "border-radius: 4px; padding: 5px 16px; min-width: 65px; font-size: 12px; font-weight: bold; } "
+            "QPushButton:hover { background-color: #44475a; } "
+            "QPushButton:focus { border: 1px solid #bd93f9; }"
+        )
+
+        reply = msg_box.exec()
         if reply == QMessageBox.StandardButton.Yes:
             self.store.delete_conversation(conversation_id)
             self.signal_conversation_deleted.emit(conversation_id)

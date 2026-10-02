@@ -44,6 +44,7 @@ class UIController(QObject):
     signal_chat_tool_end = pyqtSignal(str, dict)
     signal_chat_error = pyqtSignal(str)
     signal_task_running = pyqtSignal(bool)
+    signal_sync_conversation = pyqtSignal(str, str, list)
 
     def __init__(
         self,
@@ -118,6 +119,13 @@ class UIController(QObject):
         self.pill.signal_replay_tts.connect(self.replay_tts)
         self.pill.signal_edit_submitted.connect(self._on_message_edited)
         self.signal_task_running.connect(self.pill.set_task_running)
+        self.signal_sync_conversation.connect(self._apply_conversation_sync)
+
+    @pyqtSlot(str, str, list)
+    def _apply_conversation_sync(self, conv_id: str, title: str, messages: list):
+        """Update desktop chat view when active conversation changes remotely."""
+        self.pill.load_conversation_messages(conv_id, title, messages)
+        self.pill.set_status("idle", f"Conversation: {title}")
 
     @pyqtSlot()
     def clear_chat_history(self):
@@ -312,14 +320,9 @@ class UIController(QObject):
         if self._agent_loop is None:
             return
         if getattr(self._agent_loop, "active_conversation_id", None) == conv_id:
-            active_id = self._agent_loop.active_conversation_id
-            if active_id and self._agent_loop.conversation_store:
-                conv = self._agent_loop.conversation_store.get_conversation(active_id)
-                title = conv.get("title", "New Chat") if conv else "New Chat"
-                msgs = self._agent_loop.conversation_store.get_messages(active_id)
-                self.pill.load_conversation_messages(active_id, title, msgs)
-            else:
-                self.pill.load_conversation_messages("", "New Chat", [])
+            new_id = self._agent_loop.start_new_conversation(title="New Chat")
+            self.pill.load_conversation_messages(new_id, "New Chat", [])
+            self.pill.set_status("idle", "Conversation deleted")
 
     @pyqtSlot(dict)
     def on_settings_applied(self, new_config: dict):
@@ -534,6 +537,26 @@ class UIController(QObject):
             "on_conversation_title_changed",
             lambda t: self.pill.signal_set_conversation_title.emit(t),
         )
+
+        # Remote conversation change synchronization (e.g. switched from Mobile Gateway)
+        def _on_remote_conv_changed(cid, title):
+            msgs = []
+            if getattr(agent_loop, "conversation_store", None) and cid:
+                try:
+                    msgs = agent_loop.conversation_store.get_messages(cid)
+                except Exception:
+                    pass
+            self.signal_sync_conversation.emit(cid or "", title or "New Chat", msgs)
+
+        agent_loop.register_callback("on_conversation_changed", _on_remote_conv_changed)
+
+        # Remote task start synchronization (e.g. prompt sent from mobile gateway)
+        def _on_remote_task_start(goal: str):
+            if not self.is_task_running() or self._active_task_prompt != goal:
+                self.signal_chat_user_message.emit(goal)
+                self.pill.signal_set_status.emit("thinking", f"Task: {goal}")
+
+        agent_loop.register_callback("on_task_start", _on_remote_task_start)
 
         # Restore persistent conversation into chat UI on startup
         if getattr(agent_loop, "conversation_store", None) and getattr(agent_loop, "active_conversation_id", None):

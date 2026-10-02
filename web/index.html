@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>EidosBot Gateway</title>
+
+    <!-- PWA & Mobile Meta Tags -->
+    <meta name="theme-color" content="#bd93f9" />
+    <meta name="description" content="EidosBot Autonomous OS Agent Mobile Companion" />
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- iOS Safari Standalone Support -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="EidosBot" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="/icons/favicon.png" />
+  </head>
+  <body class="bg-[#1e1f29] text-[#f8f8f2] min-h-screen selection:bg-[#bd93f9] selection:text-[#1e1f29] antialiased">
+    <div id="root">
+      <noscript>
+        <div style="padding: 20px; font-family: sans-serif; color: #f8f8f2; background: #1e1f29;">
+          <h1>🤖 EidosBot Gateway</h1>
+          <p>Please enable JavaScript to run the EidosBot PWA.</p>
+        </div>
+      </noscript>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

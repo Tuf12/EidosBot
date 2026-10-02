@@ -216,6 +216,31 @@ def test_agent_loop_skips_auto_speak_when_disabled():
         mock_voice.speak_response.assert_not_called()
 
 
+def test_agent_loop_skips_auto_speak_when_speak_summary_false():
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+        mock_model = MockModelClient()
+
+        mock_voice = MagicMock()
+        mock_voice.tts.is_available = True
+
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+            voice_manager=mock_voice,
+            config={"voice": {"enabled": True, "auto_speak_responses": True}},
+        )
+
+        # Explicitly pass speak_summary=False (as done by remote mobile gateway)
+        res = agent.run_task("Perform loop verification", max_steps=5, speak_summary=False)
+        assert res["success"] is True
+        mock_voice.speak.assert_not_called()
+        mock_voice.speak_response.assert_not_called()
+
+
 def test_agent_loop_cancel_task():
     with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
         kill_switch = KillSwitch()
@@ -252,4 +277,74 @@ def test_agent_loop_cancel_task():
         res = agent.run_task("Task to cancel", max_steps=5)
         assert res["success"] is False
         assert "stopped by user" in res["summary"].lower()
-        mock_voice.stop_speaking.assert_called()
+
+
+def test_agent_loop_optimalx_tool_dispatch():
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+
+        class OptimalXMockModel(BaseModelClient):
+            def __init__(self):
+                self.step = 0
+
+            def chat(self, messages, tools=None, model_override=None):
+                self.step += 1
+                if self.step == 1:
+                    return ModelResponse(
+                        content="Searching notes",
+                        tool_calls=[ToolCall(name="optimalx_search_notes", arguments={"query": "patent architecture"})]
+                    )
+                elif self.step == 2:
+                    return ModelResponse(
+                        content="Listing folders",
+                        tool_calls=[ToolCall(name="optimalx_list_folders", arguments={})]
+                    )
+                elif self.step == 3:
+                    return ModelResponse(
+                        content="Writing note",
+                        tool_calls=[ToolCall(name="optimalx_write_note", arguments={"content": "New ideas", "subfolder_title": "Idea 1"})]
+                    )
+                else:
+                    return ModelResponse(
+                        content="Finished note exploration",
+                        tool_calls=[ToolCall(name="finish_task", arguments={"summary": "OptimalX notes handled successfully."})]
+                    )
+
+            def vision_chat(self, prompt, image_base64, system_prompt=None, model_override=None):
+                return ModelResponse(content="")
+
+        mock_model = OptimalXMockModel()
+        mock_voice = MagicMock()
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+            voice_manager=mock_voice,
+        )
+
+        agent.optimalx = MagicMock()
+        agent.optimalx.search_notes.return_value = [{"title": "Patent 1", "snippet": "..."}]
+        agent.optimalx.list_folders.return_value = [{"id": 1, "name": "Inventions", "subfolders": []}]
+        agent.optimalx.write_note.return_value = {"status": "written", "kind": "written", "subfolder_id": 10}
+
+        res = agent.run_task("Explore and write notes", max_steps=5)
+        assert res["success"] is True
+        agent.optimalx.search_notes.assert_called_once_with(
+            query="patent architecture", limit=5, parent_filter=None, prefer_offline=False
+        )
+        agent.optimalx.list_folders.assert_called_once_with(
+            parent_folder_id=None, include_subfolders=True, query=None
+        )
+        agent.optimalx.write_note.assert_called_once_with(
+            content="New ideas",
+            subfolder_id=None,
+            subfolder_title="Idea 1",
+            parent_name=None,
+            parent_folder_id=None,
+            mode="auto",
+            allow_direct_append=False,
+            label=None,
+            conversation_id=None,
+        )

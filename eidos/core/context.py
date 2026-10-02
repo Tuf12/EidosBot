@@ -609,6 +609,34 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_batch_job",
+            "description": "Start continuous autonomous execution of a batch job queue (processes all pending items sequentially with pacing cool-downs). Can run in background or foreground.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or queue.json path. If omitted, runs the active batch job."
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Whether to run as a background worker thread (true, default) or block in foreground (false)."
+                    },
+                    "pause_between_items_sec": {
+                        "type": "number",
+                        "description": "Cool-down interval between items in seconds (default: 2.0s)."
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "description": "Optional limit on number of items to process in this run before stopping."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "step_batch_job",
             "description": "Execute the next pending item in a batch job queue with fresh item context.",
             "parameters": {
@@ -667,6 +695,241 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
                         "description": "Optional job ID or queue directory."
                     }
                 }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_batch_summary",
+            "description": "Generate or re-compile the ranked leaderboard summary (RANKING_SUMMARY.md, .csv, .json) for an evaluated batch job queue.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "Optional job ID or queue directory. If omitted, summarizes the active batch job."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_search_notes",
+            "description": "Search personal notes and knowledge bases across OptimalX (synced from mobile and desktop). Uses semantic vector search when online, falling back to SQLite text search.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language search query or keywords."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of note matches to return (default: 5)."
+                    },
+                    "parent_folder": {
+                        "type": "string",
+                        "description": "Optional: Filter results to a specific parent folder name."
+                    },
+                    "prefer_offline": {
+                        "type": "boolean",
+                        "description": "Optional: Force direct SQLite search bypassing online LLM server (default: false)."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_read_note",
+            "description": "Read the full markdown content and metadata of a specific OptimalX note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subfolder_id": {
+                        "type": "integer",
+                        "description": "Subfolder ID containing the note."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional: Subfolder or note title if ID is unknown."
+                    },
+                    "note_id": {
+                        "type": "integer",
+                        "description": "Optional: Direct note table ID."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_list_folders",
+            "description": "List hierarchical parent folders and contained subfolders in OptimalX to explore personal knowledge organization. Pass 'query' or 'parent_folder_id' to filter specifically (e.g. 'Inventions') and avoid dumping the entire knowledge tree.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search term to filter parent folders or subfolders by name (e.g. 'Inventions', 'the list'). Highly recommended to keep context small."
+                    },
+                    "parent_folder_id": {
+                        "type": "integer",
+                        "description": "Optional: Specific parent folder ID to list subfolders for."
+                    },
+                    "include_subfolders": {
+                        "type": "boolean",
+                        "description": "Whether to include subfolder arrays within each parent folder (default: true)."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_write_note",
+            "description": "Write, append, or propose modifications to an OptimalX note with Diff Review safety. Empty notes write immediately; existing non-empty notes queue for human-in-the-loop Diff Review in the OptimalX desktop app.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Markdown content to write, append, or propose."
+                    },
+                    "subfolder_id": {
+                        "type": "integer",
+                        "description": "Optional: ID of the target subfolder/note if known."
+                    },
+                    "subfolder_title": {
+                        "type": "string",
+                        "description": "Title of the note or subfolder (used if subfolder_id is not provided)."
+                    },
+                    "parent_name": {
+                        "type": "string",
+                        "description": "Optional parent folder name (e.g. 'Inventions', 'Personal', 'Work'). Auto-created if not found."
+                    },
+                    "parent_folder_id": {
+                        "type": "integer",
+                        "description": "Optional: Parent folder ID."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["auto", "direct_overwrite", "append", "propose_edit"],
+                        "description": "Write mode: 'auto' (direct write if empty, queue if existing), 'direct_overwrite', 'append', or 'propose_edit' (default: 'auto')."
+                    },
+                    "allow_direct_append": {
+                        "type": "boolean",
+                        "description": "If true with mode='append', bypasses Diff Review to append directly (default: false)."
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional checkpoint description or version note."
+                    }
+                },
+                "required": ["content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_read_notex_doc",
+            "description": "Read a long-form markdown document from an OptimalX NoteX corpus project with optional line range slicing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subfolder_id": {
+                        "type": "integer",
+                        "description": "Subfolder ID of the NoteX project."
+                    },
+                    "doc_path": {
+                        "type": "string",
+                        "description": "Relative document path within the NoteX project (e.g. 'Canon.md', 'Outline.md', 'Sections/Chapter 1.md')."
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional: 1-indexed starting line number for sliced reading."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional: 1-indexed ending line number for sliced reading."
+                    }
+                },
+                "required": ["subfolder_id", "doc_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_list_notex_docs",
+            "description": "List all markdown documents, chapters, and sections available in an OptimalX NoteX corpus project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subfolder_id": {
+                        "type": "integer",
+                        "description": "Subfolder ID of the NoteX project."
+                    }
+                },
+                "required": ["subfolder_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_list_pending_reviews",
+            "description": "List pending Diff Review items in OptimalX awaiting human approval or review.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subfolder_id": {
+                        "type": "integer",
+                        "description": "Optional subfolder ID to filter pending items."
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_accept_pending_review",
+            "description": "Accept a pending Diff Review item and commit its changes directly to the OptimalX note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "ID of the pending review item to accept."
+                    }
+                },
+                "required": ["item_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "optimalx_reject_pending_review",
+            "description": "Reject a pending Diff Review item in OptimalX without modifying the note on disk.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "item_id": {
+                        "type": "integer",
+                        "description": "ID of the pending review item to reject."
+                    }
+                },
+                "required": ["item_id"]
             }
         }
     },
@@ -737,7 +1000,7 @@ BEHAVIORAL PRINCIPLES:
 8. EPISODIC LEARNING: If `<episodic_context>` is provided above, leverage proven tool patterns and heed cautionary pitfalls from past sessions before taking high-risk or multi-step actions.
 9. CONSCIOUS ACTIVE RECALL: If you are uncertain about a command, flag, tool pattern, or past solution during your thought process, you can emit `<recall>search keywords</recall>`. The system will intercept your query in mid-thought, search your episodic memory, and inject `<recalled_memory>...</recalled_memory>` so you can continue your reasoning with verified experience.
 10. DETERMINISTIC WEB AUTOMATION: For research, online forms, dynamic SPAs, and patent searches, prefer the headless browser tools (`browser_open`, `browser_extract`, `browser_click`, `browser_type`, `browser_screenshot`, `browser_close`). They interact directly with the DOM and extract clean Markdown via trafilatura, without needing fragile screen coordinates.
-11. SKILLS & BATCH QUEUES: For domain procedures, standardized rubrics, or repetitive multi-item projects (e.g. 300+ items), consult skills using `list_skills` and `load_skill`. Use `init_batch_job`, `step_batch_job`, and `get_job_status` to maintain durable progress via `queue.json` while running each item in an isolated context window.
+11. SKILLS & BATCH QUEUES: For domain procedures, standardized rubrics, or repetitive multi-item projects (e.g. 300+ items), consult skills using `list_skills` and `load_skill`. Use `init_batch_job`, `run_batch_job`, `step_batch_job`, `get_job_status`, and `generate_batch_summary` to maintain durable progress via `queue.json` while running each item in an isolated context window.
 12. WORKSPACE DIRECTORY & FILE STORAGE:
 - Store all user documents, downloaded PDFs, patents, research notes, datasets, and generated files in your Workspace directory: `{ws_dir}` (use `{downloads_dir}` for downloads and `{documents_dir}` for notes/docs).
 - NEVER store downloads, documents, or temporary task files inside the `{current_dir}` repository codebase directory.
@@ -746,4 +1009,12 @@ BEHAVIORAL PRINCIPLES:
 14. DOWNLOADING & DESKTOP BROWSING:
 - To download files from the internet (patents, PDFs, datasets, images), use the dedicated `download_file` tool.
 - If the user asks to "pull it up on my PC", "show me the patent", or "open this in my browser", use `open_in_browser` to launch the URL or local file directly on their desktop.
+15. OPTIMALX KNOWLEDGE ECOSYSTEM:
+- You have direct, bi-directional access to the user's personal notes, ideas, and knowledge base synchronized across OptimalX Mobile (Android) and OptimalX Desktop via `optimalx_search_notes`, `optimalx_read_note`, `optimalx_list_folders`, `optimalx_write_note`, `optimalx_read_notex_doc`, and `optimalx_list_notex_docs`.
+- When the user asks about their notes, projects, ideas, or personal plans, search and consult OptimalX first before assuming or creating duplicate external files.
+- Notes with `ai_locked=1` or `ai_blind=1` are protected; do not attempt to bypass privacy flags.
+- Writing to a brand new or empty note auto-applies directly with version checkpoints; writing or proposing edits to existing notes queues a diff proposal into OptimalX Diff Review for the user to review and approve in the desktop UI.
+16. DATA EXTRACTION & FILE CONVERSION (CSV/JSON):
+- When asked to extract large lists, notes, or datasets (e.g., extracting 50 to 300+ items from an OptimalX note or document into CSV or JSON), do NOT try to output hundreds of formatted rows through conversational chat text, which risks hitting output token limits or timing out.
+- Instead, read the note or file metadata, and use `execute_shell` to run a concise Python script or command that parses the items and saves them directly to `{documents_dir}/<filename>.csv`.
 """

@@ -1,5 +1,7 @@
 """Telegram Gateway companion & remote human-in-the-loop approvals for EidosBot."""
 
+from __future__ import annotations
+
 import asyncio
 from datetime import datetime
 import logging
@@ -29,6 +31,7 @@ except ImportError:
     InlineKeyboardButton = None
     InlineKeyboardMarkup = None
     Update = None
+    ContextTypes = None
     CommandHandler = None
     CallbackQueryHandler = None
     MessageHandler = None
@@ -179,6 +182,8 @@ class TelegramGateway:
                 self.app.add_handler(CommandHandler("help", self._handle_help))
                 self.app.add_handler(CommandHandler("status", self._handle_status))
                 self.app.add_handler(CommandHandler("jobs", self._handle_jobs))
+                self.app.add_handler(CommandHandler("run", self._handle_run))
+                self.app.add_handler(CommandHandler("summary", self._handle_summary))
                 self.app.add_handler(CommandHandler("pause", self._handle_pause))
                 self.app.add_handler(CommandHandler("resume", self._handle_resume))
                 self.app.add_handler(CommandHandler("kill", self._handle_kill))
@@ -319,6 +324,8 @@ class TelegramGateway:
             "*Commands:*\n"
             "• `/status` - Desktop status, active window & clock\n"
             "• `/jobs` - Batch queue progress & active items\n"
+            "• `/run` - Start/resume active batch job in background\n"
+            "• `/summary` - Generate/view leaderboard rankings summary\n"
             "• `/pause` - Pause active batch job\n"
             "• `/resume` - Resume paused batch job\n"
             "• `/kill` - Emergency stop active tasks\n"
@@ -386,6 +393,7 @@ class TelegramGateway:
         if st.get("active_item"):
             active_item_text = f"Item `{st['active_item'].get('id')}`"
 
+        worker_text = "🟢 Running in background" if st.get("is_running_in_background") else "⏸️ Idle / Stopped"
         pct = st.get("progress_percent", 0.0)
         jobs_text = (
             f"📋 *Batch Job Queue:* `{st.get('job_name')}`\n"
@@ -393,11 +401,68 @@ class TelegramGateway:
             f"• *Job ID:* `{st.get('job_id')}`\n"
             f"• *Skill:* `{st.get('skill_name')}`\n"
             f"• *Status:* `{st.get('status')}`\n"
+            f"• *Worker:* {worker_text}\n"
             f"• *Progress:* {st.get('completed_items')}/{st.get('total_items')} ({pct}%)\n"
             f"• *Pending:* {st.get('pending_items')} | *Failed:* {st.get('failed_items')}\n"
             f"• *Active Item:* {active_item_text}\n"
         )
         await update.message.reply_text(jobs_text, parse_mode="Markdown")
+
+    async def _handle_run(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._verify_update_auth(update):
+            return
+
+        if hasattr(self.agent_loop, "jobs") and self.agent_loop.jobs:
+            args = context.args or []
+            target = args[0] if args else None
+            res = self.agent_loop.jobs.run_in_background(job_id_or_path=target)
+            if res.get("success"):
+                await update.message.reply_text(
+                    f"🚀 *Started Background Batch Worker*\n"
+                    f"• *Job:* `{res.get('job_name', 'Job')}` (`{res.get('job_id')}`)\n"
+                    f"• *Progress:* {res.get('completed_items')}/{res.get('total_items')} ({res.get('progress_percent')}%)",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(f"⚠️ {res.get('error', 'Could not run batch job.')}")
+        else:
+            await update.message.reply_text("Batch Job Runner subsystem unavailable.")
+
+    async def _handle_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._verify_update_auth(update):
+            return
+
+        if hasattr(self.agent_loop, "jobs") and self.agent_loop.jobs:
+            args = context.args or []
+            target = args[0] if args else None
+            res = self.agent_loop.jobs.generate_summary(job_id_or_path=target)
+            if res.get("success"):
+                md_path = res.get("markdown_path", "")
+                total = res.get("total_items", 0)
+                comp = res.get("completed_items", 0)
+                avg = res.get("average_score", 0.0)
+                t1 = res.get("tier_1_count", 0)
+                t2 = res.get("tier_2_count", 0)
+                t3 = res.get("tier_3_count", 0)
+                needs_rev = res.get("needs_review_count", 0)
+
+                msg = (
+                    f"📊 *Batch Job Ranking Leaderboard*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• *Progress:* {comp}/{total} items evaluated\n"
+                    f"• *Average Score:* {avg}/100\n"
+                    f"• *🏆 Tier 1 (80–100):* {t1}\n"
+                    f"• *💡 Tier 2 (60–79):* {t2}\n"
+                    f"• *⚠️ Tier 3 (<60):* {t3}\n"
+                )
+                if needs_rev > 0:
+                    msg += f"• *⚠️ Needs Review:* {needs_rev}\n"
+                msg += f"\n📁 *Report:* `{md_path}`"
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(f"⚠️ {res.get('error', 'Could not generate ranking summary.')}")
+        else:
+            await update.message.reply_text("Batch Job Runner subsystem unavailable.")
 
     async def _handle_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._verify_update_auth(update):

@@ -9,7 +9,7 @@ models:
     reasoning_model: "batiai/gemma4-26b:iq4"
     vision_model: "batiai/gemma4-12b:q6"
     chat_model: "gpt-oss:20b"
-    timeout_seconds: 60
+    timeout_seconds: 120
 
   cloud:
     provider: "chutes"
@@ -17,7 +17,7 @@ models:
     api_key: "YOUR_CHUTES_API_KEY_HERE"
     vision_model: "Qwen/Qwen3.5-397B-A17B-TEE"        # Flagship 397B GUI/vision MoE (17B active)
     reasoning_model: "moonshotai/Kimi-K2.6-TEE"       # 1T MoE agentic reasoning & planning
-    timeout_seconds: 90
+    timeout_seconds: 180
 
 safety:
   kill_switch_hotkey: "<ctrl>+<alt>+<esc>"

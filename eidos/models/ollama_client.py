@@ -21,7 +21,7 @@ class OllamaClient(BaseModelClient):
         reasoning_model: str = "batiai/gemma4-26b:iq4",
         vision_model: str = "batiai/gemma4-12b:q6",
         chat_model: str = "gpt-oss:20b",
-        timeout: float = 60.0,
+        timeout: float = 120.0,
         recall_interceptor: Optional[Any] = None,
     ):
         self.base_url = base_url.rstrip("/")

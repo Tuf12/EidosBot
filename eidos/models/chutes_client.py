@@ -26,7 +26,7 @@ class ChutesClient(BaseModelClient):
         base_url: str = "https://llm.chutes.ai/v1",
         vision_model: str = "Qwen/Qwen3.5-397B-A17B-TEE",
         reasoning_model: str = "moonshotai/Kimi-K2.6-TEE",
-        timeout: float = 90.0,
+        timeout: float = 180.0,
         stream: bool = True,
         recall_interceptor: Optional[Any] = None,
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
@@ -138,10 +138,15 @@ class ChutesClient(BaseModelClient):
                 return self._parse_openai_response(data, model_name)
         except Exception as e:
             logger.error("Chutes chat error with model %s: %s", model_name, e)
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 429 or "429" in str(e):
+                err_text = f"Error communicating with Chutes AI: 429 Client Error (Rate limit or concurrency quota exceeded on Chutes AI). Please wait a moment or switch provider preference to 'local' in Settings."
+            else:
+                err_text = f"Error communicating with Chutes AI: {str(e)}"
             return ModelResponse(
-                content=f"Error communicating with Chutes AI: {str(e)}",
+                content=err_text,
                 model=model_name,
-                raw={"error": str(e)}
+                raw={"error": str(e), "status_code": status_code}
             )
 
     def _stream_openai_chat(

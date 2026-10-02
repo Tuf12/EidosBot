@@ -180,6 +180,58 @@ class TestTelegramGatewayUnit(unittest.IsolatedAsyncioTestCase):
         await self.gw._handle_resume(update, MagicMock())
         mock_jobs.resume.assert_called_once()
 
+    async def test_handle_run_in_background(self):
+        mock_jobs = MagicMock()
+        mock_jobs.run_in_background.return_value = {
+            "success": True,
+            "job_id": "job_123",
+            "job_name": "Inventions",
+            "completed_items": 5,
+            "total_items": 20,
+            "progress_percent": 25.0,
+        }
+        self.mock_agent.jobs = mock_jobs
+
+        update = MagicMock()
+        update.effective_user.id = 10001
+        update.message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.args = ["job_123"]
+        await self.gw._handle_run(update, ctx)
+        mock_jobs.run_in_background.assert_called_once_with(job_id_or_path="job_123")
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Started Background Batch Worker", sent_text)
+        self.assertIn("job_123", sent_text)
+
+    async def test_handle_summary(self):
+        mock_jobs = MagicMock()
+        mock_jobs.generate_summary.return_value = {
+            "success": True,
+            "markdown_path": "/path/to/RANKING_SUMMARY.md",
+            "total_items": 10,
+            "completed_items": 10,
+            "average_score": 75.5,
+            "tier_1_count": 3,
+            "tier_2_count": 5,
+            "tier_3_count": 2,
+            "needs_review_count": 0,
+        }
+        self.mock_agent.jobs = mock_jobs
+
+        update = MagicMock()
+        update.effective_user.id = 10001
+        update.message.reply_text = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.args = ["job_123"]
+        await self.gw._handle_summary(update, ctx)
+        mock_jobs.generate_summary.assert_called_once_with(job_id_or_path="job_123")
+        sent_text = update.message.reply_text.call_args[0][0]
+        self.assertIn("Batch Job Ranking Leaderboard", sent_text)
+        self.assertIn("Tier 1", sent_text)
+        self.assertIn("75.5/100", sent_text)
+
     async def test_handle_kill(self):
         update = MagicMock()
         update.effective_user.id = 10001

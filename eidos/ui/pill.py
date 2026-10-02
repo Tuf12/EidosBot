@@ -187,18 +187,6 @@ class StatusPill(QWidget):
         self.details_label.setStyleSheet("color: #f8f8f2; font-size: 12px;")
         top_bar.addWidget(self.details_label, stretch=1)
 
-        # Clear Chat Button (visible in chat mode)
-        self.btn_clear = QPushButton("🗑️")
-        self.btn_clear.setToolTip("Clear conversation history")
-        self.btn_clear.setStyleSheet(
-            "QPushButton { background-color: #282a36; border: 1px solid #44475a; "
-            "border-radius: 6px; padding: 4px 7px; font-size: 12px; } "
-            "QPushButton:hover { background-color: #ff5555; }"
-        )
-        self.btn_clear.clicked.connect(self.clear_chat)
-        self.btn_clear.setVisible(False)
-        top_bar.addWidget(self.btn_clear)
-
         # Chat Toggle Button
         self.btn_expand = QPushButton("💬")
         self.btn_expand.setToolTip("Chat / History (Ctrl+E)")
@@ -457,7 +445,6 @@ class StatusPill(QWidget):
         # Atomic layout transition: freeze visual updates during layout changes
         self.setUpdatesEnabled(False)
         try:
-            self.btn_clear.setVisible(True)
             self.btn_collapse.setVisible(True)
             self.details_label.setVisible(False)
             self.chat_container.setVisible(True)
@@ -492,7 +479,6 @@ class StatusPill(QWidget):
         # Atomic layout transition: freeze visual updates during layout changes
         self.setUpdatesEnabled(False)
         try:
-            self.btn_clear.setVisible(False)
             self.btn_collapse.setVisible(False)
             self.details_label.setVisible(True)
             self.chat_container.setVisible(False)
@@ -745,7 +731,6 @@ class StatusPill(QWidget):
 
         action_new = menu.addAction("➕  New Chat")
         action_past = menu.addAction("📜  Past Conversations...")
-        action_clear = menu.addAction("🗑️  Clear Current Chat")
         menu.addSeparator()
         action_workspace = menu.addAction("📂  Open Workspace (~/EidosWorkspace)...")
         action_skills = menu.addAction("🧠  Open Skills Directory (~/.eidos/skills)...")
@@ -767,8 +752,6 @@ class StatusPill(QWidget):
             self.signal_new_chat.emit()
         elif action == action_past:
             self.signal_open_conversations.emit()
-        elif action == action_clear:
-            self.clear_chat()
         elif action == action_workspace:
             self.signal_open_workspace.emit()
         elif action == action_skills:
