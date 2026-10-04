@@ -134,6 +134,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <textarea id="task-prompt" rows="2" placeholder="Send prompt to EidosBot..."></textarea>
     <div class="controls">
       <button class="btn btn-green" onclick="sendPrompt()">▶ Execute Task</button>
+      <button class="btn btn-red" onclick="stopActiveTask()">⏹ Stop Task</button>
       <button class="btn btn-outline" onclick="speakAloud()">🔊 Speak Aloud</button>
     </div>
   </div>
@@ -277,6 +278,15 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         addLog(`Vocalized: "${msg}"`);
       } catch (e) {
         alert("Failed to speak: " + e);
+      }
+    }
+
+    async function stopActiveTask() {
+      try {
+        await fetch('/api/stop', { method: 'POST', headers: authHeaders() });
+        addLog("Stopped active task.");
+      } catch (e) {
+        alert("Failed to stop task: " + e);
       }
     }
 
@@ -780,6 +790,14 @@ class RemoteGatewayServer:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+    async def _handle_stop(self, request: web.Request) -> web.Response:
+        """Stop active task and voice speech gracefully."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        self.stop_task()
+        return web.json_response({"ok": True, "message": "Task stopped"})
+
     async def _handle_kill(self, request: web.Request) -> web.Response:
         """Trigger emergency stop."""
         if not self._verify_auth(request):
@@ -795,6 +813,23 @@ class RemoteGatewayServer:
 
         self.reset_kill()
         return web.json_response({"ok": True, "message": "Kill switch reset"})
+
+    async def _handle_open_link(self, request: web.Request) -> web.Response:
+        """Open a URL or local file path on the host desktop."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        try:
+            data = await request.json()
+            target = str(data.get("target") or data.get("url") or data.get("path") or "").strip()
+            if not target:
+                return web.json_response({"ok": False, "error": "Missing target"}, status=400)
+
+            from eidos.ui.chat import open_chat_link
+            opened = open_chat_link(target)
+            return web.json_response({"ok": opened, "target": target})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     async def _handle_speak(self, request: web.Request) -> web.Response:
         """Vocalize message through Kokoro TTS."""
@@ -1050,32 +1085,102 @@ class RemoteGatewayServer:
 
                 summary = res.get("summary", "Done") if isinstance(res, dict) else str(res)
                 success = res.get("success", True) if isinstance(res, dict) else True
-                self.current_state = "idle"
-                self.broadcast_event("status_change", {"state": "idle", "details": summary})
+
+                is_killed = False
+                if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
+                    is_killed = self.agent_loop.kill_switch.is_triggered()
+
+                if is_killed or self.current_state == "killed":
+                    self.current_state = "killed"
+                    self.broadcast_event("status_change", {"state": "killed", "details": summary, "killed": True})
+                else:
+                    self.current_state = "idle"
+                    self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
+
                 self.broadcast_event("log", {"message": f"Task completed: {summary}"})
                 self.broadcast_event("task_finished", {"summary": summary, "success": success})
             except Exception as e:
-                self.current_state = "error"
-                self.broadcast_event("status_change", {"state": "error", "details": str(e)})
+                is_killed = False
+                if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
+                    is_killed = self.agent_loop.kill_switch.is_triggered()
+
+                if is_killed or self.current_state == "killed":
+                    self.current_state = "killed"
+                    self.broadcast_event("status_change", {"state": "killed", "details": str(e), "killed": True})
+                else:
+                    self.current_state = "error"
+                    self.broadcast_event("status_change", {"state": "error", "details": str(e), "killed": False})
+
                 self.broadcast_event("log", {"message": f"Task error: {e}"})
                 self.broadcast_event("task_finished", {"summary": str(e), "success": False})
 
         threading.Thread(target=_run, daemon=True, name="GatewayTaskWorker").start()
 
+    def stop_task(self):
+        """Stop active task, TTS speech, and unblock confirmations without engaging the emergency kill switch."""
+        if hasattr(self.agent_loop, "cancel_task") and callable(self.agent_loop.cancel_task):
+            try:
+                self.agent_loop.cancel_task()
+            except Exception as e:
+                logger.error("Error in agent_loop.cancel_task: %s", e)
+        if hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
+            try:
+                self.agent_loop.voice.stop_speaking()
+            except Exception:
+                pass
+        # Unblock any pending confirmations as denied
+        with self._confirm_lock:
+            for cid, record in list(self._pending_confirmations.items()):
+                record["approved"] = False
+                record["allowlist"] = False
+                record["event"].set()
+
+        is_killed = False
+        if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
+            is_killed = self.agent_loop.kill_switch.is_triggered()
+
+        if is_killed:
+            self.current_state = "killed"
+            self.broadcast_event("status_change", {"state": "killed", "details": "Task stopped (Kill switch active)", "killed": True})
+        else:
+            self.current_state = "idle"
+            self.broadcast_event("status_change", {"state": "idle", "details": "Task stopped by user", "killed": False})
+
+        self.broadcast_event("task_finished", {"summary": "Task stopped by user.", "success": False})
+        self.broadcast_event("log", {"message": "Active task stopped by user."})
+
     def trigger_kill(self):
-        """Trigger emergency stop."""
-        if hasattr(self.agent_loop, "kill_switch"):
+        """Trigger emergency stop: trip kill switch, halt active loop task, and silence voice."""
+        if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
             self.agent_loop.kill_switch.trigger()
+        if hasattr(self.agent_loop, "cancel_task") and callable(self.agent_loop.cancel_task):
+            try:
+                self.agent_loop.cancel_task()
+            except Exception as e:
+                logger.error("Error cancelling task on kill: %s", e)
+        if hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
+            try:
+                self.agent_loop.voice.stop_speaking()
+            except Exception:
+                pass
+        # Unblock any pending confirmations as denied
+        with self._confirm_lock:
+            for cid, record in list(self._pending_confirmations.items()):
+                record["approved"] = False
+                record["allowlist"] = False
+                record["event"].set()
+
         self.current_state = "killed"
-        self.broadcast_event("status_change", {"state": "killed", "details": "Emergency stop tripped remotely!"})
+        self.broadcast_event("status_change", {"state": "killed", "details": "Emergency stop tripped remotely!", "killed": True})
+        self.broadcast_event("task_finished", {"summary": "Emergency stop tripped remotely!", "success": False})
         self.broadcast_event("log", {"message": "EMERGENCY KILL SWITCH TRIPPED!"})
 
     def reset_kill(self):
         """Reset emergency stop."""
-        if hasattr(self.agent_loop, "kill_switch"):
+        if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
             self.agent_loop.kill_switch.reset()
         self.current_state = "idle"
-        self.broadcast_event("status_change", {"state": "idle", "details": "Emergency stop reset"})
+        self.broadcast_event("status_change", {"state": "idle", "details": "Emergency stop reset", "killed": False})
         self.broadcast_event("log", {"message": "Emergency stop reset."})
 
     def speak_message(self, message: str, voice: Optional[str] = None) -> bool:
@@ -1230,10 +1335,17 @@ class RemoteGatewayServer:
                             speak_host = bool(data.get("speak_on_host", False))
                             if prompt:
                                 self.dispatch_task(prompt, speak_on_host=speak_host)
+                        elif msg_type in ("stop", "cancel", "stop_task"):
+                            self.stop_task()
                         elif msg_type == "kill":
                             self.trigger_kill()
                         elif msg_type == "reset":
                             self.reset_kill()
+                        elif msg_type == "open_link":
+                            target = str(data.get("target") or data.get("url") or data.get("path") or "").strip()
+                            if target:
+                                from eidos.ui.chat import open_chat_link
+                                open_chat_link(target)
                         elif msg_type == "resolve_confirmation":
                             cid = str(data.get("id", ""))
                             approved = bool(data.get("approved", False))
@@ -1496,8 +1608,11 @@ class RemoteGatewayServer:
             self._app.router.add_get("/api/screenshot", self._handle_screenshot)
             self._app.router.add_post("/api/click", self._handle_click)
             self._app.router.add_post("/api/prompt", self._handle_prompt)
+            self._app.router.add_post("/api/stop", self._handle_stop)
+            self._app.router.add_post("/api/cancel", self._handle_stop)
             self._app.router.add_post("/api/kill", self._handle_kill)
             self._app.router.add_post("/api/reset", self._handle_reset)
+            self._app.router.add_post("/api/open_link", self._handle_open_link)
             self._app.router.add_post("/api/speak", self._handle_speak)
             self._app.router.add_get("/api/tts", self._handle_tts)
             self._app.router.add_post("/api/tts", self._handle_tts)

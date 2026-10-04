@@ -136,6 +136,14 @@ class TestRemoteGateway(unittest.TestCase):
                     self.assertTrue(data.get("ok"))
                     self.mock_agent.kill_switch.reset.assert_called()
 
+                # Trigger stop
+                self.mock_agent.cancel_task = MagicMock()
+                async with session.post(f"http://127.0.0.1:{self.port}/api/stop", headers=headers) as resp:
+                    self.assertEqual(resp.status, 200)
+                    data = await resp.json()
+                    self.assertTrue(data.get("ok"))
+                    self.mock_agent.cancel_task.assert_called()
+
         asyncio.run(_test())
 
     def test_prompt_endpoint(self):

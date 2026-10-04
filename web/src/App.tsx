@@ -31,6 +31,7 @@ export function App() {
     startNewChat,
     switchConversation,
     sendPrompt,
+    stopTask,
     triggerKill,
     resetKill,
     resolveConfirmation,
@@ -46,6 +47,16 @@ export function App() {
     playText,
     stopAudio,
   } = useAudioPlayback({ token });
+
+  const handleKill = () => {
+    stopAudio();
+    triggerKill();
+  };
+
+  const handleStopCallOrTask = () => {
+    stopAudio();
+    stopTask();
+  };
 
   const lastSpokenMsgIdRef = useRef<string | null>(
     localStorage.getItem('eidos_last_spoken_msg_id')
@@ -101,13 +112,14 @@ export function App() {
         token={token}
         conversationTitle={conversationTitle}
         isSyncing={isSyncing}
+        isThinking={isThinking}
+        isPlaying={isPlaying}
+        onStopCallOrTask={handleStopCallOrTask}
         onRefreshSync={refreshSync}
         onNewChat={() => startNewChat('New Chat')}
         onOpenConversations={() => setShowConversationsModal(true)}
-        autoSpeak={autoSpeak}
-        onToggleAutoSpeak={toggleAutoSpeak}
         onSetToken={setToken}
-        onKill={triggerKill}
+        onKill={handleKill}
         onReset={resetKill}
       />
 
@@ -126,6 +138,7 @@ export function App() {
             onToggleAutoSpeak={toggleAutoSpeak}
             onPlayAudio={playText}
             onStopAudio={stopAudio}
+            onStopTask={handleStopCallOrTask}
             playbackError={playbackError}
             conversationTitle={conversationTitle}
             onNewChat={() => startNewChat('New Chat')}
@@ -207,7 +220,7 @@ export function App() {
       <SafetyModal
         confirmations={confirmations}
         onResolve={resolveConfirmation}
-        onKill={triggerKill}
+        onKill={handleKill}
       />
 
       {/* Past Conversations Modal */}

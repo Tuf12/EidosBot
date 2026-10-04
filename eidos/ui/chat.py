@@ -3,11 +3,17 @@
 from datetime import datetime
 import html
 import logging
+import os
+from pathlib import Path
 import re
-from typing import Any, Dict, Optional
+import subprocess
+import sys
+from typing import Any, Dict, List, Optional
+import urllib.parse
+import webbrowser
 
-from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QFont
+from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -26,6 +32,178 @@ from PyQt6.QtWidgets import (
 from eidos.ui.styles import GLOBAL_TOOLTIP_STYLE
 
 logger = logging.getLogger(__name__)
+
+
+def _launch_external_url(url: str) -> bool:
+    """Open external HTTP/HTTPS URL in default desktop browser."""
+    logger.info("Opening external chat link: %s", url)
+    # Prefer direct xdg-open on Linux to avoid Qt 6 D-Bus host portal application ID registration issues
+    if sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(
+                ["xdg-open", url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("xdg-open external URL failed: %s", exc)
+
+    try:
+        if webbrowser.open(url):
+            return True
+    except Exception as exc:
+        logger.debug("webbrowser.open failed: %s", exc)
+
+    try:
+        return bool(QDesktopServices.openUrl(QUrl(url)))
+    except Exception as exc:
+        logger.warning("QDesktopServices.openUrl failed: %s", exc)
+        return False
+
+
+def _launch_local_file(file_path: str) -> bool:
+    """Open local document or directory in default system handler or editor."""
+    logger.info("Opening local chat file: %s", file_path)
+    abs_path = os.path.abspath(file_path)
+
+    if sys.platform.startswith("linux"):
+        try:
+            subprocess.Popen(
+                ["xdg-open", abs_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception as exc:
+            logger.debug("xdg-open local file failed: %s", exc)
+    elif sys.platform == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", abs_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+        except Exception:
+            pass
+    elif sys.platform == "win32":
+        try:
+            os.startfile(abs_path)
+            return True
+        except Exception:
+            pass
+
+    try:
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(abs_path)))
+    except Exception as exc:
+        logger.warning("QDesktopServices.openUrl failed for local file: %s", exc)
+        return False
+
+
+def _resolve_local_file_path(target: str, workspace_dir: Optional[str] = None) -> Optional[str]:
+    """Resolve a relative or absolute file path to an actual file on disk."""
+    clean_target = (target or "").strip()
+    if not clean_target:
+        return None
+
+    # 1. Expand ~ and check if file exists directly
+    expanded = os.path.expanduser(clean_target)
+    if os.path.exists(expanded):
+        return os.path.abspath(expanded)
+
+    # 2. Check relative to current working directory
+    cand_cwd = os.path.abspath(expanded)
+    if os.path.exists(cand_cwd):
+        return cand_cwd
+
+    # 3. Determine workspace candidates
+    ws_candidates: List[str] = []
+    if workspace_dir:
+        ws_candidates.append(os.path.abspath(os.path.expanduser(workspace_dir)))
+    ws_candidates.append(os.path.abspath(os.path.expanduser("~/EidosWorkspace")))
+    ws_candidates.append(os.path.abspath(os.getcwd()))
+
+    clean_sub = clean_target.lstrip("/")
+    clean_path = Path(clean_sub)
+    file_name = clean_path.name
+
+    for ws in ws_candidates:
+        if not os.path.isdir(ws):
+            continue
+        ws_p = Path(ws)
+
+        # Direct subpath in workspace
+        cand = ws_p / clean_sub
+        if cand.exists():
+            return str(cand.resolve())
+
+        # Check in common subdirectories
+        for sub_dir in ("documents", "jobs", "downloads", "documents/analysis_phase_1"):
+            cand_sub = ws_p / sub_dir / clean_sub
+            if cand_sub.exists():
+                return str(cand_sub.resolve())
+
+        # Recursive search in workspace by relative path suffix or filename
+        if file_name:
+            try:
+                for match in ws_p.rglob(file_name):
+                    if str(match).endswith(clean_sub) and match.is_file():
+                        return str(match.resolve())
+            except Exception:
+                pass
+
+            try:
+                for match in ws_p.rglob(file_name):
+                    if match.is_file():
+                        return str(match.resolve())
+            except Exception:
+                pass
+
+    return None
+
+
+def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
+    """
+    Robust desktop opener for in-chat links.
+    Handles:
+    - Web URLs (http://, https://, www.)
+    - Local file paths (absolute /home/..., relative portfolios/item_114.md, ~)
+    - File URLs (file://...)
+    """
+    clean = (url or "").strip().strip("'\"")
+    if not clean:
+        return False
+
+    # External web URLs
+    if clean.startswith(("http://", "https://")):
+        return _launch_external_url(clean)
+    if clean.startswith("www."):
+        return _launch_external_url(f"https://{clean}")
+
+    # File URLs (e.g. file:///path/to/file)
+    if clean.startswith("file://"):
+        parsed = urllib.parse.urlparse(clean)
+        clean = urllib.parse.unquote(parsed.path)
+
+    # Resolve as local file
+    resolved = _resolve_local_file_path(clean, workspace_dir)
+    if resolved:
+        return _launch_local_file(resolved)
+
+    # Fallback: check if domain without protocol
+    if "." in clean and not clean.startswith("/") and not clean.endswith(
+        (".md", ".txt", ".json", ".csv", ".py", ".pdf", ".html", ".log", ".png", ".jpg")
+    ):
+        return _launch_external_url(f"https://{clean}")
+
+    # Missing local file: still attempt to open absolute path
+    logger.warning("Target file for chat link was not found on disk: %s", clean)
+    expanded = os.path.abspath(os.path.expanduser(clean))
+    return _launch_local_file(expanded)
 
 
 def markdown_to_chat_html(text: str) -> str:
@@ -90,17 +268,21 @@ def markdown_to_chat_html(text: str) -> str:
     text = re.sub(r"\*([^*]+)\*", r"<i>\1</i>", text)
 
     # 5. Markdown Links [label](url)
+    md_links = []
+
     def replace_md_link(match):
-        label = match.group(1)
-        url = match.group(2)
-        return (
+        label = match.group(1).strip()
+        url = match.group(2).strip().strip("'\"")
+        idx = len(md_links)
+        md_links.append(
             f"<a href='{url}' style='color: #8be9fd; text-decoration: underline; font-weight: bold;'>"
             f"{label}</a>"
         )
+        return f"___MD_LINK_{idx}___"
 
-    text = re.sub(r"\[([^\]]+)\]\(((?:https?://|file://)[^\s\)]+)\)", replace_md_link, text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_md_link, text)
 
-    # 6. Autolink raw URLs (not already inside href attribute)
+    # 6. Autolink raw URLs and known local file references (not inside tags or existing links)
     def replace_raw_url(match):
         url = match.group(1)
         trailing = match.group(2) or ""
@@ -109,8 +291,16 @@ def markdown_to_chat_html(text: str) -> str:
             f"{url}</a>{trailing}"
         )
 
+    # Autolink web and file protocol URLs
     text = re.sub(
-        r'(?<!href=[\'"])((?:https?://|file://)[^\s<"\'\)]+?)([\.,;]?(?=\s|$|<|\'|"))',
+        r'(?<![\w\'"])((?:https?://|file://)[^\s<"\'\)]+?)([\.,;]?(?=\s|$|<|\'|"))',
+        replace_raw_url,
+        text,
+    )
+
+    # Autolink local paths and generated portfolio references
+    text = re.sub(
+        r'(?<![\w\'"])((?:/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md))([\.,;]?(?=\s|$|<|\'|"))',
         replace_raw_url,
         text,
     )
@@ -170,7 +360,9 @@ def markdown_to_chat_html(text: str) -> str:
     if out.endswith("<br/>"):
         out = out[:-5]
 
-    # 8. Restore code blocks and inline codes
+    # 8. Restore links, code blocks, and inline codes
+    for i, l_html in enumerate(md_links):
+        out = out.replace(f"___MD_LINK_{i}___", l_html)
     for i, cb in enumerate(code_blocks):
         out = out.replace(f"___CODE_BLOCK_{i}___", cb)
     for i, ic in enumerate(inline_codes):
@@ -215,6 +407,7 @@ class MessageBubble(QFrame):
     signal_replay_tts_requested = pyqtSignal(str) # text to replay via TTS
     signal_delete_requested = pyqtSignal(object)  # bubble instance
     signal_copy_to_input = pyqtSignal(str)        # text to copy to prompt bar
+    signal_link_clicked = pyqtSignal(str)         # URL or file path clicked in chat
 
     def __init__(
         self,
@@ -372,7 +565,9 @@ class MessageBubble(QFrame):
             Qt.TextInteractionFlag.TextSelectableByMouse
             | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
-        self.content_label.setOpenExternalLinks(True)
+        self.content_label.setOpenExternalLinks(False)
+        self.content_label.linkActivated.connect(self._handle_link_clicked)
+        self.content_label.linkHovered.connect(self._handle_link_hovered)
 
         if self.role == "thought":
             self.content_label.setStyleSheet("color: #e0e0e0; font-size: 12px; font-style: italic;")
@@ -380,8 +575,9 @@ class MessageBubble(QFrame):
         elif self.role == "tool":
             self.content_label.setStyleSheet("color: #f8f8f2; font-family: monospace; font-size: 11px;")
             escaped = html.escape(self.raw_content, quote=False)
+            tool_pat = r'(?<![\w\'"])((?:https?://|file://|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md)[^\s<"\'\)]*?)([\.,;]?(?=\s|$|<|\'|"))'
             escaped_with_links = re.sub(
-                r'((?:https?://|file://)[^\s<"\'\)]+?)([\.,;]?(?=\s|$|<|\'|"))',
+                tool_pat,
                 r"<a href='\1' style='color: #50fa7b; text-decoration: underline;'>\1</a>\2",
                 escaped,
             )
@@ -459,14 +655,36 @@ class MessageBubble(QFrame):
         self.edit_container.setVisible(False)
         self.content_label.setVisible(True)
 
+    def _handle_link_clicked(self, url: str):
+        """Handle link activation by user click, emit signal, and open in default app/browser."""
+        logger.info("MessageBubble link clicked: %s", url)
+        self.signal_link_clicked.emit(url)
+        open_chat_link(url)
+
+    def _handle_link_hovered(self, url: str):
+        """Show destination URL/path as hover tooltip when hovering over links."""
+        if url:
+            self.content_label.setToolTip(f"Open: {url}")
+        else:
+            self.content_label.setToolTip("")
+
     def save_editing(self):
         """Save edited content, update label, and emit edit signal."""
         new_text = self.edit_text_area.toPlainText().strip()
         if not new_text:
             return
         self.raw_content = new_text
-        if self.role == "user":
+        if self.role in ("user", "assistant"):
             self.content_label.setText(markdown_to_chat_html(new_text))
+        elif self.role == "tool":
+            escaped = html.escape(new_text, quote=False)
+            tool_pat = r'(?<![\w\'"])((?:https?://|file://|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md)[^\s<"\'\)]*?)([\.,;]?(?=\s|$|<|\'|"))'
+            escaped_with_links = re.sub(
+                tool_pat,
+                r"<a href='\1' style='color: #50fa7b; text-decoration: underline;'>\1</a>\2",
+                escaped,
+            )
+            self.content_label.setText(escaped_with_links.replace("\n", "<br/>"))
         else:
             self.content_label.setText(new_text)
         self.is_editing = False
@@ -563,6 +781,7 @@ class ChatHistoryWidget(QScrollArea):
     signal_replay_tts = pyqtSignal(str)         # message text to speak
     signal_copy_to_input = pyqtSignal(str)      # text to put in prompt bar
     signal_delete_message = pyqtSignal(str)     # message_id
+    signal_link_clicked = pyqtSignal(str)       # link or file path clicked in chat
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -649,6 +868,7 @@ class ChatHistoryWidget(QScrollArea):
         bubble.signal_replay_tts_requested.connect(self.signal_replay_tts.emit)
         bubble.signal_copy_to_input.connect(self.signal_copy_to_input.emit)
         bubble.signal_delete_requested.connect(self._handle_bubble_delete)
+        bubble.signal_link_clicked.connect(self.signal_link_clicked.emit)
 
         self.bubbles.append(bubble)
         self.layout_messages.addWidget(bubble)

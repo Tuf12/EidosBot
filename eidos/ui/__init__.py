@@ -2,7 +2,7 @@
 
 from eidos.ui.allowlist_dialog import AllowlistManagerDialog
 from eidos.ui.app import UIController
-from eidos.ui.chat import ChatHistoryWidget, MessageBubble, markdown_to_chat_html
+from eidos.ui.chat import ChatHistoryWidget, MessageBubble, markdown_to_chat_html, open_chat_link
 from eidos.ui.conversations_dialog import ConversationsDialog
 from eidos.ui.dialogs import ConfirmationDialog, prompt_confirmation_gui
 from eidos.ui.hud import HUDOverlay
@@ -16,6 +16,7 @@ __all__ = [
     "ChatHistoryWidget",
     "MessageBubble",
     "markdown_to_chat_html",
+    "open_chat_link",
     "ConfirmationDialog",
     "prompt_confirmation_gui",
     "AllowlistManagerDialog",

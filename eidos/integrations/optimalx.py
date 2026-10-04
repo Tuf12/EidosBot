@@ -7,10 +7,11 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import uuid
 
 import requests
@@ -201,8 +202,10 @@ class OptimalXBridge:
         query: str,
         limit: int = 5,
         parent_folder: Optional[str] = None,
+        parent_filter: Optional[str] = None,
         subfolder: Optional[str] = None,
         prefer_offline: bool = False,
+        **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         """
         Search personal notes across OptimalX.
@@ -210,11 +213,12 @@ class OptimalXBridge:
         Tier 2 (Offline / Fallback): Queries local SQLite WAL database directly.
         Enforces strict privacy filtering: ignores ai_blind=1 and deleted_at is not null.
         """
+        effective_parent = parent_folder or parent_filter
         if not prefer_offline:
             online_results = self._search_notes_online(
                 query=query,
                 limit=limit,
-                parent_folder=parent_folder,
+                parent_folder=effective_parent,
                 subfolder=subfolder,
             )
             if online_results:
@@ -224,7 +228,7 @@ class OptimalXBridge:
         return self._search_notes_db(
             query=query,
             limit=limit,
-            parent_folder=parent_folder,
+            parent_folder=effective_parent,
             subfolder=subfolder,
         )
 
@@ -296,97 +300,133 @@ class OptimalXBridge:
                 cur = conn.cursor()
                 query_str = query.strip() if query else ""
 
-                sql = """
-                    SELECT
-                        p.id AS parent_folder_id,
-                        p.name AS parent_name,
-                        s.id AS subfolder_id,
-                        s.name AS subfolder_name,
-                        s.notex_enabled,
-                        s.project_summary,
-                        n.id AS note_id,
-                        n.content,
-                        n.summary,
-                        n.updated_at,
-                        n.ai_locked,
-                        n.global_id,
-                        n.content_hash
-                    FROM notes n
-                    JOIN subfolders s ON n.subfolder_id = s.id
-                    JOIN parent_folders p ON s.parent_folder_id = p.id
-                    WHERE n.deleted_at IS NULL
-                      AND n.ai_blind = 0
-                      AND s.deleted_at IS NULL
-                      AND p.deleted_at IS NULL
-                """
-                params: List[Any] = []
-
-                if parent_folder:
-                    sql += " AND (p.name LIKE ? OR p.id = ?)"
-                    params.extend([f"%{parent_folder}%", int(parent_folder) if parent_folder.isdigit() else -1])
-
-                if subfolder:
-                    sql += " AND (s.name LIKE ? OR s.id = ?)"
-                    params.extend([f"%{subfolder}%", int(subfolder) if subfolder.isdigit() else -1])
-
+                candidate_queries: List[Tuple[str, float]] = []
                 if query_str and query_str != "*":
-                    like_q = f"%{query_str}%"
-                    sql += """
-                        AND (
-                            s.name LIKE ?
-                            OR p.name LIKE ?
-                            OR n.content LIKE ?
-                            OR n.summary LIKE ?
-                            OR s.project_summary LIKE ?
-                        )
+                    candidate_queries.append((query_str, 1.0))
+
+                    # Check prefix pattern like 'item 114', 'note #42', 'idea 7'
+                    m = re.match(
+                        r"^(?:(?:item|note|entry|idea|line|number|no)\b\.?|#)\s*#?\s*([0-9a-zA-Z_-]+)",
+                        query_str,
+                        re.IGNORECASE,
+                    )
+                    if m:
+                        id_term = m.group(1)
+                        if id_term.lower() != query_str.lower():
+                            candidate_queries.append((id_term, 0.85))
+
+                    # Multi-word query fallback with stopwords removed
+                    stopwords = {"item", "note", "the", "a", "an", "of", "in", "to", "for", "and", "or", "on", "at", "by", "is"}
+                    words = [w for w in re.split(r"\s+", query_str) if len(w) > 1 and w.lower() not in stopwords]
+                    if len(words) > 1:
+                        for w in words:
+                            if w.lower() != query_str.lower() and not any(w.lower() == cq[0].lower() for cq in candidate_queries):
+                                candidate_queries.append((w, 0.7))
+                else:
+                    candidate_queries.append(("*", 0.5))
+
+                seen_note_ids: Set[int] = set()
+                scored_results: List[Dict[str, Any]] = []
+
+                for term, term_weight in candidate_queries:
+                    if len(scored_results) >= limit:
+                        break
+
+                    sql = """
+                        SELECT
+                            p.id AS parent_folder_id,
+                            p.name AS parent_name,
+                            s.id AS subfolder_id,
+                            s.name AS subfolder_name,
+                            s.notex_enabled,
+                            s.project_summary,
+                            n.id AS note_id,
+                            n.content,
+                            n.summary,
+                            n.updated_at,
+                            n.ai_locked,
+                            n.global_id,
+                            n.content_hash
+                        FROM notes n
+                        JOIN subfolders s ON n.subfolder_id = s.id
+                        JOIN parent_folders p ON s.parent_folder_id = p.id
+                        WHERE n.deleted_at IS NULL
+                          AND n.ai_blind = 0
+                          AND s.deleted_at IS NULL
+                          AND p.deleted_at IS NULL
                     """
-                    params.extend([like_q, like_q, like_q, like_q, like_q])
+                    params: List[Any] = []
 
-                sql += " ORDER BY n.updated_at DESC LIMIT ?"
-                params.append(limit * 3)
+                    if parent_folder:
+                        sql += " AND (p.name LIKE ? OR p.id = ?)"
+                        params.extend([f"%{parent_folder}%", int(parent_folder) if str(parent_folder).isdigit() else -1])
 
-                cur.execute(sql, params)
-                rows = cur.fetchall()
+                    if subfolder:
+                        sql += " AND (s.name LIKE ? OR s.id = ?)"
+                        params.extend([f"%{subfolder}%", int(subfolder) if str(subfolder).isdigit() else -1])
 
-                scored_results = []
-                for row in rows:
-                    p_name = row["parent_name"]
-                    s_name = row["subfolder_name"]
-                    content = row["content"] or ""
-                    summary = row["summary"] or ""
-                    location = f"{p_name} > {s_name}"
+                    if term and term != "*":
+                        like_q = f"%{term}%"
+                        sql += """
+                            AND (
+                                s.name LIKE ?
+                                OR p.name LIKE ?
+                                OR n.content LIKE ?
+                                OR n.summary LIKE ?
+                                OR s.project_summary LIKE ?
+                            )
+                        """
+                        params.extend([like_q, like_q, like_q, like_q, like_q])
 
-                    relevance_score = 0.5
-                    if query_str and query_str != "*":
-                        q_lower = query_str.lower()
-                        if q_lower == s_name.lower():
-                            relevance_score = 1.0
-                        elif q_lower in s_name.lower():
-                            relevance_score = 0.9
-                        elif summary and q_lower in summary.lower():
-                            relevance_score = 0.8
-                        elif q_lower in content.lower():
-                            relevance_score = 0.7
+                    sql += " ORDER BY n.updated_at DESC LIMIT ?"
+                    params.append(limit * 3)
 
-                    snippet = self._extract_snippet(content, query_str)
-                    scored_results.append({
-                        "location": location,
-                        "parent_name": p_name,
-                        "parent_folder_id": row["parent_folder_id"],
-                        "subfolder_name": s_name,
-                        "subfolder_id": row["subfolder_id"],
-                        "note_id": row["note_id"],
-                        "text": snippet,
-                        "summary": summary,
-                        "word_count": len(content.split()),
-                        "char_count": len(content),
-                        "score": relevance_score,
-                        "chunk_type": "note",
-                        "source": "db_sqlite",
-                        "updated_at": row["updated_at"],
-                        "ai_locked": bool(row["ai_locked"]),
-                        "notex_enabled": bool(row["notex_enabled"]),
-                    })
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+
+                    for row in rows:
+                        nid = row["note_id"]
+                        if nid in seen_note_ids:
+                            continue
+                        seen_note_ids.add(nid)
+
+                        p_name = row["parent_name"]
+                        s_name = row["subfolder_name"]
+                        content = row["content"] or ""
+                        summary = row["summary"] or ""
+                        location = f"{p_name} > {s_name}"
+
+                        relevance_score = 0.5 * term_weight
+                        if term and term != "*":
+                            t_lower = term.lower()
+                            if t_lower == s_name.lower():
+                                relevance_score = 1.0 * term_weight
+                            elif t_lower in s_name.lower():
+                                relevance_score = 0.9 * term_weight
+                            elif summary and t_lower in summary.lower():
+                                relevance_score = 0.8 * term_weight
+                            elif t_lower in content.lower():
+                                relevance_score = 0.7 * term_weight
+
+                        snippet = self._extract_snippet(content, term if term != "*" else query_str)
+                        scored_results.append({
+                            "location": location,
+                            "parent_name": p_name,
+                            "parent_folder_id": row["parent_folder_id"],
+                            "subfolder_name": s_name,
+                            "subfolder_id": row["subfolder_id"],
+                            "note_id": row["note_id"],
+                            "text": snippet,
+                            "summary": summary,
+                            "word_count": len(content.split()),
+                            "char_count": len(content),
+                            "score": round(relevance_score, 2),
+                            "chunk_type": "note",
+                            "source": "db_sqlite",
+                            "updated_at": row["updated_at"],
+                            "ai_locked": bool(row["ai_locked"]),
+                            "notex_enabled": bool(row["notex_enabled"]),
+                        })
 
                 scored_results.sort(key=lambda x: (x["score"], x["updated_at"]), reverse=True)
                 return scored_results[:limit]

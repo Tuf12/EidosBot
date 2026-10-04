@@ -332,7 +332,12 @@ def test_agent_loop_optimalx_tool_dispatch():
         res = agent.run_task("Explore and write notes", max_steps=5)
         assert res["success"] is True
         agent.optimalx.search_notes.assert_called_once_with(
-            query="patent architecture", limit=5, parent_filter=None, prefer_offline=False
+            query="patent architecture",
+            limit=5,
+            parent_folder=None,
+            parent_filter=None,
+            subfolder=None,
+            prefer_offline=False,
         )
         agent.optimalx.list_folders.assert_called_once_with(
             parent_folder_id=None, include_subfolders=True, query=None
@@ -348,3 +353,53 @@ def test_agent_loop_optimalx_tool_dispatch():
             label=None,
             conversation_id=None,
         )
+
+
+def test_agent_loop_tool_exception_recovery():
+    """Verify that an unexpected tool exception does not crash the loop and allows model recovery."""
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+
+        class ErrorRecoveryMockModel(BaseModelClient):
+            def __init__(self):
+                self.step = 0
+
+            def chat(self, messages, tools=None, model_override=None):
+                self.step += 1
+                if self.step == 1:
+                    return ModelResponse(
+                        content="Attempting search that will fail",
+                        tool_calls=[ToolCall(name="optimalx_search_notes", arguments={"query": "item 114"})]
+                    )
+                else:
+                    # Model inspects error in messages and finishes gracefully
+                    last_tool_msg = next((m for m in reversed(messages) if m.get("role") == "tool"), None)
+                    assert last_tool_msg is not None
+                    assert "Tool 'optimalx_search_notes' execution failed" in last_tool_msg["content"]
+                    return ModelResponse(
+                        content="Self-corrected after tool failure",
+                        tool_calls=[ToolCall(name="finish_task", arguments={"summary": "Handled tool error gracefully."})]
+                    )
+
+            def vision_chat(self, prompt, image_base64, system_prompt=None, model_override=None):
+                return ModelResponse(content="")
+
+        mock_model = ErrorRecoveryMockModel()
+        mock_voice = MagicMock()
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+            voice_manager=mock_voice,
+        )
+
+        agent.optimalx = MagicMock()
+        # Simulate unexpected keyword argument or runtime crash in bridge
+        agent.optimalx.search_notes.side_effect = TypeError("OptimalXBridge.search_notes() got an unexpected keyword argument 'parent_filter'")
+
+        res = agent.run_task("Search for item 114", max_steps=5)
+        assert res["success"] is True
+        assert res["summary"] == "Handled tool error gracefully."
+

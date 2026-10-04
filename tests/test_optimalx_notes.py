@@ -169,7 +169,7 @@ def temp_optimalx_db():
     # Note 5: Long Invention List
     cur.execute("""
         INSERT INTO notes (id, subfolder_id, content, summary, created_at, updated_at, ai_locked, ai_blind, global_id, content_hash)
-        VALUES (104, 14, 'Item 1: Smart garden solar pump. Item 2: Autonomous lawn aerator. Item 3: Acoustic pipe leak detector.', 'List of 300 invention concepts', 1000, 2500, 0, 0, 'n104', 'hash104')
+        VALUES (104, 14, 'Item 1: Smart garden solar pump. Item 2: Autonomous lawn aerator. Item 3: Acoustic pipe leak detector.\n114. Hook to hang on niche metal for hooks that can be grouted in', 'List of 300 invention concepts', 1000, 2500, 0, 0, 'n104', 'hash104')
     """)
 
     conn.commit()
@@ -302,6 +302,23 @@ def test_search_notes_parent_folder_filter(temp_optimalx_db):
     inv_results = bridge.search_notes(query="*", parent_folder="Inventions", prefer_offline=True)
     assert len(inv_results) == 2
     assert all(r["parent_name"] == "Inventions" for r in inv_results)
+
+
+def test_search_notes_parent_filter_kwarg_alias(temp_optimalx_db):
+    """Verify that parent_filter keyword argument works as an alias for parent_folder."""
+    bridge = OptimalXBridge(db_path=temp_optimalx_db)
+    inv_results = bridge.search_notes(query="*", parent_filter="Inventions", prefer_offline=True)
+    assert len(inv_results) == 2
+    assert all(r["parent_name"] == "Inventions" for r in inv_results)
+
+
+def test_search_notes_item_number_pattern(temp_optimalx_db):
+    """Verify that querying for 'item 114' matches numbered list item '114.' even if 'item' is not in the text."""
+    bridge = OptimalXBridge(db_path=temp_optimalx_db)
+    results = bridge.search_notes(query="item 114", prefer_offline=True)
+    assert len(results) >= 1
+    assert results[0]["note_id"] == 104
+    assert "Hook to hang on niche metal" in results[0]["text"]
 
 
 def test_read_note_by_subfolder_id(temp_optimalx_db):

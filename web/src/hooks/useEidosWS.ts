@@ -57,6 +57,8 @@ export function useEidosWS() {
           headers,
           body: JSON.stringify({ prompt: msg.prompt }),
         }).catch((e) => addLog(`HTTP error: ${e}`));
+      } else if (msg.type === 'stop' || msg.type === 'cancel' || msg.type === 'stop_task') {
+        fetch('/api/stop', { method: 'POST', headers }).catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'kill') {
         fetch('/api/kill', { method: 'POST', headers }).catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'reset') {
@@ -192,6 +194,11 @@ export function useEidosWS() {
           if (ev === 'status_change') {
             if (data.state) {
               setAgentState(data.state);
+              if (data.state.toLowerCase() === 'killed') {
+                setIsKilled(true);
+              } else if (['idle', 'thinking', 'executing', 'perceiving'].includes(data.state.toLowerCase()) && !data.killed) {
+                setIsKilled(false);
+              }
               // When transitioning to a terminal state (idle, error, killed),
               // clear streaming flag on all active messages so nothing gets stuck
               if (['idle', 'error', 'killed'].includes(data.state.toLowerCase())) {
@@ -485,11 +492,35 @@ export function useEidosWS() {
   );
 
   const triggerKill = useCallback(() => {
+    setIsKilled(true);
+    setAgentState('killed');
+    setStateDetails('Emergency stop tripped remotely');
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.streaming ? { ...m, streaming: false, content: (m.content || '') + ' [Emergency Stopped]' } : m
+      )
+    );
+    currentAssistantMsgIdRef.current = null;
     sendMessage({ type: 'kill' });
   }, [sendMessage]);
 
   const resetKill = useCallback(() => {
+    setIsKilled(false);
+    setAgentState('idle');
+    setStateDetails('Emergency stop reset');
     sendMessage({ type: 'reset' });
+  }, [sendMessage]);
+
+  const stopTask = useCallback(() => {
+    setAgentState('idle');
+    setStateDetails('Task stopped');
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.streaming ? { ...m, streaming: false, content: (m.content || '') + ' [Stopped]' } : m
+      )
+    );
+    currentAssistantMsgIdRef.current = null;
+    sendMessage({ type: 'stop' });
   }, [sendMessage]);
 
   const resolveConfirmation = useCallback(
@@ -527,6 +558,7 @@ export function useEidosWS() {
     startNewChat,
     switchConversation,
     sendPrompt,
+    stopTask,
     triggerKill,
     resetKill,
     resolveConfirmation,

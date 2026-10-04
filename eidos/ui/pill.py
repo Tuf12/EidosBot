@@ -11,10 +11,11 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QSizeGrip,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -40,6 +41,106 @@ RESIZE_CURSORS = {
     "bottom_left": Qt.CursorShape.SizeBDiagCursor,
     "bottom_right": Qt.CursorShape.SizeFDiagCursor,
 }
+
+PROMPT_STYLE = (
+    "QPlainTextEdit { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; "
+    "border-radius: 6px; padding: 6px 10px; font-size: 12px; } "
+    "QPlainTextEdit:focus { border: 1px solid #bd93f9; }"
+)
+
+
+class AutoGrowPromptEdit(QPlainTextEdit):
+    """Multi-line prompt that grows with content (same behavior as web ChatView textarea)."""
+
+    submit_requested = pyqtSignal()
+    height_changed = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._chat_expanded = False
+        self._adjusting = False
+        self._pending_adjust = False
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTabChangesFocus(True)
+        self.setStyleSheet(PROMPT_STYLE)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.document().setDocumentMargin(2)
+        self.document().contentsChanged.connect(self._adjust_height)
+        self._apply_height(self._min_height())
+
+    def set_chat_expanded(self, expanded: bool) -> None:
+        self._chat_expanded = expanded
+        self._adjust_height()
+
+    def _min_height(self) -> int:
+        return 40
+
+    def _max_height(self) -> int:
+        return 320 if self._chat_expanded else 180
+
+    def _apply_height(self, height: int) -> None:
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
+        self.updateGeometry()
+
+    def _content_pixel_height(self) -> int:
+        """Pixel height of the laid-out text. document().size() is not pixels here."""
+        doc = self.document()
+        layout = doc.documentLayout()
+        width = self.viewport().width()
+        if self.verticalScrollBar().isVisible():
+            width += self.verticalScrollBar().width()
+        width = max(1, width)
+        if int(doc.textWidth()) != width:
+            doc.setTextWidth(width)
+        content = 0.0
+        block = doc.begin()
+        while block.isValid():
+            content += layout.blockBoundingRect(block).height()
+            block = block.next()
+        margins = self.contentsMargins()
+        chrome = margins.top() + margins.bottom() + int(doc.documentMargin() * 2) + 8
+        return int(content + chrome)
+
+    def _adjust_height(self) -> None:
+        if self._adjusting:
+            # setTextWidth emits contentsChanged before the new layout can be measured.
+            self._pending_adjust = True
+            return
+        self._adjusting = True
+        try:
+            for _ in range(3):
+                self._pending_adjust = False
+                target = max(self._min_height(), min(self._content_pixel_height(), self._max_height()))
+                if target != self.maximumHeight() or target != self.minimumHeight():
+                    self._apply_height(target)
+                    self.height_changed.emit()
+                if not self._pending_adjust:
+                    break
+        finally:
+            self._adjusting = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self._adjust_height()
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                super().keyPressEvent(event)
+                return
+            event.accept()
+            self.submit_requested.emit()
+            return
+        super().keyPressEvent(event)
+
+    def clear(self) -> None:
+        super().clear()
+        self._apply_height(self._min_height())
+        self.height_changed.emit()
 
 
 class ElidedLabel(QLabel):
@@ -99,6 +200,7 @@ class StatusPill(QWidget):
     signal_set_conversation_title = pyqtSignal(str)
     signal_open_workspace = pyqtSignal()
     signal_open_skills = pyqtSignal()
+    signal_link_clicked = pyqtSignal(str)  # activated in-chat link/file
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -297,15 +399,13 @@ class StatusPill(QWidget):
         prompt_bar = QHBoxLayout()
         prompt_bar.setSpacing(6)
 
-        self.prompt_input = QLineEdit()
-        self.prompt_input.setPlaceholderText("Ask EidosBot to do something...")
-        self.prompt_input.setStyleSheet(
-            "QLineEdit { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; "
-            "border-radius: 6px; padding: 6px 10px; font-size: 12px; } "
-            "QLineEdit:focus { border: 1px solid #bd93f9; }"
+        self.prompt_input = AutoGrowPromptEdit()
+        self.prompt_input.setPlaceholderText(
+            "Ask EidosBot to do something... (Shift+Enter for newline)"
         )
-        self.prompt_input.returnPressed.connect(self._on_submit_prompt)
-        prompt_bar.addWidget(self.prompt_input, stretch=1)
+        self.prompt_input.submit_requested.connect(self._on_submit_prompt)
+        self.prompt_input.height_changed.connect(self._on_prompt_height_changed)
+        prompt_bar.addWidget(self.prompt_input, stretch=1, alignment=Qt.AlignmentFlag.AlignBottom)
 
         # Push-to-Talk Mic Button
         self.btn_mic = QPushButton("🎙️")
@@ -318,17 +418,17 @@ class StatusPill(QWidget):
             "QPushButton:hover { background-color: #44475a; border-color: #50fa7b; }"
         )
         self.btn_mic.clicked.connect(self.signal_toggle_mic.emit)
-        prompt_bar.addWidget(self.btn_mic)
+        prompt_bar.addWidget(self.btn_mic, alignment=Qt.AlignmentFlag.AlignBottom)
 
         self.btn_send = QPushButton("▶")
-        self.btn_send.setToolTip("Execute prompt (Enter)")
+        self.btn_send.setToolTip("Execute prompt (Enter; Shift+Enter for newline)")
         self.btn_send.setStyleSheet(
             "QPushButton { background-color: #bd93f9; color: #282a36; font-weight: bold; "
             "border-radius: 6px; padding: 6px 12px; font-size: 12px; border: none; } "
             "QPushButton:hover { background-color: #ff79c6; }"
         )
         self.btn_send.clicked.connect(self._on_submit_prompt)
-        prompt_bar.addWidget(self.btn_send)
+        prompt_bar.addWidget(self.btn_send, alignment=Qt.AlignmentFlag.AlignBottom)
 
         card_layout.addLayout(prompt_bar)
 
@@ -378,6 +478,7 @@ class StatusPill(QWidget):
         self.chat_history.signal_edit_message.connect(self._on_edit_message)
         self.chat_history.signal_replay_tts.connect(self.signal_replay_tts.emit)
         self.chat_history.signal_copy_to_input.connect(self.set_prompt_text)
+        self.chat_history.signal_link_clicked.connect(self._on_link_clicked)
 
     def _setup_shortcuts(self):
         # Ctrl+E to toggle expand/collapse
@@ -457,6 +558,7 @@ class StatusPill(QWidget):
         finally:
             self.setUpdatesEnabled(True)
 
+        self.prompt_input.set_chat_expanded(True)
         QTimer.singleShot(40, self.chat_history.scroll_to_bottom)
         self.prompt_input.setFocus()
         self.signal_toggle_expand.emit(True)
@@ -485,6 +587,7 @@ class StatusPill(QWidget):
             self.lbl_hint.setVisible(False)
             self.size_grip.setVisible(False)
 
+            self.prompt_input.set_chat_expanded(False)
             self.card.layout().activate()
             self.layout().activate()
 
@@ -494,8 +597,8 @@ class StatusPill(QWidget):
                     self.move(self._collapsed_pos)
 
             # Shrink back down to compact pill minimal size
-            target_w = self.minimumSizeHint().width()
-            target_h = self.minimumSizeHint().height()
+            target_w = self._collapsed_width if self._collapsed_width > 0 else self.minimumSizeHint().width()
+            target_h = self._collapsed_height if self._collapsed_height > 0 else self.minimumSizeHint().height()
             self.resize(target_w, target_h)
         finally:
             self.setUpdatesEnabled(True)
@@ -655,6 +758,11 @@ class StatusPill(QWidget):
         self.signal_edit_submitted.emit(message_id, clean)
         self.signal_submit_task.emit(clean)
 
+    @pyqtSlot(str)
+    def _on_link_clicked(self, link: str):
+        """Forward link activation signal."""
+        self.signal_link_clicked.emit(link)
+
     @pyqtSlot(bool)
     def set_mic_recording(self, recording: bool):
         """Update mic button state during push-to-talk recording."""
@@ -678,7 +786,7 @@ class StatusPill(QWidget):
     @pyqtSlot(str)
     def set_prompt_text(self, text: str):
         """Set text in the prompt input field."""
-        self.prompt_input.setText(text)
+        self.prompt_input.setPlainText(text)
         self.prompt_input.setFocus()
 
     @pyqtSlot()
@@ -778,7 +886,7 @@ class StatusPill(QWidget):
             self.signal_stop_task.emit()
             return
 
-        prompt = self.prompt_input.text().strip()
+        prompt = self.prompt_input.toPlainText().strip()
         if not prompt:
             return
 
@@ -787,6 +895,14 @@ class StatusPill(QWidget):
             self.expand_chat()
 
         self.signal_submit_task.emit(prompt)
+
+    def _on_prompt_height_changed(self) -> None:
+        """Keep the prompt row and compact pill height in sync with wrapped text."""
+        self.card.layout().activate()
+        self.layout().activate()
+        if self.is_expanded:
+            return
+        self.resize(self.width(), self.minimumSizeHint().height())
 
     # Window moving and frameless border/corner resizing
     def _get_resize_edge(self, global_pos: QPoint) -> Optional[str]:
@@ -823,7 +939,7 @@ class StatusPill(QWidget):
         """Determine if a mouse click is in an allowed window dragging zone."""
         child = QApplication.widgetAt(global_pos)
         # Interactive controls are never draggable
-        if isinstance(child, (QPushButton, QLineEdit, QSizeGrip)):
+        if isinstance(child, (QPushButton, QPlainTextEdit, QSizeGrip)):
             return False
 
         # In compact pill mode, the whole widget (outside buttons/input) moves the window

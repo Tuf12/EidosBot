@@ -61,6 +61,9 @@ export interface OutboundWSMessage {
   type:
     | 'ping'
     | 'prompt'
+    | 'stop'
+    | 'cancel'
+    | 'stop_task'
     | 'kill'
     | 'reset'
     | 'resolve_confirmation'

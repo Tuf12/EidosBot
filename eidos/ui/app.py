@@ -145,6 +145,12 @@ class UIController(QObject):
                     self._agent_loop.voice.stop_speaking()
                 except Exception:
                     pass
+            if self._agent_loop is not None and hasattr(self._agent_loop, "cancel_task"):
+                try:
+                    self._agent_loop.cancel_task()
+                except Exception:
+                    pass
+            self.pill.set_task_running(False)
 
         self.kill_switch.register_callback(on_kill)
 

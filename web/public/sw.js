@@ -1,5 +1,5 @@
-// EidosBot Mobile PWA Service Worker (v5 - Network First & Cache Purging)
-const CACHE_NAME = 'eidos-pwa-v5';
+// EidosBot Mobile PWA Service Worker (v6 - Stop & End Call Support)
+const CACHE_NAME = 'eidos-pwa-v6';
 const PRECACHE_ASSETS = [
   '/manifest.json',
   '/icons/icon-192.png',

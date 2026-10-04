@@ -196,26 +196,59 @@ function renderInlineSpans(text: string): React.ReactNode {
   });
 }
 
+async function handleLocalLinkClick(url: string) {
+  try {
+    const token = localStorage.getItem('eidos_token') || '';
+    const res = await fetch('/api/open_link', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({ target: url }),
+    });
+    if (!res.ok) {
+      await navigator.clipboard.writeText(url);
+    }
+  } catch {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function parseFormattingAndLinks(raw: string): React.ReactNode {
   // Matches markdown links: [text](url)
-  const linkRegex = /\[([^\]]+)\]\(((?:https?:\/\/|\/)[^\s\)]+)\)/g;
+  const linkRegex = /\[([^\]]+)\]\(([^)\s]+)\)/g;
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
   while ((match = linkRegex.exec(raw)) !== null) {
     if (match.index > lastIndex) {
-      parts.push(parseBoldAndItalic(raw.substring(lastIndex, match.index), `txt_${lastIndex}`));
+      parts.push(parseRawUrlsAndFormatting(raw.substring(lastIndex, match.index), `txt_${lastIndex}`));
     }
     const label = match[1];
-    const url = match[2];
+    const url = match[2].trim().replace(/^['"]|['"]$/g, '');
+    const isWebUrl = url.startsWith('http://') || url.startsWith('https://') || url.startsWith('www.');
+    const fullWebUrl = url.startsWith('www.') ? `https://${url}` : url;
+
     parts.push(
       <a
         key={`link_${match.index}`}
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="text-[#8be9fd] underline underline-offset-2 hover:text-[#50fa7b] font-semibold transition"
+        href={isWebUrl ? fullWebUrl : '#'}
+        target={isWebUrl ? '_blank' : undefined}
+        rel={isWebUrl ? 'noopener noreferrer' : undefined}
+        onClick={(e) => {
+          if (!isWebUrl) {
+            e.preventDefault();
+            handleLocalLinkClick(url);
+          }
+        }}
+        title={isWebUrl ? url : `Open file: ${url}`}
+        className="text-[#8be9fd] underline underline-offset-2 hover:text-[#50fa7b] font-semibold transition cursor-pointer"
       >
         {label}
       </a>
@@ -224,10 +257,46 @@ function parseFormattingAndLinks(raw: string): React.ReactNode {
   }
 
   if (lastIndex < raw.length) {
-    parts.push(parseBoldAndItalic(raw.substring(lastIndex), `txt_end_${lastIndex}`));
+    parts.push(parseRawUrlsAndFormatting(raw.substring(lastIndex), `txt_end_${lastIndex}`));
   }
 
-  return parts.length > 0 ? parts : raw;
+  return parts.length > 0 ? parts : parseRawUrlsAndFormatting(raw, 'txt_raw');
+}
+
+function parseRawUrlsAndFormatting(text: string, keyPrefix: string): React.ReactNode {
+  // Autolink raw web URLs
+  const rawUrlRegex = /(https?:\/\/[^\s<"'\)]+?)([\.,;]?(?=\s|$|<|'|"))/g;
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = rawUrlRegex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(parseBoldAndItalic(text.substring(lastIndex, match.index), `${keyPrefix}_b_${lastIndex}`));
+    }
+    const url = match[1];
+    const trailing = match[2] || '';
+    parts.push(
+      <React.Fragment key={`${keyPrefix}_url_${match.index}`}>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-[#8be9fd] underline underline-offset-2 hover:text-[#50fa7b] font-semibold transition cursor-pointer"
+        >
+          {url}
+        </a>
+        {trailing}
+      </React.Fragment>
+    );
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(parseBoldAndItalic(text.substring(lastIndex), `${keyPrefix}_end_${lastIndex}`));
+  }
+
+  return parts.length > 0 ? parts : parseBoldAndItalic(text, keyPrefix);
 }
 
 function parseBoldAndItalic(text: string, keyPrefix: string): React.ReactNode {

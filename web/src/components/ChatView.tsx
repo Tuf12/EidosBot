@@ -8,6 +8,7 @@ import {
   VolumeX,
   Loader2,
   Square,
+  PhoneOff,
   Mic,
   MicOff,
   Bot,
@@ -34,6 +35,7 @@ interface ChatViewProps {
   onToggleAutoSpeak?: () => void;
   onPlayAudio?: (text: string, messageId: string) => void;
   onStopAudio?: () => void;
+  onStopTask?: () => void;
   playbackError?: string | null;
   conversationTitle?: string;
   onNewChat?: () => void;
@@ -75,6 +77,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   onToggleAutoSpeak,
   onPlayAudio,
   onStopAudio,
+  onStopTask,
   playbackError,
   conversationTitle = 'New Chat',
   onNewChat,
@@ -168,13 +171,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
     setIsExpanded(false);
     if (textareaRef.current) {
       textareaRef.current.style.height = '40px';
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSubmit();
     }
   };
 
@@ -344,6 +340,41 @@ export const ChatView: React.FC<ChatViewProps> = ({
       startRecording();
     }
   }, [isRecording, isTranscribing, stopRecording, startRecording]);
+
+  const handleStopAll = useCallback(() => {
+    if (isRecording) {
+      cancelRecording();
+    }
+    onStopAudio?.();
+    onStopTask?.();
+  }, [isRecording, cancelRecording, onStopAudio, onStopTask]);
+
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (isThinking || isPlaying || isRecording) {
+          e.preventDefault();
+          handleStopAll();
+        }
+      }
+    };
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [isThinking, isPlaying, isRecording, handleStopAll]);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Escape') {
+      if (isThinking || isPlaying || isRecording) {
+        e.preventDefault();
+        handleStopAll();
+        return;
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
 
   return (
     <div className="flex flex-col h-full bg-[#1e1f29]">
@@ -586,15 +617,27 @@ export const ChatView: React.FC<ChatViewProps> = ({
             </button>
           </div>
 
-          {isPlaying && (
+          {isPlaying ? (
             <button
               type="button"
-              onClick={onStopAudio}
-              className="text-[#ff5555] hover:underline flex items-center gap-1 font-semibold"
+              onClick={handleStopAll}
+              className="px-2.5 py-1 rounded-lg bg-[#ff5555] text-white hover:bg-[#ff5555]/90 flex items-center gap-1.5 font-bold text-xs shadow-md active:scale-95 animate-pulse"
+              title="End Call / Stop Speech Playback (Esc)"
             >
-              <Square className="w-3 h-3 fill-current" /> Stop Audio
+              <PhoneOff className="w-3.5 h-3.5" />
+              <span>End Call</span>
             </button>
-          )}
+          ) : isThinking ? (
+            <button
+              type="button"
+              onClick={handleStopAll}
+              className="px-2.5 py-1 rounded-lg bg-[#ff5555]/20 border border-[#ff5555] text-[#ff5555] hover:bg-[#ff5555]/30 flex items-center gap-1.5 font-bold text-xs active:scale-95 animate-pulse"
+              title="Stop active task / Cancel (Esc)"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+              <span>Stop Task</span>
+            </button>
+          ) : null}
         </div>
 
         {/* Active Recording / Transcription Banner */}
@@ -723,16 +766,37 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
               </button>
 
-              {/* Submit button */}
-              <button
-                type="submit"
-                disabled={!inputText.trim() || isThinking}
-                title="Send Message (Enter)"
-                className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#bd93f9] text-[#1e1f29] font-medium text-xs hover:bg-[#bd93f9]/90 disabled:opacity-30 disabled:cursor-not-allowed transition active:scale-95 shadow-md"
-              >
-                <span>Send</span>
-                <Send className="w-3.5 h-3.5" />
-              </button>
+              {/* Submit or Stop / End Call button */}
+              {isThinking || isPlaying ? (
+                <button
+                  type="button"
+                  onClick={handleStopAll}
+                  title={isPlaying ? 'End Call / Stop Speech (Esc)' : 'Stop active task / Cancel generation (Esc)'}
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition active:scale-95 shadow-md animate-pulse"
+                >
+                  {isPlaying ? (
+                    <>
+                      <PhoneOff className="w-3.5 h-3.5" />
+                      <span>End Call</span>
+                    </>
+                  ) : (
+                    <>
+                      <Square className="w-3.5 h-3.5 fill-current" />
+                      <span>Stop</span>
+                    </>
+                  )}
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  disabled={!inputText.trim()}
+                  title="Send Message (Enter)"
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#bd93f9] text-[#1e1f29] font-medium text-xs hover:bg-[#bd93f9]/90 disabled:opacity-30 disabled:cursor-not-allowed transition active:scale-95 shadow-md"
+                >
+                  <span>Send</span>
+                  <Send className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
           </div>
         </form>

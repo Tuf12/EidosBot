@@ -507,9 +507,11 @@ class AgentLoop:
             return None
 
     def _on_kill_stop_voice(self) -> None:
-        """Stop TTS and batch workers immediately when the emergency kill switch fires."""
+        """Stop TTS, request loop cancellation, and halt batch workers immediately when emergency kill fires."""
+        self._stop_requested.set()
         try:
-            self.voice.stop_speaking()
+            if self.voice:
+                self.voice.stop_speaking()
         except Exception:
             pass
         try:
@@ -798,7 +800,15 @@ class AgentLoop:
                     break
                 executed_tools.append({"name": tc.name, "arguments": tc.arguments})
                 self._emit("on_tool_start", tc.name, tc.arguments)
-                tool_result, is_finish = self._dispatch_tool(tc)
+                try:
+                    tool_result, is_finish = self._dispatch_tool(tc)
+                except Exception as exc:
+                    logger.error("Exception dispatching tool '%s': %s", tc.name, exc, exc_info=True)
+                    tool_result = {
+                        "success": False,
+                        "error": f"Tool '{tc.name}' execution failed with exception: {exc}",
+                    }
+                    is_finish = False
                 self._emit("on_tool_end", tc.name, tool_result)
                 executed_observations.append(tool_result)
                 if is_finish:
@@ -1025,7 +1035,8 @@ class AgentLoop:
         if name == "optimalx_search_notes":
             query = args.get("query", "")
             limit = int(args.get("limit", 5))
-            parent_folder = args.get("parent_folder")
+            parent_folder = args.get("parent_folder") or args.get("parent_filter")
+            subfolder = args.get("subfolder")
             prefer_offline = bool(args.get("prefer_offline", False))
             allowed, reason = self.gatekeeper.evaluate(
                 "optimalx_search_notes",
@@ -1036,7 +1047,9 @@ class AgentLoop:
             results = self.optimalx.search_notes(
                 query=query,
                 limit=limit,
+                parent_folder=parent_folder,
                 parent_filter=parent_folder,
+                subfolder=subfolder,
                 prefer_offline=prefer_offline,
             )
             return {"query": query, "count": len(results), "results": results}, False

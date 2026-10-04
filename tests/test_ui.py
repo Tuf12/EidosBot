@@ -10,7 +10,13 @@ from eidos.safety.kill_switch import KillSwitch
 from eidos.safety.risk_classifier import RiskLevel
 from eidos.ui.allowlist_dialog import AllowlistManagerDialog
 from eidos.ui.app import UIController
-from eidos.ui.chat import ChatHistoryWidget, MessageBubble, markdown_to_chat_html
+from eidos.ui.chat import (
+    ChatHistoryWidget,
+    MessageBubble,
+    markdown_to_chat_html,
+    open_chat_link,
+    _resolve_local_file_path,
+)
 from eidos.ui.dialogs import ConfirmationDialog
 from eidos.ui.hud import HUDOverlay
 from eidos.ui.pill import StatusPill
@@ -474,8 +480,9 @@ def test_status_pill_minimize_restores_minimal_size(qapp):
     # Verify it returns back to its minimal size and does not stay inflated
     assert pill.height() == pill.minimumSizeHint().height()
     assert pill.width() == pill.minimumSizeHint().width()
-    assert pill.height() <= 110  # Compact minimal height (< 100px)
-    assert pill.geometry() == initial_geom
+    assert pill.height() <= 120  # Compact minimal height
+    assert pill.geometry().topLeft() == initial_geom.topLeft()
+    assert pill.geometry().width() == initial_geom.width()
 
     # Even after setting a long status message, collapsing returns to minimal size
     pill.expand_chat()
@@ -489,7 +496,7 @@ def test_status_pill_minimize_restores_minimal_size(qapp):
         time.sleep(0.005)
     assert pill.height() == pill.minimumSizeHint().height()
     assert pill.width() == pill.minimumSizeHint().width()
-    assert pill.height() <= 110
+    assert pill.height() <= 120
 
     pill.close()
 
@@ -658,9 +665,9 @@ def test_start_task_rejects_when_busy(qapp, monkeypatch):
     assert controller.is_task_running()
     assert controller.pill.chat_history.message_count == 1
 
-    controller.pill.prompt_input.setText("second task")
+    controller.pill.set_prompt_text("second task")
     controller.pill._on_submit_prompt()
-    assert controller.pill.prompt_input.text() == "second task"
+    assert controller.pill.prompt_input.toPlainText() == "second task"
     assert controller.pill.chat_history.message_count == 2
 
     if controller._agent_thread:
@@ -821,6 +828,92 @@ def test_markdown_to_chat_html_links():
     assert "<a href='https://finance.yahoo.com/quote/SNDL/'" in html2
     assert ">https://finance.yahoo.com/quote/SNDL/</a>" in html2
 
+    # Relative markdown portfolio links
+    text3 = "Analysis ready: [Portfolio Item 114](portfolios/item_114.md)"
+    html3 = markdown_to_chat_html(text3)
+    assert "<a href='portfolios/item_114.md'" in html3
+    assert ">Portfolio Item 114</a>" in html3
+
+    # Absolute file path in markdown link
+    text4 = "View [Ranking Summary](/home/tuf/EidosWorkspace/documents/RANKING_SUMMARY.md)"
+    html4 = markdown_to_chat_html(text4)
+    assert "<a href='/home/tuf/EidosWorkspace/documents/RANKING_SUMMARY.md'" in html4
+    assert ">Ranking Summary</a>" in html4
+
+    # Autolink raw portfolio path
+    text5 = "Generated file portfolios/item_275.md for review."
+    html5 = markdown_to_chat_html(text5)
+    assert "<a href='portfolios/item_275.md'" in html5
+
+    # Markdown link where label is the URL (must not create nested <a> tags)
+    text6 = "Visit [https://example.com](https://example.com) now."
+    html6 = markdown_to_chat_html(text6)
+    assert "<a href='https://example.com'" in html6
+    assert "<a href='https://example.com'><a href" not in html6
+
+
+def test_message_bubble_link_activation(qapp, monkeypatch):
+    """Test that clicking on links in MessageBubble emits signal_link_clicked and invokes open_chat_link."""
+    opened_links = []
+    monkeypatch.setattr("eidos.ui.chat.open_chat_link", lambda url, workspace_dir=None: opened_links.append(url) or True)
+
+    bubble = MessageBubble(
+        role="assistant",
+        content="Review [Portfolio](portfolios/item_114.md) or https://patents.google.com",
+    )
+    assert not bubble.content_label.openExternalLinks()
+
+    signals_received = []
+    bubble.signal_link_clicked.connect(signals_received.append)
+
+    # Simulate link activation signal from QLabel
+    bubble.content_label.linkActivated.emit("portfolios/item_114.md")
+    assert "portfolios/item_114.md" in signals_received
+    assert "portfolios/item_114.md" in opened_links
+
+    bubble.content_label.linkActivated.emit("https://patents.google.com")
+    assert "https://patents.google.com" in signals_received
+    assert "https://patents.google.com" in opened_links
+
+    bubble.close()
+
+
+def test_chat_history_widget_link_clicked_forwarding(qapp, monkeypatch):
+    """Verify ChatHistoryWidget forwards signal_link_clicked from nested MessageBubbles."""
+    monkeypatch.setattr("eidos.ui.chat.open_chat_link", lambda url, workspace_dir=None: True)
+
+    chat = ChatHistoryWidget()
+    received = []
+    chat.signal_link_clicked.connect(received.append)
+
+    bubble = chat.add_message(role="assistant", content="See [Link](https://eidos.ai)")
+    bubble.content_label.linkActivated.emit("https://eidos.ai")
+
+    assert "https://eidos.ai" in received
+    chat.close()
+
+
+def test_resolve_local_file_path(tmp_path):
+    """Verify local file resolution against workspace and nested directories."""
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    portfolios_dir = ws / "documents" / "analysis_phase_1" / "portfolios"
+    portfolios_dir.mkdir(parents=True)
+    target_file = portfolios_dir / "item_114.md"
+    target_file.write_text("# Item 114")
+
+    # Relative path matching
+    resolved = _resolve_local_file_path("portfolios/item_114.md", workspace_dir=str(ws))
+    assert resolved == str(target_file.resolve())
+
+    # Direct filename matching
+    resolved_name = _resolve_local_file_path("item_114.md", workspace_dir=str(ws))
+    assert resolved_name == str(target_file.resolve())
+
+    # Absolute path directly on disk
+    resolved_abs = _resolve_local_file_path(str(target_file.resolve()), workspace_dir=str(ws))
+    assert resolved_abs == str(target_file.resolve())
+
 
 def test_message_bubble_tool_links(qapp):
     bubble = MessageBubble(
@@ -846,37 +939,42 @@ def test_status_pill_workspace_button(qapp):
 
 
 def test_message_bubble_copy_all_roles(qapp):
-    clipboard = QApplication.clipboard()
+    copied = []
 
     # User bubble
     user_bubble = MessageBubble(role="user", content="User prompt to copy")
+    user_bubble.signal_copy_clicked.connect(copied.append)
     assert user_bubble.btn_copy is not None
     user_bubble.btn_copy.click()
-    assert clipboard.text() == "User prompt to copy"
+    assert copied[-1] == "User prompt to copy"
 
     # Assistant bubble
     asst_bubble = MessageBubble(role="assistant", content="Assistant reply to copy")
+    asst_bubble.signal_copy_clicked.connect(copied.append)
     assert asst_bubble.btn_copy is not None
     asst_bubble.btn_copy.click()
-    assert clipboard.text() == "Assistant reply to copy"
+    assert copied[-1] == "Assistant reply to copy"
 
     # Tool bubble
     tool_bubble = MessageBubble(role="tool", content="Tool result: status ok")
+    tool_bubble.signal_copy_clicked.connect(copied.append)
     assert tool_bubble.btn_copy is not None
     tool_bubble.btn_copy.click()
-    assert clipboard.text() == "Tool result: status ok"
+    assert copied[-1] == "Tool result: status ok"
 
     # Thought bubble
     thought_bubble = MessageBubble(role="thought", content="Thought reasoning to copy")
+    thought_bubble.signal_copy_clicked.connect(copied.append)
     assert thought_bubble.btn_copy is not None
     thought_bubble.btn_copy.click()
-    assert clipboard.text() == "Thought reasoning to copy"
+    assert copied[-1] == "Thought reasoning to copy"
 
     # Error bubble
     err_bubble = MessageBubble(role="error", content="Error output to copy")
+    err_bubble.signal_copy_clicked.connect(copied.append)
     assert err_bubble.btn_copy is not None
     err_bubble.btn_copy.click()
-    assert clipboard.text() == "Error output to copy"
+    assert copied[-1] == "Error output to copy"
 
     user_bubble.close()
     asst_bubble.close()

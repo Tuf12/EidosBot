@@ -8,11 +8,11 @@ import {
   WifiOff,
   Eye,
   EyeOff,
-  Volume2,
-  VolumeX,
   RefreshCw,
   Plus,
   History,
+  PhoneOff,
+  Square,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -23,11 +23,12 @@ interface HeaderProps {
   token: string;
   conversationTitle?: string;
   isSyncing?: boolean;
+  isThinking?: boolean;
+  isPlaying?: boolean;
+  onStopCallOrTask?: () => void;
   onRefreshSync?: () => void;
   onNewChat?: () => void;
   onOpenConversations?: () => void;
-  autoSpeak?: boolean;
-  onToggleAutoSpeak?: () => void;
   onSetToken: (token: string) => void;
   onKill: () => void;
   onReset: () => void;
@@ -41,11 +42,12 @@ export const Header: React.FC<HeaderProps> = ({
   token,
   conversationTitle = 'New Chat',
   isSyncing = false,
+  isThinking = false,
+  isPlaying = false,
+  onStopCallOrTask,
   onRefreshSync,
   onNewChat,
   onOpenConversations,
-  autoSpeak = false,
-  onToggleAutoSpeak,
   onSetToken,
   onKill,
   onReset,
@@ -125,7 +127,7 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Right: Actions (New Chat, Sync/Refresh, Past Chats, Audio, Auth, Kill) */}
+        {/* Right: Actions (New Chat, Sync/Refresh, Past Chats, Auth, Kill) */}
         <div className="flex items-center gap-1.5 shrink-0">
           {/* New Chat Button */}
           {onNewChat && (
@@ -167,21 +169,6 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {/* Auto-Read responses toggle */}
-          {onToggleAutoSpeak && (
-            <button
-              onClick={onToggleAutoSpeak}
-              title={autoSpeak ? 'Auto-read aloud ON (Kokoro TTS)' : 'Auto-read aloud OFF'}
-              className={`p-1.5 sm:p-2 rounded-lg border transition active:scale-95 ${
-                autoSpeak
-                  ? 'bg-[#50fa7b]/20 border-[#50fa7b] text-[#50fa7b]'
-                  : 'bg-[#282a36] border-[#44475a] text-[#6272a4] hover:text-[#f8f8f2]'
-              }`}
-            >
-              {autoSpeak ? <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" /> : <VolumeX className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
-            </button>
-          )}
-
           {/* Key / Auth Button */}
           <button
             onClick={() => {
@@ -193,6 +180,18 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <Key className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
+
+          {/* Quick End Call / Stop Button (Active when speaking or thinking) */}
+          {(isThinking || isPlaying) && onStopCallOrTask && !isKilled && (
+            <button
+              onClick={onStopCallOrTask}
+              title={isPlaying ? 'End Call / Stop Speech Playback' : 'Stop active task / Cancel'}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition shadow-[0_0_12px_rgba(255,85,85,0.5)] animate-pulse active:scale-95"
+            >
+              {isPlaying ? <PhoneOff className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5 fill-current" />}
+              <span className="hidden xs:inline sm:inline">{isPlaying ? 'End Call' : 'Stop'}</span>
+            </button>
+          )}
 
           {/* Connection status indicator */}
           <div
@@ -210,6 +209,7 @@ export const Header: React.FC<HeaderProps> = ({
           {isKilled ? (
             <button
               onClick={onReset}
+              title="Reset Emergency Stop"
               className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#ffb86c]/20 border border-[#ffb86c] text-[#ffb86c] font-bold text-xs hover:bg-[#ffb86c]/30 transition active:scale-95"
             >
               🔄 Reset
@@ -217,6 +217,7 @@ export const Header: React.FC<HeaderProps> = ({
           ) : (
             <button
               onClick={onKill}
+              title="Emergency Kill Switch (Immediately halts all processing, audio, and tasks)"
               className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition shadow-[0_0_12px_rgba(255,85,85,0.4)] active:scale-95"
             >
               <ShieldAlert className="w-3.5 h-3.5" />
