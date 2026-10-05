@@ -18,7 +18,10 @@ class AuditLogger:
             self.file_path = Path(os.path.expanduser("~/.eidos/audit.log"))
 
         self._lock = threading.Lock()
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
 
     def log(
         self,
@@ -44,5 +47,8 @@ class AuditLogger:
 
         line = json.dumps(record) + "\n"
         with self._lock:
-            with open(self.file_path, "a", encoding="utf-8") as f:
-                f.write(line)
+            try:
+                with open(self.file_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                pass

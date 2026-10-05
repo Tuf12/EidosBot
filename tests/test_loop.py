@@ -403,3 +403,60 @@ def test_agent_loop_tool_exception_recovery():
         assert res["success"] is True
         assert res["summary"] == "Handled tool error gracefully."
 
+
+def test_unfinished_attempt_is_remembered_for_the_next_turn():
+    """A step-limit stop must leave thinking and actions in the next model context."""
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+
+        class RepeatingToolModel(BaseModelClient):
+            def __init__(self):
+                self.calls = []
+
+            def chat(self, messages, tools=None, model_override=None):
+                self.calls.append(list(messages))
+                return ModelResponse(
+                    content="I should inspect the active window before continuing.",
+                    thinking="The window title will tell me where I am.",
+                    tool_calls=[ToolCall(name="get_active_window", arguments={})],
+                )
+
+            def vision_chat(self, prompt, image_base64, system_prompt=None, model_override=None):
+                return ModelResponse(content="")
+
+        mock_model = RepeatingToolModel()
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+            config={"agent": {"max_steps": 50}, "memory": {"conversations_db_path": ":memory:"}},
+        )
+        assert agent._resolve_max_steps(None) == 50
+
+        thoughts = []
+        agent.register_callback("on_thought", lambda text: thoughts.append(text))
+
+        res = agent.run_task("Open the notes and summarize them", max_steps=2)
+        assert res["success"] is False
+        assert "step limit (2)" in res["summary"]
+        assert "get_active_window" in res["detail"]
+        assert "window title" in res["detail"].lower()
+        assert any("window title" in text.lower() or "active window" in text.lower() for text in thoughts)
+
+        assistant_turns = [msg for msg in agent.conversation_history if msg["role"] == "assistant"]
+        assert len(assistant_turns) == 1
+        assert "get_active_window" in assistant_turns[0]["content"]
+        assert "Continue from the progress below" in assistant_turns[0]["content"]
+
+        stored = agent.conversation_store.get_messages(agent.active_conversation_id)
+        assistant_stored = [msg for msg in stored if str(msg["role"]).lower() == "assistant"]
+        assert assistant_stored
+        assert "Actions already taken:" in assistant_stored[-1]["content"]
+
+        res2 = agent.run_task("Continue that", max_steps=1)
+        followup = mock_model.calls[-1]
+        assistant_context = [msg["content"] for msg in followup if msg["role"] == "assistant"]
+        assert any("get_active_window" in content for content in assistant_context)
+

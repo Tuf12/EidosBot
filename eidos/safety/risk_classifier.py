@@ -78,7 +78,7 @@ class RiskClassifier:
             "read_clipboard", "read_file", "list_directory",
             "web_search", "web_fetch", "speak", "speak_aloud",
             "browser_open", "browser_extract", "browser_screenshot", "browser_close",
-            "list_skills", "load_skill", "get_job_status", "share_file",
+            "list_skills", "load_skill", "close_skill", "get_job_status", "share_file",
             "optimalx_search_notes", "optimalx_read_note", "optimalx_list_folders",
             "optimalx_read_notex_doc", "optimalx_list_notex_docs", "optimalx_list_pending_reviews",
         ):

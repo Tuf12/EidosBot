@@ -22,11 +22,19 @@ export interface SharedFile {
   missing?: boolean;
 }
 
+export interface ChatAction {
+  tool: string;
+  arguments?: string;
+  result?: string;
+  pending?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   thoughts?: string[];
+  actions?: ChatAction[];
   timestamp: number;
   streaming?: boolean;
   isHistorical?: boolean;
@@ -49,7 +57,11 @@ export interface InboundWSEvent {
   chunk?: string;
   is_thought?: boolean;
   summary?: string;
+  detail?: string;
+  headline?: string;
   success?: boolean;
+  thoughts?: string[];
+  actions?: Array<{ tool?: string; arguments?: any; result?: any; pending?: boolean }>;
   confirmations?: ConfirmationRecord[];
   id?: string;
   action_type?: string;

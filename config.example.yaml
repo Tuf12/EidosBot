@@ -1,6 +1,9 @@
 # EidosBot System Configuration Template
 # Copy to config.yaml and customize for your local setup
 
+agent:
+  max_steps: 50                  # Sense/act cycles per task. Desktop work needs more than a short reply.
+
 models:
   provider_preference: "local"     # Options: "local", "cloud", "auto"
   

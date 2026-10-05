@@ -382,6 +382,39 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 
 ---
 
+### Phase 12: Dynamic Tool Scoping & Lean System Prompt Architecture
+**Goal:** Replace the monolithic 1,050-line system prompt and 49-tool global catalog with a minimal ~120-line base kernel and just-in-time (JIT) tool scoping via living `SKILL.md` documents, reducing token overhead by ~90%, preventing the 15-hop budget from being starved, and eliminating attention dilution/OptimalX hallucination biases.
+
+*(See full specification in [`docs/SKILLS_AND_JOBS.md`](SKILLS_AND_JOBS.md))*
+
+#### Deliverables & Tasks:
+1. [x] **Decoupled Tool Registry (`eidos/core/tool_registry.py`):**
+   - Partition global tool catalog into `BASE_TOOLS` (6 universal tools: `execute_shell`, `load_skill`, `close_skill`, `get_current_time`, `finish_task`, `share_file`) and `SPECIALIZED_TOOLS` (on-demand functions). `share_file` stays in the base set so the web app, including a phone, can receive files without loading a skill.
+   - Purge redundant deadweight tools (`optimalx_reject_pending_review`, `optimalx_accept_pending_review`, `optimalx_list_pending_reviews`).
+2. [x] **Built-in System Skills Catalog (`eidos/skills/builtin/`):**
+   - Package specialized toolsets into self-contained skills with `tools_required: [...]` frontmatter:
+     - `desktop-gui`: Screen capture, visual grounding, mouse/keyboard injection.
+     - `browser-automation`: Headless Playwright, DOM extraction, SPA interactions.
+     - `optimalx`: Notes, search, folders, NoteX doc reader, and safe writes.
+     - `batch-runner`: Queue initialization, stepping, status checks, and summaries.
+     - `web-research`: Search, fetch, download, and desktop browser launching.
+     - `user-memory`: User profile facts and workflow rules.
+     - `skills-manager`: Authoring and updating custom `SKILL.md` procedures.
+3. [x] **Lean Base System Prompt (`eidos/core/context.py`):**
+   - Shrink prompt from ~1,050 lines to ~50 lines.
+   - Eliminate all domain-specific instruction bloat (including Principle 15 OptimalX bias and coordinate math lectures).
+   - Retain only core environment snapshot, episodic/profile blocks, and universal behavioral principles.
+4. [x] **Active Skill Scope Engine (`eidos/core/loop.py`):**
+   - Maintain `active_skill` state across loop steps.
+   - Assemble model payload dynamically on each step (`BASE_TOOLS + active_skill.tools`).
+   - Append active `SKILL.md` procedure to system prompt while active; drop both upon `close_skill()` or `finish_task()`.
+5. [x] **Hop Budget & Shell Determinism Protection:**
+   - Reinforce shell-first scripting via `execute_shell` for multi-step data tasks to finish deterministically.
+6. [x] **Regression & Safety Verification:**
+   - Add unit tests (`tests/test_tool_registry.py`, `tests/test_skills.py`, `tests/test_context.py`, `tests/test_dynamic_scoping.py`) with zero system overload and isolated test execution.
+
+---
+
 ## 🚦 Recommended Next Steps
 
 With the core subsystems, processor, background batch runner, and ranking leaderboard generator fully deployed and verified, the status of the pipeline milestones is:

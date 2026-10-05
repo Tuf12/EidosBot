@@ -50,11 +50,16 @@ class BubblewrapSandbox:
 
     @classmethod
     def is_available(cls, bwrap_bin: Optional[str] = None) -> bool:
-        """Check if bubblewrap (bwrap) executable is installed and runnable."""
+        """Check if bubblewrap (bwrap) executable is installed and runnable in current environment."""
         path = bwrap_bin or shutil.which("bwrap")
-        if not path:
+        if not path or not os.path.exists(path) or not os.access(path, os.X_OK):
             return False
-        return os.path.exists(path) and os.access(path, os.X_OK)
+        # Verify kernel user namespaces are permitted (e.g. not blocked inside containers/sandboxes)
+        try:
+            res = subprocess.run([path, "--ro-bind", "/", "/", "true"], capture_output=True, timeout=2)
+            return res.returncode == 0
+        except Exception:
+            return False
 
     def build_command(self, user_command: str, cwd: Optional[str] = None) -> List[str]:
         """Construct the bwrap execution argument vector."""

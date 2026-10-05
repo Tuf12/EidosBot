@@ -192,7 +192,7 @@ def run_cli_mode(
     cfg: dict,
     kill_switch: KillSwitch,
     prompt_args: list,
-    max_steps: int,
+    max_steps: Optional[int],
     start_gateway: bool = False,
     start_telegram: bool = False,
 ):
@@ -444,7 +444,12 @@ def cli_entrypoint():
     parser = argparse.ArgumentParser(description="EidosBot OS-Level Autonomous Desktop Agent")
     parser.add_argument("prompt", nargs="*", help="Goal or prompt for EidosBot (optional)")
     parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
-    parser.add_argument("--steps", type=int, default=15, help="Maximum cycle steps per task")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Maximum cycle steps per task (default: agent.max_steps, or 50)",
+    )
     parser.add_argument("--gui", action="store_true", help="Launch PyQt6 Desktop HUD and Floating Pill")
     parser.add_argument("--cli", action="store_true", help="Force headless CLI mode")
     parser.add_argument("--gateway", "--with-gateway", dest="gateway", action="store_true", help="Start remote mobile gateway server")

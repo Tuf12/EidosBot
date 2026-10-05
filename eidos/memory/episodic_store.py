@@ -618,7 +618,7 @@ class EpisodicStore:
         task_goal: str,
         top_k_success: int = 1,
         top_k_pitfall: int = 1,
-        min_similarity: float = 0.25,
+        min_similarity: float = 0.15,
     ) -> str:
         """Retrieve top golden path success and cautionary pitfall for macro context injection."""
         if not task_goal.strip():

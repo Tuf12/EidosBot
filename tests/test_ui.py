@@ -758,6 +758,28 @@ def test_status_pill_conversation_header_and_loading(qapp):
     assert pill.chat_history.message_count == 2
     assert "Star Wars Chat" in pill.lbl_conv_title.text()
 
+    failed_turn = {
+        "role": "ASSISTANT",
+        "content": (
+            "Reached the step limit (50) before the task was finished.\n\n"
+            "Reasoning:\n1. Look at the portfolio note.\n\n"
+            "Actions already taken:\n1. execute_shell {} → ok"
+        ),
+        "metadata": {
+            "headline": "Reached the step limit (50) before the task was finished.",
+            "outcome": "max_steps",
+            "thoughts": ["Look at the portfolio note."],
+            "actions": [{"tool": "execute_shell", "arguments": "{}", "result": "ok"}],
+        },
+    }
+    pill.load_conversation_messages("conv_fail", "Failed Turn", [failed_turn])
+    roles = [bubble.role for bubble in pill.chat_history.bubbles]
+    assert roles == ["thought", "tool", "error"]
+    assert "portfolio note" in pill.chat_history.bubbles[0].raw_content
+    assert pill.chat_history.bubbles[1].title == "execute_shell"
+    assert "step limit" in pill.chat_history.bubbles[2].raw_content
+    assert "Actions already taken" not in pill.chat_history.bubbles[2].raw_content
+
     pill.close()
 
 
@@ -924,6 +946,65 @@ def test_message_bubble_tool_links(qapp):
     )
     assert "<a href='https://patents.google.com/patent/US20140216326'" in bubble.content_label.text()
     bubble.close()
+
+
+def test_tool_json_path_link_stops_before_escaped_newline(qapp):
+    """JSON tool dumps encode newlines as \\n. That tail must not become part of the href."""
+    import json
+
+    command = (
+        "cat << 'EOF' > /home/tuf/EidosWorkspace/documents/analysis_phase_1/portfolios/item_166.md\n"
+        "# Invention Analysis\n"
+    )
+    content = "Calling:\n" + json.dumps({"command": command}, indent=2)
+    bubble = MessageBubble(role="tool", content=content, title="execute_shell")
+    html_text = bubble.content_label.text()
+    assert "<a href='/home/tuf/EidosWorkspace/documents/analysis_phase_1/portfolios/item_166.md'" in html_text
+    assert "item_166.md\\n#" not in html_text
+    assert "href='/home/tuf/EidosWorkspace/documents/analysis_phase_1/portfolios/item_166.md\\n" not in html_text
+    bubble.close()
+
+
+def test_chat_bubbles_fit_inside_history(qapp):
+    """Long paths and tool output must not push bubbles past the chat viewport."""
+    import json
+
+    chat = ChatHistoryWidget()
+    chat.resize(480, 460)
+    chat.show()
+    path = "/home/tuf/EidosWorkspace/" + ("documents/" * 12) + "item_166.md"
+    command = "echo " + ("A" * 500) + " > " + path
+    chat.add_message("assistant", f"Wrote `{path}` now.")
+    chat.add_message("tool", "Calling:\n" + json.dumps({"command": command}), title="execute_shell")
+    chat.add_message("user", "fit inside the chat")
+    qapp.processEvents()
+
+    viewport_width = chat.viewport().width()
+    assert viewport_width > 0
+    assert chat.container.width() <= viewport_width
+    for bubble in chat.bubbles:
+        assert bubble.geometry().right() <= viewport_width
+        assert bubble.content_label.width() <= bubble.contentsRect().width()
+        if bubble.btn_delete is not None:
+            delete_right = bubble.btn_delete.mapTo(chat.viewport(), bubble.btn_delete.rect().topRight())
+            assert delete_right.x() <= viewport_width
+    chat.close()
+
+
+def test_inline_code_path_is_clickable():
+    text = "Overwritten `/home/tuf/EidosWorkspace/documents/analysis_phase_1/portfolios/item_166.md` on disk."
+    html_out = markdown_to_chat_html(text)
+    assert 'href="/home/tuf/EidosWorkspace/documents/analysis_phase_1/portfolios/item_166.md"' in html_out
+    assert "<code" in html_out
+
+
+def test_open_chat_link_strips_json_newline_tail(tmp_path, monkeypatch):
+    target = tmp_path / "item_166.md"
+    target.write_text("# item")
+    opened = []
+    monkeypatch.setattr("eidos.ui.chat._launch_local_file", lambda path: opened.append(path) or True)
+    assert open_chat_link(f"{target}\\n#") is True
+    assert opened == [str(target.resolve())]
 
 
 def test_status_pill_workspace_button(qapp):

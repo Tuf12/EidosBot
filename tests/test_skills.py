@@ -37,7 +37,7 @@ def test_parse_frontmatter_missing():
 
 def test_skill_manager_lifecycle():
     with tempfile.TemporaryDirectory() as global_dir, tempfile.TemporaryDirectory() as proj_dir:
-        manager = SkillManager(skills_dir=global_dir, project_skills_dir=proj_dir)
+        manager = SkillManager(skills_dir=global_dir, project_skills_dir=proj_dir, include_builtin=False)
 
         # 1. Initially empty
         assert len(manager.list_skills()) == 0
@@ -87,7 +87,7 @@ Inspect logs for 401 and 500 status codes.
 
 def test_skill_manager_project_override():
     with tempfile.TemporaryDirectory() as global_dir, tempfile.TemporaryDirectory() as proj_dir:
-        manager = SkillManager(skills_dir=global_dir, project_skills_dir=proj_dir)
+        manager = SkillManager(skills_dir=global_dir, project_skills_dir=proj_dir, include_builtin=False)
 
         # Global version of doc-gen
         manager.create_skill(
@@ -111,6 +111,76 @@ def test_skill_manager_project_override():
         loaded = manager.load_skill("doc-gen")
         assert loaded["scope"] == "project"
         assert "# Project" in loaded["body"]
+
+
+def test_builtin_skills_discovery():
+    """Verify all 7 system built-in skills are discovered with tools_required."""
+    from eidos.core.tool_registry import ToolRegistry
+
+    manager = SkillManager(skills_dir="/tmp/nonexistent_skills_dir", project_skills_dir="/tmp/nonexistent_proj_dir")
+    skills = manager.list_skills()
+
+    expected_builtins = {
+        "desktop-gui",
+        "browser-automation",
+        "optimalx",
+        "batch-runner",
+        "web-research",
+        "user-memory",
+        "skills-manager",
+    }
+    discovered_names = {s["name"] for s in skills}
+    assert expected_builtins.issubset(discovered_names)
+
+    # Verify each builtin skill has valid tools_required registered in ToolRegistry
+    valid_tool_names = set(ToolRegistry.list_specialized_tool_names()) | {
+        t["function"]["name"] for t in ToolRegistry.BASE_TOOLS
+    }
+
+    for skill_name in expected_builtins:
+        loaded = manager.load_skill(skill_name)
+        assert loaded is not None, f"Failed to load builtin skill {skill_name}"
+        assert loaded["scope"] == "builtin"
+        assert len(loaded["tools_required"]) > 0, f"Skill {skill_name} has empty tools_required"
+        for tool_name in loaded["tools_required"]:
+            assert tool_name in valid_tool_names, f"Tool {tool_name} in {skill_name} not found in ToolRegistry"
+
+
+def test_builtin_skill_deletion_protection():
+    """Verify built-in system skills cannot be deleted."""
+    manager = SkillManager()
+    del_res = manager.delete_skill("desktop-gui")
+    assert del_res["success"] is False
+    assert "Cannot delete built-in system skill" in del_res["error"]
+
+    # Verify skill still exists and loads
+    loaded = manager.load_skill("desktop-gui")
+    assert loaded is not None
+
+
+def test_project_overrides_builtin_skill():
+    """Verify project-level skill can override a built-in skill of the same name."""
+    with tempfile.TemporaryDirectory() as global_dir, tempfile.TemporaryDirectory() as proj_dir:
+        manager = SkillManager(skills_dir=global_dir, project_skills_dir=proj_dir)
+
+        # Override desktop-gui at project level
+        custom_content = (
+            "---\n"
+            "name: desktop-gui\n"
+            "version: 2.0.0\n"
+            "description: Custom project GUI procedure\n"
+            "tools_required: [take_screenshot]\n"
+            "---\n"
+            "# Custom GUI Procedure\n"
+        )
+        create_res = manager.create_skill("desktop-gui", custom_content, scope="project")
+        assert create_res["success"] is True
+
+        loaded = manager.load_skill("desktop-gui")
+        assert loaded is not None
+        assert loaded["scope"] == "project"
+        assert loaded["metadata"]["version"] == "2.0.0"
+        assert loaded["tools_required"] == ["take_screenshot"]
 
 
 def test_invention_evaluator_skill_accessible():

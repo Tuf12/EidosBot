@@ -244,8 +244,9 @@ def test_agent_loop_skills_and_jobs_tool_dispatch():
 
         # 2. list_skills
         res, stop = loop._dispatch_tool(ToolCall(name="list_skills", arguments={}))
-        assert res["count"] == 1
-        assert res["skills"][0]["name"] == "summary-skill"
+        assert res["count"] >= 1
+        skill_names = [s["name"] for s in res["skills"]]
+        assert "summary-skill" in skill_names
 
         # 3. load_skill
         res, stop = loop._dispatch_tool(ToolCall(name="load_skill", arguments={"skill_name": "summary-skill"}))

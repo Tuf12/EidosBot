@@ -166,6 +166,50 @@ def _resolve_local_file_path(target: str, workspace_dir: Optional[str] = None) -
     return None
 
 
+# Autolink http(s), file://, absolute paths, and portfolio markdown refs.
+# Backslash is excluded so JSON tool dumps (path.md\n# Heading) do not
+# swallow the escaped newline into the href.
+_CHAT_AUTOLINK_RE = re.compile(
+    r'(?<![\w\'"])('
+    r'(?:https?://|file://)[^\s<"\'\)\\]+?'
+    r'|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)\\]+?\.[A-Za-z0-9]+'
+    r'|portfolios/[A-Za-z0-9_\-]+\.md'
+    r')([\.,;]?(?=\s|$|<|\'|"|\\))'
+)
+
+_INLINE_LINK_RE = re.compile(
+    r'^(?:https?://\S+|file://\S+|www\.\S+|/(?:home|tmp|usr|opt|var)/\S+|~/\S+|portfolios/[A-Za-z0-9_\-]+\.md)$'
+)
+
+
+def _clean_chat_link_target(url: str) -> str:
+    """Drop JSON escape tails and hash fragments that are not part of a local path."""
+    clean = (url or "").strip().strip("'\"")
+    for token in ("\\r\\n", "\\n", "\\r", "\\t"):
+        idx = clean.find(token)
+        if idx != -1:
+            clean = clean[:idx]
+    clean = clean.strip().strip("'\"")
+    if not clean.startswith(("http://", "https://", "www.")):
+        if "#" in clean:
+            clean = clean.split("#", 1)[0].strip()
+    return clean
+
+
+def linkify_escaped_text(text: str, color: str = "#8be9fd") -> str:
+    """Wrap already-escaped URLs and file paths in anchor tags."""
+
+    def repl(match: re.Match) -> str:
+        url = match.group(1)
+        trailing = match.group(2) or ""
+        return (
+            f"<a href='{url}' style='color: {color}; text-decoration: underline;'>"
+            f"{url}</a>{trailing}"
+        )
+
+    return _CHAT_AUTOLINK_RE.sub(repl, text)
+
+
 def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
     """
     Robust desktop opener for in-chat links.
@@ -174,7 +218,7 @@ def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
     - Local file paths (absolute /home/..., relative portfolios/item_114.md, ~)
     - File URLs (file://...)
     """
-    clean = (url or "").strip().strip("'\"")
+    clean = _clean_chat_link_target(url)
     if not clean:
         return False
 
@@ -248,12 +292,23 @@ def markdown_to_chat_html(text: str) -> str:
 
     def replace_inline_code(match):
         code = match.group(1)
+        target = code.strip()
+        linkable = bool(_INLINE_LINK_RE.match(target))
         escaped = html.escape(code, quote=False)
-        idx = len(inline_codes)
-        inline_codes.append(
-            f"<code style='background-color: #14151b; color: #ff79c6; border-radius: 3px; "
-            f"padding: 1px 4px; font-family: monospace; font-size: 12px;'>{escaped}</code>"
+        color = "#8be9fd" if linkable else "#ff79c6"
+        deco = " text-decoration: underline;" if linkable else ""
+        inner = (
+            f"<code style='background-color: #14151b; color: {color}; border-radius: 3px; "
+            f"padding: 1px 4px; font-family: monospace; font-size: 12px;{deco}'>{escaped}</code>"
         )
+        if linkable:
+            href = html.escape(target, quote=True)
+            inner = (
+                f"<a href=\"{href}\" style='color: #8be9fd; text-decoration: underline; font-weight: bold;'>"
+                f"{inner}</a>"
+            )
+        idx = len(inline_codes)
+        inline_codes.append(inner)
         return f"___INLINE_{idx}___"
 
     text = re.sub(r"`([^`\n]+)`", replace_inline_code, text)
@@ -283,27 +338,7 @@ def markdown_to_chat_html(text: str) -> str:
     text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_md_link, text)
 
     # 6. Autolink raw URLs and known local file references (not inside tags or existing links)
-    def replace_raw_url(match):
-        url = match.group(1)
-        trailing = match.group(2) or ""
-        return (
-            f"<a href='{url}' style='color: #8be9fd; text-decoration: underline;'>"
-            f"{url}</a>{trailing}"
-        )
-
-    # Autolink web and file protocol URLs
-    text = re.sub(
-        r'(?<![\w\'"])((?:https?://|file://)[^\s<"\'\)]+?)([\.,;]?(?=\s|$|<|\'|"))',
-        replace_raw_url,
-        text,
-    )
-
-    # Autolink local paths and generated portfolio references
-    text = re.sub(
-        r'(?<![\w\'"])((?:/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md))([\.,;]?(?=\s|$|<|\'|"))',
-        replace_raw_url,
-        text,
-    )
+    text = linkify_escaped_text(text)
 
     # 7. Headings
     text = re.sub(
@@ -371,6 +406,62 @@ def markdown_to_chat_html(text: str) -> str:
     return out
 
 
+def soften_long_tokens(markup: str, limit: int = 48) -> str:
+    """Insert wrap points into long tokens so chat text stays inside the bubble.
+
+    Markup tags, including href attributes, are left unchanged.
+    """
+
+    def break_token(token: str) -> str:
+        if len(token) < limit:
+            return token
+        token = re.sub(r"([/\\_.\-:&#])", "\\1\u200b", token)
+        pieces = []
+        for piece in token.split("\u200b"):
+            if len(piece) <= 24:
+                pieces.append(piece)
+            else:
+                pieces.append("\u200b".join(piece[i:i + 24] for i in range(0, len(piece), 24)))
+        return "\u200b".join(pieces)
+
+    def soften_text(text: str) -> str:
+        return re.sub(r"\S+", lambda match: break_token(match.group(0)), text)
+
+    parts = re.split(r"(<[^>]+>)", markup)
+    return "".join(part if part.startswith("<") else soften_text(part) for part in parts)
+
+
+class ChatContentLabel(QLabel):
+    """Word-wrapped message text that cannot force the chat panel wider."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWordWrap(True)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return super().heightForWidth(max(40, width))
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+    def sizeHint(self) -> QSize:
+        width = self.width() if self.width() > 40 else 280
+        height = self.heightForWidth(width)
+        if height < 1:
+            height = super().sizeHint().height()
+        return QSize(0, height)
+
+
 class ChatEditArea(QPlainTextEdit):
     """Text area for inline editing of chat messages with keyboard shortcuts."""
     signal_save = pyqtSignal()
@@ -418,6 +509,8 @@ class MessageBubble(QFrame):
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.role = role.lower()
         self.raw_content = content
         self.title = title
@@ -559,37 +652,23 @@ class MessageBubble(QFrame):
         layout.addLayout(header_layout)
 
         # Message Content Label
-        self.content_label = QLabel()
-        self.content_label.setWordWrap(True)
-        self.content_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-            | Qt.TextInteractionFlag.LinksAccessibleByMouse
-        )
+        self.content_label = ChatContentLabel()
         self.content_label.setOpenExternalLinks(False)
         self.content_label.linkActivated.connect(self._handle_link_clicked)
         self.content_label.linkHovered.connect(self._handle_link_hovered)
 
         if self.role == "thought":
             self.content_label.setStyleSheet("color: #e0e0e0; font-size: 12px; font-style: italic;")
-            self.content_label.setText(self.raw_content)
+            self._show_content(self.raw_content, rich=False)
         elif self.role == "tool":
             self.content_label.setStyleSheet("color: #f8f8f2; font-family: monospace; font-size: 11px;")
-            escaped = html.escape(self.raw_content, quote=False)
-            tool_pat = r'(?<![\w\'"])((?:https?://|file://|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md)[^\s<"\'\)]*?)([\.,;]?(?=\s|$|<|\'|"))'
-            escaped_with_links = re.sub(
-                tool_pat,
-                r"<a href='\1' style='color: #50fa7b; text-decoration: underline;'>\1</a>\2",
-                escaped,
-            )
-            escaped_with_links = escaped_with_links.replace("\n", "<br/>")
-            self.content_label.setText(escaped_with_links)
+            self._show_content(self._tool_markup(self.raw_content))
         elif self.role == "error":
             self.content_label.setStyleSheet("color: #ff5555; font-size: 12px;")
-            self.content_label.setText(self.raw_content)
+            self._show_content(self.raw_content, rich=False)
         else:
             self.content_label.setStyleSheet("color: #f8f8f2; font-size: 13px; line-height: 1.4;")
-            html_content = markdown_to_chat_html(self.raw_content)
-            self.content_label.setText(html_content)
+            self._show_content(markdown_to_chat_html(self.raw_content))
 
         layout.addWidget(self.content_label)
 
@@ -655,6 +734,24 @@ class MessageBubble(QFrame):
         self.edit_container.setVisible(False)
         self.content_label.setVisible(True)
 
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        return QSize(0, hint.height())
+
+    def _show_content(self, markup: str, *, rich: bool = True) -> None:
+        text = soften_long_tokens(markup or "")
+        if rich:
+            self.content_label.setTextFormat(Qt.TextFormat.RichText)
+        else:
+            # Reasoning and failure notes often contain "<...>" from the model.
+            # Rich text would treat those as tags and the bubble would render blank.
+            self.content_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.content_label.setText(text)
+
+    def _tool_markup(self, text: str) -> str:
+        escaped = html.escape(text, quote=False)
+        return linkify_escaped_text(escaped, color="#50fa7b").replace("\n", "<br/>")
+
     def _handle_link_clicked(self, url: str):
         """Handle link activation by user click, emit signal, and open in default app/browser."""
         logger.info("MessageBubble link clicked: %s", url)
@@ -675,18 +772,11 @@ class MessageBubble(QFrame):
             return
         self.raw_content = new_text
         if self.role in ("user", "assistant"):
-            self.content_label.setText(markdown_to_chat_html(new_text))
+            self._show_content(markdown_to_chat_html(new_text))
         elif self.role == "tool":
-            escaped = html.escape(new_text, quote=False)
-            tool_pat = r'(?<![\w\'"])((?:https?://|file://|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)]+?\.[a-zA-Z0-9]+|portfolios/[a-zA-Z0-9_\-]+\.md)[^\s<"\'\)]*?)([\.,;]?(?=\s|$|<|\'|"))'
-            escaped_with_links = re.sub(
-                tool_pat,
-                r"<a href='\1' style='color: #50fa7b; text-decoration: underline;'>\1</a>\2",
-                escaped,
-            )
-            self.content_label.setText(escaped_with_links.replace("\n", "<br/>"))
+            self._show_content(self._tool_markup(new_text))
         else:
-            self.content_label.setText(new_text)
+            self._show_content(new_text, rich=self.role not in ("thought", "error"))
         self.is_editing = False
         self.edit_container.setVisible(False)
         self.content_label.setVisible(True)
@@ -804,6 +894,8 @@ class ChatHistoryWidget(QScrollArea):
         )
 
         self.container = QWidget()
+        self.container.setMinimumWidth(0)
+        self.container.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.container.setStyleSheet("background-color: transparent;")
         self.layout_messages = QVBoxLayout(self.container)
         self.layout_messages.setContentsMargins(4, 4, 4, 4)
@@ -818,6 +910,15 @@ class ChatHistoryWidget(QScrollArea):
         self.layout_messages.addItem(self.spacer)
 
         self.setWidget(self.container)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_container_width()
+
+    def _fit_container_width(self) -> None:
+        width = self.viewport().width()
+        if width > 0:
+            self.container.setMaximumWidth(width)
 
     def _create_welcome_widget(self) -> QWidget:
         box = QFrame()
@@ -872,6 +973,7 @@ class ChatHistoryWidget(QScrollArea):
 
         self.bubbles.append(bubble)
         self.layout_messages.addWidget(bubble)
+        self._fit_container_width()
         self._message_count = len(self.bubbles)
 
         # Re-add bottom spacer

@@ -579,6 +579,37 @@ class RemoteGatewayServer:
             "pending_confirmations": len(self._pending_confirmations),
         })
 
+    @staticmethod
+    def _message_metadata(raw: Dict[str, Any]) -> Dict[str, Any]:
+        meta = raw.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        return meta if isinstance(meta, dict) else {}
+
+    @classmethod
+    def _public_chat_message(cls, raw: Dict[str, Any], index: int) -> Dict[str, Any]:
+        """Shape a stored turn for the web app, including a failed attempt's trace."""
+        meta = cls._message_metadata(raw)
+        message: Dict[str, Any] = {
+            "id": str(raw.get("id", f"msg_{index}")),
+            "role": str(raw.get("role") or "assistant").lower(),
+            "content": str(raw.get("content", "")),
+            "timestamp": int(raw.get("createdAt") or raw.get("timestamp") or time.time() * 1000),
+        }
+        headline = meta.get("headline")
+        if isinstance(headline, str) and headline.strip():
+            message["headline"] = headline.strip()
+        thoughts = meta.get("thoughts") or []
+        if isinstance(thoughts, list) and thoughts:
+            message["thoughts"] = [str(item) for item in thoughts if str(item).strip()]
+        actions = meta.get("actions") or []
+        if isinstance(actions, list) and actions:
+            message["actions"] = actions
+        return message
+
     def get_active_conversation_info(self) -> Tuple[Optional[str], str, List[Dict[str, Any]]]:
         """Return (conversation_id, title, messages_list) for current active conversation."""
         raw_conv_id = getattr(self.agent_loop, "active_conversation_id", None)
@@ -598,12 +629,7 @@ class RemoteGatewayServer:
                         if isinstance(rm, dict):
                             role = str(rm.get("role") or "").lower()
                             if role in ("user", "assistant"):
-                                messages.append({
-                                    "id": str(rm.get("id", f"msg_{len(messages)}")),
-                                    "role": role,
-                                    "content": str(rm.get("content", "")),
-                                    "timestamp": int(rm.get("createdAt") or time.time() * 1000),
-                                })
+                                messages.append(self._public_chat_message(rm, len(messages)))
             except Exception as e:
                 logger.debug("Error getting messages from conversation_store: %s", e)
 
@@ -1227,6 +1253,9 @@ class RemoteGatewayServer:
 
                 summary = res.get("summary", "Done") if isinstance(res, dict) else str(res)
                 success = res.get("success", True) if isinstance(res, dict) else True
+                detail = res.get("detail", summary) if isinstance(res, dict) else summary
+                thoughts = res.get("thoughts") if isinstance(res, dict) else None
+                actions = res.get("actions") if isinstance(res, dict) else None
 
                 is_killed = False
                 if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
@@ -1240,7 +1269,15 @@ class RemoteGatewayServer:
                     self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
 
                 self.broadcast_event("log", {"message": f"Task completed: {summary}"})
-                self.broadcast_event("task_finished", {"summary": summary, "success": success})
+                chat_text = detail if not success else summary
+                self.broadcast_event("task_finished", {
+                    "summary": chat_text,
+                    "detail": detail,
+                    "headline": summary,
+                    "success": success,
+                    "thoughts": thoughts or [],
+                    "actions": actions or [],
+                })
             except Exception as e:
                 is_killed = False
                 if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
@@ -1411,7 +1448,19 @@ class RemoteGatewayServer:
         self.broadcast_event("task_start", {"goal": goal})
 
     def _on_agent_task_finish(self, summary: str, success: bool):
-        self.broadcast_event("task_finished", {"summary": summary, "success": success})
+        trace = getattr(self.agent_loop, "last_turn_trace", None) or {}
+        if not isinstance(trace, dict):
+            trace = {}
+        detail = trace.get("detail") or summary
+        chat_text = detail if not success else summary
+        self.broadcast_event("task_finished", {
+            "summary": chat_text,
+            "detail": detail,
+            "headline": summary,
+            "success": success,
+            "thoughts": trace.get("thoughts") or [],
+            "actions": trace.get("actions") or [],
+        })
 
     def _on_conversation_title_changed(self, title: str):
         self.broadcast_event("conversation_title_changed", {"title": title})

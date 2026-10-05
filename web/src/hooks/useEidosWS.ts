@@ -1,6 +1,44 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AgentState, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
+import { AgentState, ChatAction, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
 
+/** Turn gateway tool events into the action chips shown on an assistant message. */
+function normalizeActions(raw: any): ChatAction[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((action) => ({
+    tool: String(action?.tool || action?.name || 'action'),
+    arguments:
+      action?.arguments == null
+        ? ''
+        : typeof action.arguments === 'string'
+        ? action.arguments
+        : JSON.stringify(action.arguments),
+    result: action?.result == null ? '' : String(action.result),
+    pending: Boolean(action?.pending),
+  }));
+}
+
+/**
+ * Map one stored turn into a chat message.
+ * A failed attempt already writes its reasoning and actions into the body, so those
+ * are not also attached as separate chips.
+ */
+function mapHistoryMessage(m: any, index: number): ChatMessage {
+  const content = m?.content || '';
+  const traceInBody = content.includes('Actions already taken:') || content.includes('\nReasoning:');
+  const thoughts = Array.isArray(m?.thoughts) ? m.thoughts.map((item: any) => String(item)).filter(Boolean) : [];
+  const actions = normalizeActions(m?.actions);
+  return {
+    id: m?.id || `hist_${index}_${m?.role || 'turn'}`,
+    role: m?.role || 'assistant',
+    content,
+    thoughts: traceInBody ? [] : thoughts,
+    actions: traceInBody ? [] : actions,
+    timestamp: m?.timestamp || Date.now(),
+    isHistorical: true,
+  };
+}
+
+/** Coerce a shared-file payload into the shape the file list renders. */
 function normalizeSharedFile(raw: any): SharedFile {
   return {
     id: String(raw?.id || ''),
@@ -16,6 +54,7 @@ function normalizeSharedFile(raw: any): SharedFile {
   };
 }
 
+/** Live gateway connection: chat, agent status, files, and safety confirmations. */
 export function useEidosWS() {
   const [token, setTokenState] = useState<string>(() => {
     const urlToken = new URLSearchParams(window.location.search).get('token');
@@ -49,16 +88,18 @@ export function useEidosWS() {
   const currentAssistantMsgIdRef = useRef<string | null>(null);
   const conversationIdRef = useRef<string | null>(null);
 
+  /** Save the gateway auth token and keep it for later visits. */
   const setToken = useCallback((newToken: string) => {
     localStorage.setItem('eidos_token', newToken);
     setTokenState(newToken);
   }, []);
 
+  /** Prepend a timestamped line to the on-screen activity log, keeping the latest 100. */
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...prev.slice(0, 99)]);
   }, []);
 
-  // Send JSON message over WebSocket or fallback to HTTP REST
+  /** Send a command over the socket, or the matching REST route when the socket is down. */
   const sendMessage = useCallback((msg: OutboundWSMessage) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
@@ -102,7 +143,7 @@ export function useEidosWS() {
     }
   }, [token, addLog]);
 
-  // Load chat history from backend on connect or manual sync
+  /** Replace the visible chat with the active conversation from the gateway. */
   const loadHistory = useCallback(async (force: boolean = false) => {
     if (!token) return;
     try {
@@ -127,11 +168,8 @@ export function useEidosWS() {
                 return prev;
               }
               const loaded: ChatMessage[] = data.messages.map((m: any, i: number) => ({
-                id: m.id || `hist_${i}_${m.role || 'turn'}`,
-                role: m.role || 'assistant',
-                content: m.content || '',
+                ...mapHistoryMessage(m, i),
                 timestamp: m.timestamp || Date.now() - (data.messages.length - i) * 1000,
-                isHistorical: true,
               }));
               return loaded;
             });
@@ -143,7 +181,7 @@ export function useEidosWS() {
     }
   }, [token]);
 
-  // Force sync chat history, agent status, and conversation metadata with desktop app
+  /** Pull chat, status, and files so this client matches the desktop session. */
   const refreshSync = useCallback(async () => {
     if (!token) return;
     setIsSyncing(true);
@@ -171,7 +209,7 @@ export function useEidosWS() {
     }
   }, [token, loadHistory, addLog]);
 
-  // Start fresh conversation thread on backend and desktop
+  /** Clear the local thread and ask the gateway to open a new conversation. */
   const startNewChat = useCallback((title: string = 'New Chat') => {
     setMessages([]);
     setSharedFiles([]);
@@ -181,7 +219,7 @@ export function useEidosWS() {
     addLog('Started new conversation thread.');
   }, [sendMessage, addLog]);
 
-  // Switch to past conversation thread
+  /** Ask the gateway to activate a past conversation, then reload its messages. */
   const switchConversation = useCallback((convId: string) => {
     sendMessage({ type: 'switch_conversation', conversation_id: convId });
     setTimeout(() => loadHistory(true), 150);
@@ -194,6 +232,7 @@ export function useEidosWS() {
 
     let isUnmounted = false;
 
+    /** Open the gateway socket and keep reconnecting until this hook unmounts. */
     function connect() {
       if (isUnmounted) return;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -259,14 +298,7 @@ export function useEidosWS() {
               setSharedFiles(data.files.map(normalizeSharedFile));
             }
             if (Array.isArray(data.messages)) {
-              const mapped: ChatMessage[] = data.messages.map((m: any, i: number) => ({
-                id: m.id || `hist_${i}_${m.role || 'turn'}`,
-                role: m.role || 'assistant',
-                content: m.content || '',
-                timestamp: m.timestamp || Date.now(),
-                isHistorical: true,
-              }));
-              setMessages(mapped);
+              setMessages(data.messages.map((m: any, i: number) => mapHistoryMessage(m, i)));
             } else {
               loadHistory(true);
             }
@@ -283,14 +315,7 @@ export function useEidosWS() {
               setSharedFiles(data.files.map(normalizeSharedFile));
             }
             if (Array.isArray(data.messages)) {
-              const mapped: ChatMessage[] = data.messages.map((m: any, i: number) => ({
-                id: m.id || `hist_${i}_${m.role || 'turn'}`,
-                role: m.role || 'assistant',
-                content: m.content || '',
-                timestamp: m.timestamp || Date.now(),
-                isHistorical: true,
-              }));
-              setMessages(mapped);
+              setMessages(data.messages.map((m: any, i: number) => mapHistoryMessage(m, i)));
             }
           } else if (ev === 'task_start') {
             // Task initiated (either locally from web or remotely from desktop app)
@@ -378,51 +403,110 @@ export function useEidosWS() {
                 ];
               }
             });
+          } else if (ev === 'tool_start') {
+            const tool = String(data.tool || 'action');
+            const args =
+              data.arguments == null
+                ? ''
+                : typeof data.arguments === 'string'
+                ? data.arguments
+                : JSON.stringify(data.arguments);
+            setMessages((prev) => {
+              const action: ChatAction = { tool, arguments: args, result: '', pending: true };
+              const last = prev[prev.length - 1];
+              if (last && last.role === 'assistant') {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...last, actions: [...(last.actions || []), action] },
+                ];
+              }
+              return [
+                ...prev,
+                {
+                  id: `msg_${Date.now()}`,
+                  role: 'assistant' as const,
+                  content: '',
+                  thoughts: [],
+                  actions: [action],
+                  timestamp: Date.now(),
+                  streaming: true,
+                  isHistorical: false,
+                },
+              ];
+            });
+          } else if (ev === 'tool_end') {
+            const tool = String(data.tool || 'action');
+            const result = data.result == null ? '' : String(data.result);
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== 'assistant') return prev;
+              const actions = [...(last.actions || [])];
+              for (let i = actions.length - 1; i >= 0; i -= 1) {
+                if (actions[i].tool === tool && actions[i].pending) {
+                  actions[i] = { ...actions[i], result, pending: false };
+                  break;
+                }
+              }
+              return [...prev.slice(0, -1), { ...last, actions }];
+            });
           } else if (ev === 'task_finished') {
+            const failed = data.success === false;
+            const record = failed ? (data.detail || data.summary || '').trim() : '';
+            const headline = (data.headline || (!failed ? data.summary : '') || '').trim();
+            const incomingThoughts = Array.isArray(data.thoughts)
+              ? data.thoughts.map((item) => String(item)).filter(Boolean)
+              : [];
+            const incomingActions = normalizeActions(data.actions);
+            /** Close a streaming reply. A failed run keeps the written attempt as the message body. */
+            const applyFinish = (message: ChatMessage): ChatMessage => {
+              if (record) {
+                return {
+                  ...message,
+                  content: record,
+                  thoughts: [],
+                  actions: [],
+                  streaming: false,
+                  isHistorical: false,
+                };
+              }
+              return {
+                ...message,
+                content:
+                  message.content ||
+                  headline ||
+                  (failed ? 'Task ended before it finished.' : 'Task completed.'),
+                thoughts: message.thoughts?.length ? message.thoughts : incomingThoughts,
+                actions: message.actions?.length ? message.actions : incomingActions,
+                streaming: false,
+                isHistorical: false,
+              };
+            };
             setMessages((prev) => {
               const hasStreaming = prev.some((m) => m.streaming);
               if (hasStreaming) {
-                return prev.map((m) => {
-                  if (m.streaming) {
-                    return {
-                      ...m,
-                      content: m.content || data.summary || (data.success ? 'Task completed.' : 'Task ended with an error.'),
-                      streaming: false,
-                      isHistorical: false,
-                    };
-                  }
-                  return m;
-                });
-              } else {
-                const last = prev[prev.length - 1];
-                if (last && last.role === 'assistant') {
-                  return [
-                    ...prev.slice(0, -1),
-                    {
-                      ...last,
-                      content: last.content || data.summary || (data.success ? 'Task completed.' : 'Task ended with an error.'),
-                      streaming: false,
-                      isHistorical: false,
-                    },
-                  ];
-                } else if (data.summary) {
-                  return [
-                    ...prev,
-                    {
-                      id: `msg_${Date.now()}`,
-                      role: 'assistant',
-                      content: data.summary,
-                      streaming: false,
-                      isHistorical: false,
-                      timestamp: Date.now(),
-                    },
-                  ];
-                }
+                return prev.map((m) => (m.streaming ? applyFinish(m) : m));
+              }
+              const last = prev[prev.length - 1];
+              if (last && last.role === 'assistant') {
+                return [...prev.slice(0, -1), applyFinish(last)];
+              }
+              if (record || headline || incomingThoughts.length || incomingActions.length) {
+                return [
+                  ...prev,
+                  applyFinish({
+                    id: `msg_${Date.now()}`,
+                    role: 'assistant',
+                    content: '',
+                    thoughts: [],
+                    actions: [],
+                    timestamp: Date.now(),
+                  }),
+                ];
               }
               return prev;
             });
             currentAssistantMsgIdRef.current = null;
-            addLog(`Task finished: ${data.summary || 'Done'}`);
+            addLog(`Task finished: ${data.headline || data.summary || 'Done'}`);
           } else if (ev === 'error') {
             const errorMsg = data.error || data.message || 'Unknown error occurred.';
             setMessages((prev) =>
@@ -513,6 +597,7 @@ export function useEidosWS() {
 
   // Auto-sync when user returns to browser tab or phone wakes up
   useEffect(() => {
+    /** Refresh when the tab or phone becomes visible again, so a backgrounded client is not stale. */
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible' && connected) {
         refreshSync();
@@ -526,6 +611,7 @@ export function useEidosWS() {
     };
   }, [connected, refreshSync]);
 
+  /** Show the user's message immediately, then send it to the agent. */
   const sendPrompt = useCallback(
     (promptText: string) => {
       const clean = promptText.trim();
@@ -547,6 +633,7 @@ export function useEidosWS() {
     [sendMessage]
   );
 
+  /** Trip the emergency stop and freeze any reply that is still streaming. */
   const triggerKill = useCallback(() => {
     setIsKilled(true);
     setAgentState('killed');
@@ -560,6 +647,7 @@ export function useEidosWS() {
     sendMessage({ type: 'kill' });
   }, [sendMessage]);
 
+  /** Clear the emergency stop so a new task can start. */
   const resetKill = useCallback(() => {
     setIsKilled(false);
     setAgentState('idle');
@@ -567,6 +655,7 @@ export function useEidosWS() {
     sendMessage({ type: 'reset' });
   }, [sendMessage]);
 
+  /** Cancel the running task without tripping the emergency stop. */
   const stopTask = useCallback(() => {
     setAgentState('idle');
     setStateDetails('Task stopped');
@@ -579,6 +668,7 @@ export function useEidosWS() {
     sendMessage({ type: 'stop' });
   }, [sendMessage]);
 
+  /** Approve or deny a safety prompt, optionally remembering the command. */
   const resolveConfirmation = useCallback(
     (id: string, approved: boolean, allowlist: boolean = false) => {
       sendMessage({ type: 'resolve_confirmation', id, approved, allowlist });
@@ -586,6 +676,7 @@ export function useEidosWS() {
     [sendMessage]
   );
 
+  /** Ask the host to speak a line with the selected voice. */
   const speakMessage = useCallback(
     (message: string, voice?: string) => {
       sendMessage({ type: 'speak', message, voice });
@@ -593,6 +684,7 @@ export function useEidosWS() {
     [sendMessage]
   );
 
+  /** Ask the gateway to wipe the active conversation. */
   const clearHistory = useCallback(() => {
     sendMessage({ type: 'clear' });
   }, [sendMessage]);

@@ -47,6 +47,8 @@ class SkillManager:
         self,
         skills_dir: Optional[str] = None,
         project_skills_dir: Optional[str] = None,
+        builtin_skills_dir: Optional[str] = None,
+        include_builtin: bool = True,
     ):
         self.skills_dir = Path(os.path.abspath(os.path.expanduser(skills_dir or "~/.eidos/skills")))
         self.project_skills_dir = (
@@ -54,6 +56,17 @@ class SkillManager:
             if project_skills_dir
             else Path(os.path.abspath(".eidos/skills"))
         )
+        self.include_builtin = include_builtin
+        if builtin_skills_dir is not None:
+            self.builtin_skills_dir: Optional[Path] = (
+                Path(os.path.abspath(os.path.expanduser(builtin_skills_dir)))
+                if builtin_skills_dir
+                else None
+            )
+        else:
+            self.builtin_skills_dir = (
+                Path(__file__).resolve().parent / "builtin" if include_builtin else None
+            )
         self._ensure_directories()
 
     def _ensure_directories(self):
@@ -70,10 +83,26 @@ class SkillManager:
         return clean or "unnamed-skill"
 
     def list_skills(self) -> List[Dict[str, Any]]:
-        """List all discovered skills across project and global skills directories."""
+        """List all discovered skills across builtin, global, and project skills directories."""
         discovered: Dict[str, Dict[str, Any]] = {}
 
-        # 1. Search global skills directory
+        # 1. Search builtin system skills (lowest precedence)
+        if self.builtin_skills_dir and self.builtin_skills_dir.exists():
+            for entry in sorted(self.builtin_skills_dir.iterdir()):
+                skill_path = None
+                if entry.is_dir():
+                    candidate = entry / "SKILL.md"
+                    if candidate.exists() and candidate.is_file():
+                        skill_path = candidate
+                elif entry.is_file() and entry.suffix == ".md":
+                    skill_path = entry
+
+                if skill_path:
+                    meta = self._inspect_skill_file(skill_path, scope="builtin")
+                    if meta:
+                        discovered[meta["name"]] = meta
+
+        # 2. Search global user skills directory (~/.eidos/skills, overrides builtin if same name)
         if self.skills_dir.exists():
             for entry in sorted(self.skills_dir.iterdir()):
                 skill_path = None
@@ -89,7 +118,7 @@ class SkillManager:
                     if meta:
                         discovered[meta["name"]] = meta
 
-        # 2. Search project-level skills directory (overrides global if same name)
+        # 3. Search project-level skills directory (overrides global and builtin if same name)
         if self.project_skills_dir.exists():
             for entry in sorted(self.project_skills_dir.iterdir()):
                 skill_path = None
@@ -145,20 +174,29 @@ class SkillManager:
         """Resolve the path to a skill's SKILL.md by name."""
         clean_name = self._sanitize_name(name)
 
-        # Check project scope first
+        # Check candidate exact locations in order of precedence: project -> global -> builtin
         candidates = [
             self.project_skills_dir / clean_name / "SKILL.md",
             self.project_skills_dir / f"{clean_name}.md",
             self.skills_dir / clean_name / "SKILL.md",
             self.skills_dir / f"{clean_name}.md",
         ]
+        if self.builtin_skills_dir:
+            candidates.extend([
+                self.builtin_skills_dir / clean_name / "SKILL.md",
+                self.builtin_skills_dir / f"{clean_name}.md",
+            ])
 
         for cand in candidates:
             if cand.exists() and cand.is_file():
                 return cand
 
         # Fallback case-insensitive match on directory names
-        for base in [self.project_skills_dir, self.skills_dir]:
+        search_dirs = [self.project_skills_dir, self.skills_dir]
+        if self.builtin_skills_dir:
+            search_dirs.append(self.builtin_skills_dir)
+
+        for base in search_dirs:
             if base.exists():
                 for sub in base.iterdir():
                     if sub.name.lower() == clean_name:
@@ -179,7 +217,15 @@ class SkillManager:
                 content = f.read()
 
             metadata, body = parse_frontmatter(content)
-            scope = "project" if str(path).startswith(str(self.project_skills_dir)) else "global"
+            if str(path).startswith(str(self.project_skills_dir)):
+                scope = "project"
+            elif self.builtin_skills_dir and str(path).startswith(str(self.builtin_skills_dir)):
+                scope = "builtin"
+            elif str(path).startswith(str(self.skills_dir)):
+                scope = "global"
+            else:
+                scope = "global"
+
             inferred_name = metadata.get("name") or path.parent.name
 
             return {
@@ -187,6 +233,7 @@ class SkillManager:
                 "metadata": metadata,
                 "content": content,
                 "body": body,
+                "tools_required": metadata.get("tools_required") or [],
                 "path": str(path),
                 "scope": scope,
             }
@@ -282,6 +329,12 @@ class SkillManager:
         existing_path = self.find_skill_path(name)
         if not existing_path:
             return {"success": False, "error": f"Skill '{name}' not found."}
+
+        if self.builtin_skills_dir and str(existing_path).startswith(str(self.builtin_skills_dir)):
+            return {
+                "success": False,
+                "error": f"Cannot delete built-in system skill '{name}'.",
+            }
 
         try:
             target_dir = existing_path.parent

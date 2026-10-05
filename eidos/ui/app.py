@@ -734,6 +734,8 @@ class UIController(QObject):
                     if summary:
                         self.signal_chat_assistant_message.emit(summary)
                 else:
+                    # Leave the reasoning and action bubbles already on screen.
+                    # The long attempt record stays in conversation memory for the next turn.
                     self.pill.signal_set_status.emit("error", f"Ended: {summary}")
                     self.signal_chat_error.emit(summary or "Task ended unsuccessfully.")
             except Exception as e:

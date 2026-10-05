@@ -12,6 +12,7 @@ from eidos.actions.shell import ShellExecutor
 from eidos.browser.manager import PlaywrightManager
 from eidos.core.clock import EidosClock
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
+from eidos.core.tool_registry import ToolRegistry
 from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
 from eidos.jobs import BatchJobRunner, SkillJobProcessor
@@ -36,6 +37,10 @@ from eidos.skills.manager import SkillManager
 from eidos.voice.voice_manager import VoiceManager
 
 logger = logging.getLogger(__name__)
+
+# Desktop tasks chain perception, shell, and GUI actions. 15 steps was
+# exhausted before many of those tasks could finish.
+DEFAULT_MAX_STEPS = 50
 
 
 class AgentLoop:
@@ -205,6 +210,7 @@ class AgentLoop:
             skills_dir=skills_cfg.get("directory"),
             project_skills_dir=skills_cfg.get("project_directory"),
         )
+        self.active_skill: Optional[Dict[str, Any]] = None
         self.job_processor = SkillJobProcessor(
             model_router=self.router,
             web_research_engine=self.web,
@@ -250,6 +256,7 @@ class AgentLoop:
             "on_conversation_changed": [],
         }
         self.conversation_history: List[Dict[str, Any]] = []
+        self.last_turn_trace: Dict[str, Any] = {}
 
         # Restore past turns from active conversation if persisted
         if self.conversation_store and self.active_conversation_id:
@@ -564,15 +571,200 @@ class AgentLoop:
                         + f"\n... [Historical observation from {tool_name} pruned to conserve context ({len(content)} chars total)]"
                     )
 
+    def _assemble_system_prompt(
+        self,
+        active_win: Dict[str, Any],
+        user_profile_ctx: Optional[str] = None,
+        episodic_ctx: Optional[str] = None,
+    ) -> str:
+        """Construct lean system prompt and append active skill procedure if scoped."""
+        prompt = build_system_prompt(
+            active_win,
+            os.getcwd(),
+            clock=self.clock,
+            user_profile_context=user_profile_ctx,
+            episodic_context=episodic_ctx,
+            workspace_dir=self.workspace_dir,
+        )
+        if self.active_skill:
+            skill_name = self.active_skill.get("name", "unnamed-skill")
+            skill_body = (self.active_skill.get("body") or "").strip()
+            prompt += f"\n\n---\nACTIVE SKILL: {skill_name}\n{skill_body}\n---"
+        return prompt
+
+    def _assemble_active_tools(self) -> List[Dict[str, Any]]:
+        """Return base tools or scoped tools unlocked by active skill."""
+        if self.active_skill:
+            req_tools = self.active_skill.get("tools_required") or []
+            return ToolRegistry.get_scoped_tools(req_tools)
+        return ToolRegistry.get_base_tools()
+
+    def _resolve_max_steps(self, max_steps: Optional[int]) -> int:
+        """Use the caller's cap, otherwise agent.max_steps from config."""
+        if max_steps is not None:
+            try:
+                value = int(max_steps)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        configured = self.config.get("agent", {}).get("max_steps", DEFAULT_MAX_STEPS)
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = DEFAULT_MAX_STEPS
+        return value if value > 0 else DEFAULT_MAX_STEPS
+
+    @staticmethod
+    def _compact_trace_text(value: Any, limit: int) -> str:
+        """Flatten a thought, argument payload, or tool result for the chat record."""
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, default=str, ensure_ascii=False)
+            except Exception:
+                text = str(value)
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _trace_action(self, name: str, arguments: Any, result: Any) -> Dict[str, str]:
+        return {
+            "tool": name or "tool",
+            "arguments": self._compact_trace_text(arguments, 240),
+            "result": self._compact_trace_text(result, 400),
+        }
+
+    def _format_attempt_detail(
+        self,
+        headline: str,
+        thoughts: List[str],
+        actions: List[Dict[str, str]],
+    ) -> str:
+        """Build the assistant turn stored after an unfinished attempt.
+
+        The next user message replays this text, so the model can see what it
+        already thought and which tools it already ran.
+        """
+        shown_thoughts = [t for t in thoughts if (t or "").strip()][-12:]
+        shown_actions = actions[-24:]
+        lines = [
+            headline.strip(),
+            "",
+            "This attempt already ran. Continue from the progress below instead of starting over.",
+        ]
+        if len(actions) > len(shown_actions):
+            lines.append(
+                f"(Showing the last {len(shown_actions)} of {len(actions)} actions.)"
+            )
+        if shown_thoughts:
+            lines.append("")
+            lines.append("Reasoning:")
+            for index, thought in enumerate(shown_thoughts, 1):
+                lines.append(f"{index}. {self._compact_trace_text(thought, 500)}")
+        if shown_actions:
+            lines.append("")
+            lines.append("Actions already taken:")
+            for index, action in enumerate(shown_actions, 1):
+                lines.append(
+                    f"{index}. {action.get('tool')} {action.get('arguments')} → {action.get('result')}"
+                )
+        if not shown_thoughts and not shown_actions:
+            lines.append("")
+            lines.append("No tool actions or reasoning notes were recorded before the attempt stopped.")
+        text = "\n".join(lines).strip()
+        if len(text) > 8000:
+            text = text[:7900] + "\n… [earlier progress truncated]"
+        return text
+
+    def _remember_turn(
+        self,
+        content: str,
+        *,
+        headline: str,
+        thoughts: List[str],
+        actions: List[Dict[str, str]],
+        outcome: str,
+    ) -> None:
+        """Save the assistant turn for the next model call and for chat history."""
+        public_thoughts = [self._compact_trace_text(t, 500) for t in thoughts if (t or "").strip()][-12:]
+        public_actions = list(actions[-24:])
+        self.last_turn_trace = {
+            "headline": headline,
+            "detail": content,
+            "thoughts": public_thoughts,
+            "actions": public_actions,
+            "outcome": outcome,
+        }
+        if not content:
+            return
+        self.conversation_history.append({"role": "assistant", "content": content})
+        if self.conversation_store and self.active_conversation_id:
+            self.conversation_store.add_message(
+                self.active_conversation_id,
+                role="assistant",
+                content=content,
+                metadata={
+                    "headline": headline,
+                    "thoughts": public_thoughts,
+                    "actions": public_actions,
+                    "outcome": outcome,
+                },
+            )
+
+    def _complete_run(
+        self,
+        *,
+        episode_id: Optional[str],
+        headline: str,
+        success: bool,
+        outcome: str,
+        step: int,
+        speak: bool,
+        speak_summary: bool,
+        thoughts: List[str],
+        actions: List[Dict[str, str]],
+        include_trace: bool,
+    ) -> Dict[str, Any]:
+        """Finish a task, speak a short summary, and persist what was attempted."""
+        headline = (headline or "").strip() or "Task ended."
+        if include_trace and not success:
+            detail = self._format_attempt_detail(headline, thoughts, actions)
+        else:
+            detail = headline
+        self._finish_and_index_episode(episode_id, outcome=outcome, final_summary=headline)
+        if speak:
+            self._speak_task_summary(headline, speak_summary=speak_summary)
+        self._remember_turn(
+            detail,
+            headline=headline,
+            thoughts=thoughts,
+            actions=actions,
+            outcome=outcome,
+        )
+        self._emit("on_task_finish", headline, success)
+        return {
+            "success": success,
+            "summary": headline,
+            "detail": detail,
+            "steps_taken": step,
+            "thoughts": list(self.last_turn_trace.get("thoughts") or []),
+            "actions": list(self.last_turn_trace.get("actions") or []),
+        }
+
     def run_task(
         self,
         user_goal: str,
-        max_steps: int = 15,
+        max_steps: Optional[int] = None,
         speak_summary: bool = True,
     ) -> Dict[str, Any]:
         """Run autonomous agent loop until goal achieved or max_steps reached."""
+        max_steps = self._resolve_max_steps(max_steps)
         logger.info("Starting EidosBot task: %s", user_goal)
         self._stop_requested.clear()
+        self.active_skill = None
         self._emit("on_task_start", user_goal)
         try:
             self.voice.stop_speaking()
@@ -621,13 +813,10 @@ class AgentLoop:
 
         user_profile_ctx = self.user_store.get_prompt_context() if self.memory_enabled else None
         active_win = self.windows.get_active_window_info()
-        system_prompt = build_system_prompt(
+        system_prompt = self._assemble_system_prompt(
             active_win,
-            os.getcwd(),
-            clock=self.clock,
-            user_profile_context=user_profile_ctx,
-            episodic_context=episodic_ctx,
-            workspace_dir=self.workspace_dir,
+            user_profile_ctx=user_profile_ctx,
+            episodic_ctx=episodic_ctx,
         )
 
         # Construct messages including past conversational turns
@@ -651,6 +840,8 @@ class AgentLoop:
 
         step = 0
         task_summary = ""
+        turn_thoughts: List[str] = []
+        turn_actions: List[Dict[str, str]] = []
 
         while step < max_steps:
             step += 1
@@ -661,36 +852,41 @@ class AgentLoop:
             # 1. Sense emergency kill switch or user cancellation
             if self.kill_switch.is_triggered():
                 logger.warning("Agent loop stopped by kill switch at step %d", step)
-                summary = f"Aborted by emergency kill switch at step {step}."
-                self._finish_and_index_episode(episode_id, outcome="aborted", final_summary=summary)
-                self._emit("on_task_finish", summary, False)
-                return {
-                    "success": False,
-                    "summary": summary,
-                    "steps_taken": step,
-                }
+                return self._complete_run(
+                    episode_id=episode_id,
+                    headline=f"Aborted by emergency kill switch at step {step}.",
+                    success=False,
+                    outcome="aborted",
+                    step=step,
+                    speak=False,
+                    speak_summary=speak_summary,
+                    thoughts=turn_thoughts,
+                    actions=turn_actions,
+                    include_trace=True,
+                )
             if self._stop_requested.is_set():
                 logger.warning("Agent loop stopped by user request at step %d", step)
-                summary = "Task stopped by user."
-                self._finish_and_index_episode(episode_id, outcome="aborted", final_summary=summary)
-                self._emit("on_task_finish", summary, False)
-                return {
-                    "success": False,
-                    "summary": summary,
-                    "steps_taken": step,
-                }
+                return self._complete_run(
+                    episode_id=episode_id,
+                    headline="Task stopped by user.",
+                    success=False,
+                    outcome="aborted",
+                    step=step,
+                    speak=False,
+                    speak_summary=speak_summary,
+                    thoughts=turn_thoughts,
+                    actions=turn_actions,
+                    include_trace=True,
+                )
 
-            # Refresh system context (date/time, active window, user profile) each step
+            # Refresh system context (date/time, active window, user profile, active skill) each step
             active_win = self.windows.get_active_window_info()
             if self.memory_enabled:
                 user_profile_ctx = self.user_store.get_prompt_context()
-            messages[0]["content"] = build_system_prompt(
+            messages[0]["content"] = self._assemble_system_prompt(
                 active_win,
-                os.getcwd(),
-                clock=self.clock,
-                user_profile_context=user_profile_ctx,
-                episodic_context=episodic_ctx,
-                workspace_dir=self.workspace_dir,
+                user_profile_ctx=user_profile_ctx,
+                episodic_ctx=episodic_ctx,
             )
 
             state_snapshot = {
@@ -699,17 +895,22 @@ class AgentLoop:
                 "cwd": os.getcwd(),
                 "geometry": active_win.get("geometry", {}),
                 "clock": self.clock.snapshot().to_dict(),
+                "active_skill": self.active_skill.get("name") if self.active_skill else None,
             }
 
             # Prune context if older tool outputs are accumulating
             self._compact_context_if_needed(messages, max_chars=48000)
 
+            # Assemble scoped tools based on active skill
+            active_tools = self._assemble_active_tools()
+
             # 2. Reason: Call model
-            response = self.model.chat(messages=messages, tools=EIDOS_TOOLS)
+            response = self.model.chat(messages=messages, tools=active_tools)
 
             if response.thinking:
                 logger.info("[Thinking]: %s", response.thinking)
                 self._emit("on_thought", response.thinking)
+                turn_thoughts.append(response.thinking)
 
             # Record assistant response
             assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content}
@@ -748,7 +949,7 @@ class AgentLoop:
                         if messages and messages[-1].get("role") == "assistant":
                             messages.pop()
                         try:
-                            retry_response = chutes_client.chat(messages=messages, tools=EIDOS_TOOLS)
+                            retry_response = chutes_client.chat(messages=messages, tools=active_tools)
                             if retry_response and (
                                 retry_response.has_tool_calls
                                 or (retry_response.content and not retry_response.content.startswith("Error communicating with"))
@@ -766,6 +967,12 @@ class AgentLoop:
                                     ]
                                 messages.append(assistant_msg)
                                 is_model_error = False
+                                if response.thinking and (
+                                    not turn_thoughts or turn_thoughts[-1] != response.thinking
+                                ):
+                                    logger.info("[Thinking]: %s", response.thinking)
+                                    self._emit("on_thought", response.thinking)
+                                    turn_thoughts.append(response.thinking)
                         except Exception as retry_exc:
                             logger.error("Step %d retry with Chutes also encountered error: %s", step, retry_exc)
 
@@ -786,6 +993,13 @@ class AgentLoop:
                         )
                         self.trajectory_logger.log_step(episode_id, step_rec)
                     break
+
+            # Plans that ride along with a tool call are not a final answer, but they
+            # are the reasoning the chat and the next turn need if this attempt stops.
+            note = (response.content or "").strip()
+            if note and note not in {item.strip() for item in turn_thoughts}:
+                self._emit("on_thought", note)
+                turn_thoughts.append(note)
 
             # 4. Dispatch Tool Calls
             task_finished = False
@@ -811,6 +1025,7 @@ class AgentLoop:
                     is_finish = False
                 self._emit("on_tool_end", tc.name, tool_result)
                 executed_observations.append(tool_result)
+                turn_actions.append(self._trace_action(tc.name, tc.arguments, tool_result))
                 if is_finish:
                     task_summary = tool_result.get("summary", "Task completed.")
                     task_finished = True
@@ -846,51 +1061,65 @@ class AgentLoop:
                 self.trajectory_logger.log_step(episode_id, step_rec)
 
             if task_finished:
-                if self._stop_requested.is_set():
-                    self._finish_and_index_episode(episode_id, outcome="aborted", final_summary=task_summary)
-                    self._emit("on_task_finish", task_summary, False)
-                    return {
-                        "success": False,
-                        "summary": task_summary,
-                        "steps_taken": step,
-                    }
-                self._finish_and_index_episode(episode_id, outcome="success", final_summary=task_summary)
-                self._speak_task_summary(task_summary, speak_summary=speak_summary)
-                if task_summary:
-                    self.conversation_history.append({"role": "assistant", "content": task_summary})
-                    if self.conversation_store and self.active_conversation_id:
-                        self.conversation_store.add_message(self.active_conversation_id, role="assistant", content=task_summary)
-                self._emit("on_task_finish", task_summary, True)
-                return {
-                    "success": True,
-                    "summary": task_summary,
-                    "steps_taken": step,
-                }
+                stopped = self._stop_requested.is_set() or self.kill_switch.is_triggered()
+                return self._complete_run(
+                    episode_id=episode_id,
+                    headline=task_summary or ("Task stopped by user." if stopped else "Task completed."),
+                    success=not stopped,
+                    outcome="aborted" if stopped else "success",
+                    step=step,
+                    speak=not stopped,
+                    speak_summary=speak_summary,
+                    thoughts=turn_thoughts,
+                    actions=turn_actions,
+                    include_trace=stopped,
+                )
 
             time.sleep(0.1)
 
-        if task_summary:
-            self.conversation_history.append({"role": "assistant", "content": task_summary})
-            if self.conversation_store and self.active_conversation_id:
-                self.conversation_store.add_message(self.active_conversation_id, role="assistant", content=task_summary)
-
         is_model_error = bool(
-            task_summary.startswith("Error communicating with")
-            or "429 Client Error" in task_summary
-            or "Rate limit" in task_summary
+            task_summary
+            and (
+                task_summary.startswith("Error communicating with")
+                or "429 Client Error" in task_summary
+                or "Rate limit" in task_summary
+            )
         )
-        success = bool(task_summary) and not is_model_error
-        summary = task_summary or f"Reached max steps limit ({max_steps})."
-        outcome = "success" if success else ("failed" if is_model_error else "max_steps")
-        self._finish_and_index_episode(episode_id, outcome=outcome, final_summary=summary)
-        if not success and not is_model_error:
-            self._speak_task_summary(summary, speak_summary=speak_summary)
-        self._emit("on_task_finish", summary, success)
-        return {
-            "success": success,
-            "summary": summary,
-            "steps_taken": step,
-        }
+        if task_summary and not is_model_error:
+            return self._complete_run(
+                episode_id=episode_id,
+                headline=task_summary,
+                success=True,
+                outcome="success",
+                step=step,
+                speak=False,
+                speak_summary=speak_summary,
+                thoughts=turn_thoughts,
+                actions=turn_actions,
+                include_trace=False,
+            )
+
+        if is_model_error:
+            headline = task_summary
+            outcome = "failed"
+        elif step >= max_steps:
+            headline = f"Reached the step limit ({max_steps}) before the task was finished."
+            outcome = "max_steps"
+        else:
+            headline = "The attempt stopped without a final answer."
+            outcome = "failed"
+        return self._complete_run(
+            episode_id=episode_id,
+            headline=headline,
+            success=False,
+            outcome=outcome,
+            step=step,
+            speak=not is_model_error,
+            speak_summary=speak_summary,
+            thoughts=turn_thoughts,
+            actions=turn_actions,
+            include_trace=True,
+        )
 
     def _dispatch_tool(self, tool_call: ToolCall) -> tuple[Dict[str, Any], bool]:
         """Dispatch a single tool call to the action or perception engine."""
@@ -899,6 +1128,7 @@ class AgentLoop:
         logger.info("Dispatching tool '%s' with args: %s", name, args)
 
         if name == "finish_task":
+            self.active_skill = None
             return {"status": "completed", "summary": args.get("summary", "")}, True
 
         if name == "update_user_profile":
@@ -1324,7 +1554,30 @@ class AgentLoop:
             res = self.skills.load_skill(skill_name)
             if not res:
                 return {"success": False, "error": f"Skill '{skill_name}' not found."}, False
-            return {"success": True, **res}, False
+            self.active_skill = res
+            tools_unlocked = res.get("tools_required") or []
+            logger.info("Activated skill '%s' with %d scoped tools", res.get("name"), len(tools_unlocked))
+            return {
+                "success": True,
+                "status": "activated",
+                "name": res.get("name"),
+                "skill": res.get("name"),
+                "tools_unlocked": tools_unlocked,
+                "message": f"Skill '{res.get('name')}' is now active with {len(tools_unlocked)} specialized tools unlocked.",
+            }, False
+
+        if name == "close_skill":
+            if not self.active_skill:
+                return {"success": True, "message": "No skill is currently active. Operating in base kernel mode."}, False
+            prev_name = self.active_skill.get("name", "skill")
+            self.active_skill = None
+            logger.info("Closed active skill '%s'. Returned to base kernel mode.", prev_name)
+            return {
+                "success": True,
+                "status": "closed",
+                "previous_skill": prev_name,
+                "message": f"Skill '{prev_name}' closed. Returned to base kernel mode.",
+            }, False
 
         if name == "create_skill":
             skill_name = args.get("name", "")

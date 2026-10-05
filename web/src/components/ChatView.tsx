@@ -514,6 +514,27 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     <ThoughtAccordion thoughts={allThoughts} />
                   )}
 
+                  {!isUser && (msg.actions?.length || 0) > 0 && (
+                    <div className="mb-2 space-y-1">
+                      {msg.actions!.map((action, index) => (
+                        <div
+                          key={`${action.tool}-${index}`}
+                          className="rounded-lg border border-[#44475a] bg-[#1e1f29] px-2.5 py-1.5 text-[11px]"
+                        >
+                          <div className="font-semibold text-[#8be9fd]">{action.tool}</div>
+                          {action.arguments ? (
+                            <div className="text-[#6272a4] break-words whitespace-pre-wrap">{action.arguments}</div>
+                          ) : null}
+                          {action.result ? (
+                            <div className="mt-0.5 text-[#f8f8f2]/80 break-words whitespace-pre-wrap">{action.result}</div>
+                          ) : action.pending ? (
+                            <div className="italic text-[#6272a4]">Running…</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
                   {/* Message Body with Rich Markdown */}
                   <div className="select-text font-sans text-xs">
                     {isUser ? (

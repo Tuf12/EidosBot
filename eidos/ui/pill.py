@@ -723,11 +723,63 @@ class StatusPill(QWidget):
                 continue
             content = msg.get("content") or ""
             meta = msg.get("metadata") or {}
-            msg_title = meta.get("title") if isinstance(meta, dict) else None
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            msg_title = meta.get("title") if isinstance(meta.get("title"), str) else None
             msg_id = msg.get("id") or ""
+
+            thoughts = meta.get("thoughts") if isinstance(meta.get("thoughts"), list) else []
+            actions = meta.get("actions") if isinstance(meta.get("actions"), list) else []
+            if role == "assistant" and (thoughts or actions):
+                self._append_saved_attempt(thoughts, actions, content, meta, msg_id)
+                continue
+
             self.chat_history.add_message(role=role, content=content, title=msg_title, message_id=msg_id)
 
         self.chat_history.scroll_to_bottom()
+
+    def _append_saved_attempt(
+        self,
+        thoughts: List[Any],
+        actions: List[Any],
+        content: str,
+        meta: Dict[str, Any],
+        message_id: str,
+    ) -> None:
+        """Replay a stored turn as reasoning and action bubbles, then a short closing line.
+
+        The database keeps one assistant row so the model still sees the attempt.
+        The chat shows the same reasoning and actions that were on screen when it ran.
+        """
+        for thought in thoughts:
+            text = str(thought or "").strip()
+            if text:
+                self.chat_history.add_message("thought", text, message_id=message_id)
+
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            tool_name = str(action.get("tool") or "action")
+            arguments = str(action.get("arguments") or "")
+            result = str(action.get("result") or "")
+            body = f"Calling:\n{arguments}" if arguments else "Calling:\n{}"
+            if result:
+                body += f"\n\nOutput:\n{result}"
+            self.chat_history.add_message("tool", body, title=tool_name, message_id=message_id)
+
+        headline = str(meta.get("headline") or "").strip()
+        outcome = str(meta.get("outcome") or "success").lower()
+        trace_in_body = "Actions already taken:" in content or "\nReasoning:" in content
+        visible = headline if headline and trace_in_body else (content or headline)
+        if not visible:
+            return
+        closing_role = "error" if outcome not in ("success", "") else "assistant"
+        self.chat_history.add_message(closing_role, visible, message_id=message_id)
 
     @pyqtSlot(bool)
     def set_task_running(self, running: bool):

@@ -110,15 +110,20 @@ class OllamaEmbeddingClient:
         raise RuntimeError(f"Failed to generate embeddings for batch of size {len(texts)}")
 
     def _pseudo_embed(self, text: str) -> List[float]:
-        """Deterministic pseudo-embedding for testing or offline recovery."""
-        h = hashlib.sha256(text.encode("utf-8")).digest()
-        # Expand 32-byte hash deterministically to 768 floats
-        vec: List[float] = []
-        for i in range(self.dimension):
-            byte_val = h[i % len(h)]
-            mult = (i // len(h)) + 1
-            val = ((byte_val * mult) % 256) / 128.0 - 1.0
-            vec.append(val)
-        # Normalize
+        """Deterministic pseudo-embedding for testing or offline recovery based on feature hashing."""
+        import re
+        tokens = re.findall(r"\w+", text.lower())
+        vec = [0.0] * self.dimension
+        if not tokens:
+            return vec
+        for tok in tokens:
+            h = int(hashlib.sha256(tok.encode("utf-8")).hexdigest()[:8], 16)
+            idx = h % self.dimension
+            vec[idx] += 1.0
+        for i in range(len(text) - 2):
+            trigram = text[i:i + 3].lower()
+            h = int(hashlib.md5(trigram.encode("utf-8")).hexdigest()[:8], 16)
+            idx = h % self.dimension
+            vec[idx] += 0.5
         norm = sum(x * x for x in vec) ** 0.5 or 1.0
         return [x / norm for x in vec]
