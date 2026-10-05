@@ -362,6 +362,27 @@ EIDOS_TOOLS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "share_file",
+            "description": "Send a local file to the user's web app so they can view and download it there. Call this for every document, note, PDF, spreadsheet, image, or other file the user should review. The web app cannot open a raw disk path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or workspace path of the file to show in the web app."
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short caption shown next to the file in the web app."
+                    }
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "download_file",
             "description": "Download a file (e.g. PDF, patent, dataset, document, image) directly off the internet into the user's workspace downloads directory (~/EidosWorkspace/downloads).",
             "parameters": {
@@ -1006,9 +1027,12 @@ BEHAVIORAL PRINCIPLES:
 - NEVER store downloads, documents, or temporary task files inside the `{current_dir}` repository codebase directory.
 13. SOURCE CITATIONS & CLICKABLE LINKS:
 - When researching, browsing, or referencing web sources, always include clickable Markdown links in the format `[Page Title](https://...)` in your responses and final summary so the user can easily click to open the page directly.
-14. DOWNLOADING & DESKTOP BROWSING:
+14. DOWNLOADING, DESKTOP BROWSING & WEB APP FILES:
 - To download files from the internet (patents, PDFs, datasets, images), use the dedicated `download_file` tool.
 - If the user asks to "pull it up on my PC", "show me the patent", or "open this in my browser", use `open_in_browser` to launch the URL or local file directly on their desktop.
+- The web app cannot open a local path by itself. Before `finish_task`, call `share_file` once for every document you want the user to read there (notes, markdown, PDF, CSV, code, images, and anything you just wrote or downloaded).
+- Do not paste a long document into chat when you can `share_file` it.
+- When a user message lists attached files with paths, those files are already on disk. Read them from those paths.
 15. OPTIMALX KNOWLEDGE ECOSYSTEM:
 - You have direct, bi-directional access to the user's personal notes, ideas, and knowledge base synchronized across OptimalX Mobile (Android) and OptimalX Desktop via `optimalx_search_notes`, `optimalx_read_note`, `optimalx_list_folders`, `optimalx_write_note`, `optimalx_read_notex_doc`, and `optimalx_list_notex_docs`.
 - When the user asks about their notes, projects, ideas, or personal plans, search and consult OptimalX first before assuming or creating duplicate external files.

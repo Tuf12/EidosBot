@@ -193,6 +193,7 @@ class StatusPill(QWidget):
     signal_reset_kill = pyqtSignal()
     signal_quit_app = pyqtSignal()
     signal_toggle_mic = pyqtSignal()  # voice push-to-talk toggle
+    signal_toggle_auto_speak = pyqtSignal(bool)  # auto-read responses on/off
     signal_toggle_expand = pyqtSignal(bool)  # is_expanded
     signal_clear_chat = pyqtSignal()
     signal_new_chat = pyqtSignal()
@@ -223,6 +224,7 @@ class StatusPill(QWidget):
         self._last_assistant_message: str = ""
         self._unread_responses: int = 0
         self._is_task_running: bool = False
+        self._auto_speak: bool = True
 
         self._init_window()
         self._init_ui()
@@ -395,7 +397,22 @@ class StatusPill(QWidget):
         self.chat_container.setVisible(False)
         card_layout.addWidget(self.chat_container, stretch=1)
 
-        # 3. Prompt Input Bar: Quick prompt entry, mic push-to-talk, send button
+        # 3. Voice bar: same Auto-Read toggle the web app shows above the composer
+        self.voice_bar = QWidget()
+        self.voice_bar.setStyleSheet("background-color: transparent; border: none;")
+        voice_bar_layout = QHBoxLayout(self.voice_bar)
+        voice_bar_layout.setContentsMargins(2, 0, 2, 0)
+        voice_bar_layout.setSpacing(8)
+
+        self.btn_auto_speak = QPushButton()
+        self.btn_auto_speak.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_speak.clicked.connect(self._on_auto_speak_clicked)
+        voice_bar_layout.addWidget(self.btn_auto_speak)
+        voice_bar_layout.addStretch(1)
+        self.set_auto_speak(True)
+        card_layout.addWidget(self.voice_bar)
+
+        # 4. Prompt Input Bar: Quick prompt entry, mic push-to-talk, send button
         prompt_bar = QHBoxLayout()
         prompt_bar.setSpacing(6)
 
@@ -432,7 +449,7 @@ class StatusPill(QWidget):
 
         card_layout.addLayout(prompt_bar)
 
-        # 4. Bottom Footer Bar: Hint + Resize Grip (Resize grip only visible when expanded)
+        # 5. Bottom Footer Bar: Hint + Resize Grip (Resize grip only visible when expanded)
         self.bottom_bar = QHBoxLayout()
         self.bottom_bar.setContentsMargins(0, 0, 0, 0)
 
@@ -762,6 +779,37 @@ class StatusPill(QWidget):
     def _on_link_clicked(self, link: str):
         """Forward link activation signal."""
         self.signal_link_clicked.emit(link)
+
+    @pyqtSlot(bool)
+    def set_auto_speak(self, enabled: bool):
+        """Show the same Auto-Read on/off state the web app uses."""
+        self._auto_speak = bool(enabled)
+        if self._auto_speak:
+            self.btn_auto_speak.setText("🔊 Auto-Read: ON")
+            self.btn_auto_speak.setToolTip(
+                "Automatically read assistant responses aloud via Kokoro TTS. Click to turn audio off."
+            )
+            self.btn_auto_speak.setStyleSheet(
+                "QPushButton { background-color: transparent; color: #50fa7b; font-weight: 600; "
+                "border: none; padding: 2px 4px; font-size: 11px; text-align: left; } "
+                "QPushButton:hover { color: #f8f8f2; }"
+            )
+        else:
+            self.btn_auto_speak.setText("🔇 Auto-Read: OFF")
+            self.btn_auto_speak.setToolTip(
+                "Response audio is off. Click to automatically read assistant responses aloud."
+            )
+            self.btn_auto_speak.setStyleSheet(
+                "QPushButton { background-color: transparent; color: #6272a4; font-weight: 500; "
+                "border: none; padding: 2px 4px; font-size: 11px; text-align: left; } "
+                "QPushButton:hover { color: #f8f8f2; }"
+            )
+
+    @pyqtSlot()
+    def _on_auto_speak_clicked(self):
+        """Toggle auto-read and notify the controller."""
+        self.set_auto_speak(not self._auto_speak)
+        self.signal_toggle_auto_speak.emit(self._auto_speak)
 
     @pyqtSlot(bool)
     def set_mic_recording(self, recording: bool):

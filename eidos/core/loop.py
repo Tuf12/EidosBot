@@ -1264,6 +1264,36 @@ class AgentLoop:
             res = self.browser.close()
             return res, False
 
+        if name == "share_file":
+            path = args.get("path") or args.get("target") or ""
+            note = args.get("note") or args.get("caption") or ""
+            allowed, reason = self.gatekeeper.evaluate("share_file", {"path": path, "note": note})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            sharer = getattr(self, "file_share", None)
+            if sharer is None or not hasattr(sharer, "register"):
+                return {
+                    "success": False,
+                    "error": "The web gateway is not running, so this file cannot be sent to the web app.",
+                }, False
+            try:
+                rec = sharer.register(
+                    path,
+                    direction="bot",
+                    conversation_id=str(self.active_conversation_id or ""),
+                    note=str(note or ""),
+                )
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}, False
+            return {
+                "success": True,
+                "already_shared": bool(rec.get("already_shared")),
+                "id": rec.get("id"),
+                "name": rec.get("name"),
+                "path": rec.get("path"),
+                "message": "The file is now in the web app for the user to view and download.",
+            }, False
+
         if name == "download_file":
             url = args.get("url", "")
             filename = args.get("filename")

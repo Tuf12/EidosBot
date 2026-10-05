@@ -1,5 +1,6 @@
 """Tests for EidosBot PyQt6 UI components."""
 
+import os
 import sys
 import tempfile
 import pytest
@@ -480,7 +481,7 @@ def test_status_pill_minimize_restores_minimal_size(qapp):
     # Verify it returns back to its minimal size and does not stay inflated
     assert pill.height() == pill.minimumSizeHint().height()
     assert pill.width() == pill.minimumSizeHint().width()
-    assert pill.height() <= 120  # Compact minimal height
+    assert pill.height() <= 140  # Compact height, including the Auto-Read row
     assert pill.geometry().topLeft() == initial_geom.topLeft()
     assert pill.geometry().width() == initial_geom.width()
 
@@ -496,7 +497,7 @@ def test_status_pill_minimize_restores_minimal_size(qapp):
         time.sleep(0.005)
     assert pill.height() == pill.minimumSizeHint().height()
     assert pill.width() == pill.minimumSizeHint().width()
-    assert pill.height() <= 120
+    assert pill.height() <= 140
 
     pill.close()
 
@@ -1261,6 +1262,97 @@ def test_markdown_apostrophe_and_quotes_not_mangled():
     code_html = markdown_to_chat_html(code_md)
     assert "&#x27;" not in code_html
     assert "'EidosBot'" in code_html
+
+
+def test_status_pill_auto_read_toggle(qapp):
+    pill = StatusPill()
+    pill.show()
+
+    assert pill.btn_auto_speak.text() == "🔊 Auto-Read: ON"
+    assert pill._auto_speak is True
+
+    states = []
+    pill.signal_toggle_auto_speak.connect(states.append)
+    pill.btn_auto_speak.click()
+    assert states == [False]
+    assert pill.btn_auto_speak.text() == "🔇 Auto-Read: OFF"
+
+    pill.btn_auto_speak.click()
+    assert states == [False, True]
+    assert pill.btn_auto_speak.text() == "🔊 Auto-Read: ON"
+
+    pill.set_auto_speak(False)
+    assert pill._auto_speak is False
+    assert "OFF" in pill.btn_auto_speak.text()
+    pill.close()
+
+
+def test_ui_controller_auto_read_toggle_persists_and_stops_speech(qapp):
+    from unittest.mock import MagicMock
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as tmp_cfg:
+        tmp_cfg.write(
+            "voice:\n"
+            "  enabled: true\n"
+            "  auto_speak_responses: true  # Speak every chat reply aloud\n"
+            "  tts_voice: bm_george\n"
+        )
+        cfg_path = tmp_cfg.name
+
+    try:
+        controller = UIController(
+            config={"voice": {"enabled": True, "auto_speak_responses": True}},
+            config_path=cfg_path,
+        )
+        controller.show()
+        assert controller.pill.btn_auto_speak.text() == "🔊 Auto-Read: ON"
+
+        mock_agent = MagicMock()
+        mock_agent.config = controller.config
+        controller._agent_loop = mock_agent
+
+        controller.pill.btn_auto_speak.click()
+        assert controller.config["voice"]["auto_speak_responses"] is False
+        mock_agent.voice.stop_speaking.assert_called_once()
+        assert controller.pill.btn_auto_speak.text() == "🔇 Auto-Read: OFF"
+
+        with open(cfg_path, encoding="utf-8") as f:
+            saved = f.read()
+        assert "auto_speak_responses: false" in saved
+        assert "# Speak every chat reply aloud" in saved
+        assert "tts_voice: bm_george" in saved
+
+        mock_agent.voice.stop_speaking.reset_mock()
+        controller.pill.btn_auto_speak.click()
+        assert controller.config["voice"]["auto_speak_responses"] is True
+        mock_agent.voice.stop_speaking.assert_not_called()
+        with open(cfg_path, encoding="utf-8") as f:
+            saved_on = f.read()
+        assert "auto_speak_responses: true" in saved_on
+        assert "# Speak every chat reply aloud" in saved_on
+
+        separate_cfg = {"voice": {"auto_speak_responses": True}}
+        mock_agent.config = separate_cfg
+        controller.pill.btn_auto_speak.click()
+        assert separate_cfg["voice"]["auto_speak_responses"] is False
+        assert controller.config["voice"]["auto_speak_responses"] is False
+
+        controller.hide()
+
+        missing_key = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        missing_key.write("voice:\n  enabled: true\n  tts_voice: bm_george\n")
+        missing_key.close()
+        try:
+            controller.config_path = missing_key.name
+            controller._persist_auto_speak(False)
+            with open(missing_key.name, encoding="utf-8") as f:
+                inserted = f.read()
+            assert "auto_speak_responses: false" in inserted
+            assert "tts_voice: bm_george" in inserted
+        finally:
+            os.remove(missing_key.name)
+    finally:
+        os.remove(cfg_path)
 
 
 

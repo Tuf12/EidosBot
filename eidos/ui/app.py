@@ -3,6 +3,7 @@
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -51,9 +52,11 @@ class UIController(QObject):
         config: Optional[Dict[str, Any]] = None,
         kill_switch: Optional[KillSwitch] = None,
         allowlist: Optional[AllowlistManager] = None,
+        config_path: str = "config.yaml",
     ):
         super().__init__()
         self.config = config or {}
+        self.config_path = config_path
         self.kill_switch = kill_switch or KillSwitch()
         self.allowlist = allowlist or AllowlistManager()
 
@@ -75,6 +78,9 @@ class UIController(QObject):
 
         self._connect_signals()
         self._register_kill_switch_callbacks()
+        self.pill.set_auto_speak(
+            bool(self.config.get("voice", {}).get("auto_speak_responses", True))
+        )
 
         # Prevent Qt from quitting when modal dialogs (Settings, Allowlist, Confirmations) close
         app = QApplication.instance()
@@ -104,6 +110,7 @@ class UIController(QObject):
         self.pill.signal_quit_app.connect(self.quit_application)
         self.pill.signal_submit_task.connect(self.start_task_in_background)
         self.pill.signal_toggle_mic.connect(self._toggle_voice_mic)
+        self.pill.signal_toggle_auto_speak.connect(self._on_toggle_auto_speak)
         self.signal_update_mic_state.connect(self.pill.set_mic_recording)
         self.signal_voice_transcribed.connect(self._on_voice_transcribed)
 
@@ -222,7 +229,11 @@ class UIController(QObject):
         if self._agent_loop is not None:
             user_store = getattr(self._agent_loop, "user_store", None)
         if self.settings_dialog is None:
-            self.settings_dialog = SettingsDialog(config=self.config, user_store=user_store)
+            self.settings_dialog = SettingsDialog(
+                config=self.config,
+                config_path=self.config_path,
+                user_store=user_store,
+            )
             self.settings_dialog.signal_settings_applied.connect(self.on_settings_applied)
             self.settings_dialog.signal_open_allowlist.connect(self.open_allowlist_manager)
         else:
@@ -334,6 +345,9 @@ class UIController(QObject):
     def on_settings_applied(self, new_config: dict):
         """Handle dynamic live update of system settings."""
         self.config = new_config
+        self.pill.set_auto_speak(
+            bool(new_config.get("voice", {}).get("auto_speak_responses", True))
+        )
 
         # Update running AgentLoop
         if self._agent_loop is not None:
@@ -585,6 +599,67 @@ class UIController(QObject):
             return
         logger.info("Auto-submitting transcribed speech as chat turn.")
         self.start_task_in_background(cleaned)
+
+    @pyqtSlot(bool)
+    def _on_toggle_auto_speak(self, enabled: bool):
+        """Persist the web-style Auto-Read toggle and silence playback when it turns off."""
+        enabled = bool(enabled)
+        voice_cfg = self.config.setdefault("voice", {})
+        voice_cfg["auto_speak_responses"] = enabled
+
+        if self._agent_loop is not None:
+            loop_cfg = getattr(self._agent_loop, "config", None)
+            if isinstance(loop_cfg, dict) and loop_cfg is not self.config:
+                loop_cfg.setdefault("voice", {})["auto_speak_responses"] = enabled
+
+        self._persist_auto_speak(enabled)
+
+        if self.settings_dialog is not None and hasattr(self.settings_dialog, "chk_auto_speak"):
+            self.settings_dialog.chk_auto_speak.setChecked(enabled)
+
+        if not enabled:
+            self._stop_speaking()
+
+    def _persist_auto_speak(self, enabled: bool) -> None:
+        """Update voice.auto_speak_responses in config.yaml without rewriting the rest of the file."""
+        path = self.config_path
+        if not path or not os.path.isfile(path):
+            return
+        value = "true" if enabled else "false"
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as exc:
+            logger.warning("Could not read config to save Auto-Read: %s", exc)
+            return
+
+        pattern = re.compile(r"^([ \t]*auto_speak_responses:[ \t]*)\S+", re.MULTILINE)
+        if pattern.search(text):
+            updated = pattern.sub(rf"\g<1>{value}", text, count=1)
+        else:
+            voice_header = re.compile(r"^(voice:[ \t]*(?:#.*)?\n)", re.MULTILINE)
+            match = voice_header.search(text)
+            line = f"  auto_speak_responses: {value}\n"
+            if match:
+                updated = text[: match.end()] + line + text[match.end() :]
+            else:
+                suffix = "" if text.endswith("\n") or not text else "\n"
+                updated = f"{text}{suffix}\nvoice:\n{line}"
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(updated)
+        except OSError as exc:
+            logger.warning("Could not save Auto-Read setting: %s", exc)
+
+    def _stop_speaking(self) -> None:
+        """Halt any TTS that is already playing."""
+        if self._agent_loop is None or not hasattr(self._agent_loop, "voice") or not self._agent_loop.voice:
+            return
+        try:
+            self._agent_loop.voice.stop_speaking()
+        except Exception:
+            logger.debug("stop_speaking failed while turning Auto-Read off", exc_info=True)
 
     @pyqtSlot()
     def _toggle_voice_mic(self):

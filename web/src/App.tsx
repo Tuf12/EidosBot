@@ -23,6 +23,7 @@ export function App() {
     isKilled,
     confirmations,
     messages,
+    sharedFiles,
     logs,
     conversationTitle,
     conversationId,
@@ -128,6 +129,7 @@ export function App() {
         {activeTab === 'chat' && (
           <ChatView
             messages={messages}
+            sharedFiles={sharedFiles}
             onSendMessage={sendPrompt}
             token={token}
             isThinking={isThinking}

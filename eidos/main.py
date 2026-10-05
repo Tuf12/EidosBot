@@ -88,7 +88,13 @@ def print_banner():
     print("=" * 65)
 
 
-def run_gui_mode(cfg: dict, kill_switch: KillSwitch, start_gateway: bool = False, start_telegram: bool = False):
+def run_gui_mode(
+    cfg: dict,
+    kill_switch: KillSwitch,
+    start_gateway: bool = False,
+    start_telegram: bool = False,
+    config_path: str = "config.yaml",
+):
     """Launch EidosBot with PyQt6 Transparent HUD and Floating Status Pill."""
     from PyQt6.QtCore import QTimer
     from PyQt6.QtWidgets import QApplication
@@ -115,7 +121,7 @@ def run_gui_mode(cfg: dict, kill_switch: KillSwitch, start_gateway: bool = False
     # Allow Python signal handling (e.g. Ctrl+C in terminal)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    ui_controller = UIController(config=cfg, kill_switch=kill_switch)
+    ui_controller = UIController(config=cfg, kill_switch=kill_switch, config_path=config_path)
     agent = AgentLoop(config=cfg, kill_switch=kill_switch)
     ui_controller.set_agent_loop(agent)
 
@@ -475,13 +481,25 @@ def cli_entrypoint():
     # 3. If explicit --cli -> interactive CLI REPL
     # 4. Default: GUI mode if DISPLAY is available, otherwise CLI
     if args.gui:
-        run_gui_mode(cfg, kill_switch, start_gateway=args.gateway, start_telegram=args.telegram)
+        run_gui_mode(
+            cfg,
+            kill_switch,
+            start_gateway=args.gateway,
+            start_telegram=args.telegram,
+            config_path=args.config,
+        )
     elif args.prompt or args.cli:
         run_cli_mode(cfg, kill_switch, args.prompt, args.steps, start_gateway=args.gateway, start_telegram=args.telegram)
     else:
         # Default with no arguments: Check if DISPLAY is available
         if os.environ.get("DISPLAY"):
-            run_gui_mode(cfg, kill_switch, start_gateway=args.gateway, start_telegram=args.telegram)
+            run_gui_mode(
+                cfg,
+                kill_switch,
+                start_gateway=args.gateway,
+                start_telegram=args.telegram,
+                config_path=args.config,
+            )
         else:
             run_cli_mode(cfg, kill_switch, args.prompt, args.steps, start_gateway=args.gateway, start_telegram=args.telegram)
 

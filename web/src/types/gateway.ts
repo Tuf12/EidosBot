@@ -9,6 +9,19 @@ export interface ConfirmationRecord {
   timestamp: number;
 }
 
+export interface SharedFile {
+  id: string;
+  name: string;
+  path?: string;
+  mime: string;
+  size: number;
+  direction: 'bot' | 'user';
+  note?: string;
+  conversation_id?: string;
+  created_at: number;
+  missing?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -55,6 +68,8 @@ export interface InboundWSEvent {
   messages?: any[];
   conversations?: ConversationItem[];
   active_id?: string;
+  file?: SharedFile;
+  files?: SharedFile[];
 }
 
 export interface OutboundWSMessage {

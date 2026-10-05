@@ -1,5 +1,20 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AgentState, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage } from '../types/gateway';
+import { AgentState, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
+
+function normalizeSharedFile(raw: any): SharedFile {
+  return {
+    id: String(raw?.id || ''),
+    name: String(raw?.name || 'file'),
+    path: raw?.path ? String(raw.path) : '',
+    mime: String(raw?.mime || 'application/octet-stream'),
+    size: Number(raw?.size || 0),
+    direction: raw?.direction === 'user' ? 'user' : 'bot',
+    note: raw?.note ? String(raw.note) : '',
+    conversation_id: raw?.conversation_id ? String(raw.conversation_id) : '',
+    created_at: Number(raw?.created_at || Date.now() / 1000),
+    missing: Boolean(raw?.missing),
+  };
+}
 
 export function useEidosWS() {
   const [token, setTokenState] = useState<string>(() => {
@@ -23,6 +38,7 @@ export function useEidosWS() {
   const [isKilled, setIsKilled] = useState(false);
   const [confirmations, setConfirmations] = useState<ConfirmationRecord[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [sharedFiles, setSharedFiles] = useState<SharedFile[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [conversationTitle, setConversationTitle] = useState<string>('New Chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
@@ -31,6 +47,7 @@ export function useEidosWS() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const currentAssistantMsgIdRef = useRef<string | null>(null);
+  const conversationIdRef = useRef<string | null>(null);
 
   const setToken = useCallback((newToken: string) => {
     localStorage.setItem('eidos_token', newToken);
@@ -96,7 +113,13 @@ export function useEidosWS() {
         const data = await res.json();
         if (data.ok) {
           if (data.title) setConversationTitle(data.title);
-          if (data.conversation_id) setConversationId(data.conversation_id);
+          if (data.conversation_id) {
+            conversationIdRef.current = data.conversation_id;
+            setConversationId(data.conversation_id);
+          }
+          if (Array.isArray(data.files)) {
+            setSharedFiles(data.files.map(normalizeSharedFile));
+          }
           if (Array.isArray(data.messages)) {
             setMessages((prev) => {
               // If not forced and prev already has active streaming message, keep it
@@ -151,6 +174,7 @@ export function useEidosWS() {
   // Start fresh conversation thread on backend and desktop
   const startNewChat = useCallback((title: string = 'New Chat') => {
     setMessages([]);
+    setSharedFiles([]);
     setConversationTitle(title);
     currentAssistantMsgIdRef.current = null;
     sendMessage({ type: 'new_chat', title });
@@ -220,11 +244,20 @@ export function useEidosWS() {
             if (data.details !== undefined) setStateDetails(data.details);
             if (data.killed !== undefined) setIsKilled(data.killed);
             if (data.conversation_title) setConversationTitle(data.conversation_title);
-            if (data.conversation_id) setConversationId(data.conversation_id);
+            if (data.conversation_id) {
+              conversationIdRef.current = data.conversation_id;
+              setConversationId(data.conversation_id);
+            }
           } else if (ev === 'conversation_changed') {
             if (data.title) setConversationTitle(data.title);
-            if (data.conversation_id) setConversationId(data.conversation_id);
+            if (data.conversation_id) {
+              conversationIdRef.current = data.conversation_id;
+              setConversationId(data.conversation_id);
+            }
             currentAssistantMsgIdRef.current = null;
+            if (Array.isArray(data.files)) {
+              setSharedFiles(data.files.map(normalizeSharedFile));
+            }
             if (Array.isArray(data.messages)) {
               const mapped: ChatMessage[] = data.messages.map((m: any, i: number) => ({
                 id: m.id || `hist_${i}_${m.role || 'turn'}`,
@@ -242,7 +275,13 @@ export function useEidosWS() {
             if (data.title) setConversationTitle(data.title);
           } else if (ev === 'sync_history') {
             if (data.title) setConversationTitle(data.title);
-            if (data.conversation_id) setConversationId(data.conversation_id);
+            if (data.conversation_id) {
+              conversationIdRef.current = data.conversation_id;
+              setConversationId(data.conversation_id);
+            }
+            if (Array.isArray(data.files)) {
+              setSharedFiles(data.files.map(normalizeSharedFile));
+            }
             if (Array.isArray(data.messages)) {
               const mapped: ChatMessage[] = data.messages.map((m: any, i: number) => ({
                 id: m.id || `hist_${i}_${m.role || 'turn'}`,
@@ -426,6 +465,23 @@ export function useEidosWS() {
             setMessages([]);
             setConversationTitle('New Chat');
             addLog('Conversation cleared.');
+          } else if (ev === 'file_shared' && data.file) {
+            const file = normalizeSharedFile(data.file);
+            const active = conversationIdRef.current;
+            if (file.conversation_id && active && file.conversation_id !== active) {
+              addLog(`File shared in another chat: ${file.name}`);
+            } else {
+              setSharedFiles((prev) => {
+                const idx = prev.findIndex((item) => item.id === file.id);
+                if (idx >= 0) {
+                  const next = prev.slice();
+                  next[idx] = file;
+                  return next;
+                }
+                return [...prev, file];
+              });
+              addLog(`File ready: ${file.name}`);
+            }
           } else if (ev === 'log' && data.message) {
             addLog(data.message);
           }
@@ -550,6 +606,7 @@ export function useEidosWS() {
     isKilled,
     confirmations,
     messages,
+    sharedFiles,
     logs,
     conversationTitle,
     conversationId,

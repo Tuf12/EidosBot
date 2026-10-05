@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { ChatMessage } from '../types/gateway';
+import { ChatMessage, SharedFile } from '../types/gateway';
 import { ThoughtAccordion } from './ThoughtAccordion';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import {
@@ -21,10 +21,13 @@ import {
   Minimize2,
   Plus,
   RefreshCw,
+  Paperclip,
 } from 'lucide-react';
+import { SharedFiles } from './SharedFiles';
 
 interface ChatViewProps {
   messages: ChatMessage[];
+  sharedFiles?: SharedFile[];
   onSendMessage: (text: string) => void;
   token: string;
   isThinking: boolean;
@@ -67,6 +70,7 @@ function parseEmbeddedThoughts(
 
 export const ChatView: React.FC<ChatViewProps> = ({
   messages,
+  sharedFiles = [],
   onSendMessage,
   token,
   isThinking,
@@ -94,9 +98,13 @@ export const ChatView: React.FC<ChatViewProps> = ({
     return localStorage.getItem('eidos_auto_submit_voice') !== 'false';
   });
   const [micNotice, setMicNotice] = useState<string | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [attachNotice, setAttachNotice] = useState<string | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -165,12 +173,48 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!inputText.trim() || isThinking) return;
-    onSendMessage(inputText.trim());
-    setInputText('');
-    setIsExpanded(false);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = '40px';
+    if (isThinking || isUploading) return;
+    const text = inputText.trim();
+    if (!text && pendingFiles.length === 0) return;
+    if (pendingFiles.length === 0) {
+      onSendMessage(text);
+      setInputText('');
+      setIsExpanded(false);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+      return;
+    }
+    void uploadAndSend(text);
+  };
+
+  const uploadAndSend = async (text: string) => {
+    setIsUploading(true);
+    setAttachNotice(null);
+    try {
+      const form = new FormData();
+      if (text) form.append('message', text);
+      pendingFiles.forEach((file) => form.append('file', file, file.name));
+      const res = await fetch('/api/files', {
+        method: 'POST',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        body: form,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        setAttachNotice(data.error || `Upload failed (${res.status})`);
+        return;
+      }
+      setInputText('');
+      setPendingFiles([]);
+      setIsExpanded(false);
+      if (textareaRef.current) {
+        textareaRef.current.style.height = '40px';
+      }
+    } catch (err) {
+      setAttachNotice(err instanceof Error ? err.message : 'Upload failed');
+    } finally {
+      setIsUploading(false);
     }
   };
 
@@ -405,7 +449,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
               {conversationTitle || 'New Conversation'}
             </h3>
             <p className="text-xs max-w-xs leading-relaxed mb-4">
-              Send a command, review desktop tasks, or monitor autonomous jobs with Kokoro TTS audio.
+              Send a message, attach a document, or review the files Eidos puts together.
             </p>
             <div className="flex items-center gap-2">
               {onNewChat && (
@@ -584,6 +628,8 @@ export const ChatView: React.FC<ChatViewProps> = ({
         <div ref={messagesEndRef} />
       </div>
 
+      <SharedFiles files={sharedFiles} token={token} />
+
       {/* Voice Controls Bar & Input Form */}
       <div className="p-3 bg-[#1e1f29] border-t border-[#44475a] space-y-2">
         {/* Quick Voice Bar */}
@@ -674,11 +720,38 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         )}
 
+        {attachNotice && (
+          <div className="text-[11px] text-[#ff5555] bg-[#ff5555]/10 border border-[#ff5555]/30 rounded-lg p-2">
+            {attachNotice}
+          </div>
+        )}
+
         {/* Input Form Bar */}
         <form
           onSubmit={handleSubmit}
           className="max-w-3xl mx-auto bg-[#282a36] border border-[#44475a] focus-within:border-[#bd93f9] focus-within:ring-1 focus-within:ring-[#bd93f9]/40 rounded-2xl shadow-lg transition-all flex flex-col overflow-hidden"
         >
+          {pendingFiles.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+              {pendingFiles.map((file, index) => (
+                <span
+                  key={`${file.name}-${index}`}
+                  className="inline-flex items-center gap-1 max-w-full px-2 py-1 rounded-lg bg-[#44475a]/50 text-[11px] text-[#f8f8f2]"
+                >
+                  <Paperclip className="w-3 h-3 text-[#bd93f9] shrink-0" />
+                  <span className="truncate">{file.name}</span>
+                  <button
+                    type="button"
+                    title="Remove file"
+                    onClick={() => setPendingFiles((prev) => prev.filter((_, i) => i !== index))}
+                    className="text-[#6272a4] hover:text-[#ff5555]"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           {/* Text input area */}
           <div className="px-3.5 pt-2.5 pb-1 relative">
             <textarea
@@ -704,6 +777,30 @@ export const ChatView: React.FC<ChatViewProps> = ({
           <div className="flex items-center justify-between px-2.5 py-1.5 border-t border-[#44475a]/30 bg-[#21232d]/50">
             {/* Left Actions */}
             <div className="flex items-center gap-1">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  const chosen = Array.from(e.target.files || []);
+                  if (chosen.length) {
+                    setPendingFiles((prev) => [...prev, ...chosen]);
+                    setAttachNotice(null);
+                  }
+                  e.target.value = '';
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isUploading}
+                title="Attach a file for Eidos to read"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium text-[#8be9fd] hover:bg-[#8be9fd]/10 transition active:scale-95 disabled:opacity-40"
+              >
+                <Paperclip className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Attach</span>
+              </button>
               {/* Dictate Button */}
               <button
                 type="button"
@@ -789,11 +886,11 @@ export const ChatView: React.FC<ChatViewProps> = ({
               ) : (
                 <button
                   type="submit"
-                  disabled={!inputText.trim()}
-                  title="Send Message (Enter)"
+                  disabled={(!inputText.trim() && pendingFiles.length === 0) || isUploading}
+                  title={pendingFiles.length ? 'Send message and files' : 'Send Message (Enter)'}
                   className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#bd93f9] text-[#1e1f29] font-medium text-xs hover:bg-[#bd93f9]/90 disabled:opacity-30 disabled:cursor-not-allowed transition active:scale-95 shadow-md"
                 >
-                  <span>Send</span>
+                  <span>{isUploading ? 'Sending…' : 'Send'}</span>
                   <Send className="w-3.5 h-3.5" />
                 </button>
               )}

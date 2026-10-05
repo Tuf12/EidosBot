@@ -21,6 +21,7 @@ import uuid
 
 from aiohttp import web, WSMsgType
 
+from eidos.gateway.files import SharedFileRegistry, content_disposition
 from eidos.perception.screen import ScreenCapture
 from eidos.safety.risk_classifier import RiskLevel
 from eidos.voice.voices import DEFAULT_VOICE_ID, list_voices
@@ -452,6 +453,11 @@ class RemoteGatewayServer:
         self._ws_clients: Set[web.WebSocketResponse] = set()
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._confirm_lock = threading.Lock()
+        self.files = SharedFileRegistry(on_shared=self._on_file_shared)
+        try:
+            self.agent_loop.file_share = self.files
+        except Exception:
+            logger.debug("Could not attach file registry to the agent loop.")
 
         # Track agent state
         self.current_state = "idle"
@@ -632,6 +638,7 @@ class RemoteGatewayServer:
             "conversation_id": conv_id,
             "title": title,
             "messages": history,
+            "files": self._shared_files_for(conv_id),
         })
 
     async def _handle_new_chat(self, request: web.Request) -> web.Response:
@@ -1052,6 +1059,141 @@ class RemoteGatewayServer:
         return web.json_response({"ok": True, "approved": approved, "allowlist": allowlist})
 
     # =========================================================================
+    # Shared files (web app view / download / upload)
+    # =========================================================================
+
+    def _active_conversation_id(self) -> str:
+        raw = getattr(self.agent_loop, "active_conversation_id", None)
+        return str(raw) if raw else ""
+
+    def _shared_files_for(self, conversation_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Public file records for one conversation. None means the active conversation."""
+        if conversation_id is None:
+            conversation_id = self._active_conversation_id()
+        return self.files.list_records(str(conversation_id or ""))
+
+    def _on_file_shared(self, record: Dict[str, Any]):
+        """Tell connected web clients a file is ready. The bytes stay on GET /api/files/{id}."""
+        if record.get("already_shared"):
+            return
+        payload = {key: value for key, value in record.items() if key != "already_shared"}
+        self.broadcast_event("file_shared", {"file": payload})
+        self.broadcast_event("log", {"message": f"Shared file with web app: {payload.get('name')}"})
+
+    def _maybe_share_tool_file(self, tool_name: str, result: Any) -> None:
+        """Hand the web app a file the agent just downloaded or opened on the desktop."""
+        if tool_name not in ("download_file", "open_in_browser"):
+            return
+        if not isinstance(result, dict) or not result.get("success"):
+            return
+        path = result.get("path")
+        if not path or not os.path.isfile(os.path.expanduser(str(path))):
+            return
+        note = "Downloaded file" if tool_name == "download_file" else "Opened on the desktop"
+        try:
+            self.files.register(
+                str(path),
+                direction="bot",
+                conversation_id=self._active_conversation_id(),
+                note=note,
+            )
+        except Exception as exc:
+            logger.debug("Could not share %s result with the web app: %s", tool_name, exc)
+
+    async def _handle_list_files(self, request: web.Request) -> web.Response:
+        """List files shared with the active conversation, or a conversation id query."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        conv_id = request.query.get("conversation_id")
+        if conv_id is None:
+            conv_id = self._active_conversation_id()
+        return web.json_response({
+            "ok": True,
+            "conversation_id": conv_id,
+            "files": self.files.list_records(str(conv_id or "")),
+        })
+
+    async def _handle_get_file(self, request: web.Request) -> web.Response:
+        """Stream one registered file. Add ?download=1 to force a download."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        file_id = request.match_info.get("file_id", "")
+        record = self.files.get(file_id)
+        path = self.files.resolve_path(file_id)
+        if not record or path is None:
+            return web.json_response({"ok": False, "error": "File not found"}, status=404)
+        if not path.is_file():
+            return web.json_response({"ok": False, "error": "File is no longer on disk"}, status=404)
+        download = request.query.get("download", "").lower() in ("1", "true", "yes")
+        return web.FileResponse(
+            path,
+            headers={
+                "Content-Disposition": content_disposition(str(record.get("name") or path.name), download),
+                "Cache-Control": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def _handle_upload_files(self, request: web.Request) -> web.Response:
+        """Accept files from the web app, save them, and start a task that can read them."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        content_type = request.content_type or ""
+        if "multipart/form-data" not in content_type:
+            return web.json_response({"ok": False, "error": "Expected a multipart upload"}, status=400)
+
+        message = ""
+        note = ""
+        saved: List[Dict[str, Any]] = []
+        conv_id = self._active_conversation_id()
+        try:
+            reader = await request.multipart()
+            while True:
+                part = await reader.next()
+                if part is None:
+                    break
+                if part.name == "message":
+                    message = (await part.text()).strip()
+                elif part.name == "note":
+                    note = (await part.text()).strip()
+                elif part.name == "file":
+                    data = await part.read()
+                    if not data:
+                        continue
+                    saved.append(self.files.save_upload(
+                        part.filename or "upload",
+                        data,
+                        conversation_id=conv_id,
+                        note=note,
+                    ))
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.error("File upload failed: %s", exc)
+            return web.json_response({"ok": False, "error": f"Upload failed: {exc}"}, status=500)
+
+        if not saved:
+            return web.json_response({"ok": False, "error": "No file was uploaded"}, status=400)
+
+        prompt = self._attachment_prompt(message, saved)
+        self.dispatch_task(prompt, speak_on_host=False)
+        public = [{key: value for key, value in rec.items() if key != "already_shared"} for rec in saved]
+        return web.json_response({"ok": True, "files": public, "prompt": prompt})
+
+    @staticmethod
+    def _attachment_prompt(message: str, records: List[Dict[str, Any]]) -> str:
+        """User-visible prompt that also tells the agent where the uploads landed."""
+        lines: List[str] = []
+        text = (message or "").strip()
+        lines.append(text or "Please read the attached files and respond.")
+        lines.append("")
+        lines.append("Attached files:")
+        for rec in records:
+            lines.append(f"- {rec.get('name')}: {rec.get('path')}")
+        return "\n".join(lines)
+
+    # =========================================================================
     # Task Dispatch & Agent Controls
     # =========================================================================
 
@@ -1211,6 +1353,7 @@ class RemoteGatewayServer:
             "conversation_id": conv_id,
             "title": title,
             "messages": [],
+            "files": self._shared_files_for(conv_id),
         })
         self.broadcast_event("log", {"message": f"Started new conversation: '{title}'"})
         return conv_id
@@ -1226,6 +1369,7 @@ class RemoteGatewayServer:
                         "conversation_id": cid,
                         "title": title,
                         "messages": msgs,
+                        "files": self._shared_files_for(cid),
                     })
                     self.broadcast_event("log", {"message": f"Switched conversation to: '{title}'"})
                     return True
@@ -1261,6 +1405,7 @@ class RemoteGatewayServer:
 
     def _on_agent_tool_end(self, tool_name: str, result: Any):
         self.broadcast_event("tool_end", {"tool": tool_name, "result": str(result)[:500]})
+        self._maybe_share_tool_file(tool_name, result)
 
     def _on_agent_task_start(self, goal: str):
         self.broadcast_event("task_start", {"goal": goal})
@@ -1277,6 +1422,7 @@ class RemoteGatewayServer:
             "conversation_id": cid or conv_id,
             "title": cur_title or title,
             "messages": msgs,
+            "files": self._shared_files_for(cid or conv_id),
         })
 
     # =========================================================================
@@ -1395,6 +1541,7 @@ class RemoteGatewayServer:
                                 "conversation_id": cid,
                                 "title": title,
                                 "messages": msgs,
+                                "files": self._shared_files_for(cid),
                             })
                         elif msg_type == "get_status":
                             await ws.send_json({
@@ -1595,7 +1742,7 @@ class RemoteGatewayServer:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            self._app = web.Application(middlewares=[cors_middleware])
+            self._app = web.Application(middlewares=[cors_middleware], client_max_size=100 * 1024 * 1024)
             self._app.router.add_get("/api/status", self._handle_status)
             self._app.router.add_get("/api/history", self._handle_history)
             self._app.router.add_post("/api/conversations/new", self._handle_new_chat)
@@ -1613,6 +1760,9 @@ class RemoteGatewayServer:
             self._app.router.add_post("/api/kill", self._handle_kill)
             self._app.router.add_post("/api/reset", self._handle_reset)
             self._app.router.add_post("/api/open_link", self._handle_open_link)
+            self._app.router.add_get("/api/files", self._handle_list_files)
+            self._app.router.add_post("/api/files", self._handle_upload_files)
+            self._app.router.add_get("/api/files/{file_id}", self._handle_get_file)
             self._app.router.add_post("/api/speak", self._handle_speak)
             self._app.router.add_get("/api/tts", self._handle_tts)
             self._app.router.add_post("/api/tts", self._handle_tts)
