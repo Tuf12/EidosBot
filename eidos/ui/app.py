@@ -8,7 +8,7 @@ import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from PyQt6.QtCore import QObject, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication
 
 from eidos.core.loop import AgentLoop
@@ -111,6 +111,13 @@ class UIController(QObject):
         self.pill.signal_submit_task.connect(self.start_task_in_background)
         self.pill.signal_toggle_mic.connect(self._toggle_voice_mic)
         self.pill.signal_toggle_auto_speak.connect(self._on_toggle_auto_speak)
+        self.pill.signal_playback_toggle.connect(self._on_playback_toggle)
+        self.pill.signal_playback_stop.connect(self._stop_speaking)
+        self.pill.signal_playback_seek.connect(self._on_playback_seek)
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(200)
+        self._playback_timer.timeout.connect(self._sync_playback_bar)
+        self._playback_timer.start()
         self.signal_update_mic_state.connect(self.pill.set_mic_recording)
         self.signal_voice_transcribed.connect(self._on_voice_transcribed)
 
@@ -290,12 +297,12 @@ class UIController(QObject):
 
     @pyqtSlot()
     def open_skills_folder(self):
-        """Open ~/.eidos/skills in native desktop file manager."""
+        """Open skills directory in native desktop file manager."""
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
 
         skills_dir = os.path.abspath(os.path.expanduser(
-            self.config.get("skills", {}).get("directory", "~/.eidos/skills")
+            self.config.get("skills", {}).get("directory", "~/EidosWorkspace/skills")
         ))
         os.makedirs(skills_dir, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(skills_dir))
@@ -652,6 +659,47 @@ class UIController(QObject):
         except OSError as exc:
             logger.warning("Could not save Auto-Read setting: %s", exc)
 
+    def _voice(self):
+        loop = self._agent_loop
+        if loop is None:
+            return None
+        voice = getattr(loop, "voice", None)
+        if voice is None or not hasattr(voice, "playback_snapshot"):
+            return None
+        return voice
+
+    def _sync_playback_bar(self) -> None:
+        voice = self._voice()
+        if voice is None:
+            self.pill.set_playback({"active": False})
+            return
+        try:
+            self.pill.set_playback(voice.playback_snapshot())
+        except Exception:
+            logger.debug("Speech bar update failed", exc_info=True)
+
+    def _on_playback_toggle(self) -> None:
+        voice = self._voice()
+        if voice is None:
+            return
+        try:
+            snap = voice.playback_snapshot()
+            if snap.get("playing"):
+                voice.pause_playback()
+            else:
+                voice.resume_playback()
+        except Exception:
+            logger.debug("Speech bar play/pause failed", exc_info=True)
+
+    def _on_playback_seek(self, seconds: int) -> None:
+        voice = self._voice()
+        if voice is None:
+            return
+        try:
+            voice.seek_playback(int(seconds))
+        except Exception:
+            logger.debug("Speech bar seek failed", exc_info=True)
+
     def _stop_speaking(self) -> None:
         """Halt any TTS that is already playing."""
         if self._agent_loop is None or not hasattr(self._agent_loop, "voice") or not self._agent_loop.voice:
@@ -698,12 +746,21 @@ class UIController(QObject):
         if self.is_task_running():
             logger.warning("An agent task is already running.")
             active = self._active_task_prompt or "unknown task"
-            self.pill.set_status("executing", "Task already in progress...")
-            self.signal_chat_error.emit(
-                f"Still working on: \"{active}\". "
-                "Wait for it to finish, approve/deny any pending confirmation dialog, "
-                "or press Emergency Stop (Ctrl+Alt+Esc) to cancel."
+            stopping = bool(
+                self._agent_loop is not None
+                and hasattr(self._agent_loop, "is_stop_requested")
+                and self._agent_loop.is_stop_requested()
             )
+            if stopping:
+                self.pill.set_status("executing", "Stopping the current task...")
+                self.signal_chat_error.emit("Stopping the current task. You can send a new one in a moment.")
+            else:
+                self.pill.set_status("executing", "Task already in progress...")
+                self.signal_chat_error.emit(
+                    f"Still working on: \"{active}\". "
+                    "Wait for it to finish, use Stop to cancel it, "
+                    "or press Emergency Stop (Ctrl+Alt+Esc)."
+                )
             return
 
         if self.kill_switch.is_triggered():
@@ -729,7 +786,9 @@ class UIController(QObject):
             try:
                 res = self._agent_loop.run_task(task_prompt)
                 summary = res.get("summary", "")
-                if res.get("success"):
+                if res.get("stopped"):
+                    self.pill.signal_set_status.emit("idle", "Task stopped by user")
+                elif res.get("success"):
                     self.pill.signal_set_status.emit("idle", f"Done: {summary}")
                     if summary:
                         self.signal_chat_assistant_message.emit(summary)
@@ -768,8 +827,7 @@ class UIController(QObject):
         if self._agent_loop is not None and hasattr(self._agent_loop, "cancel_task"):
             self._agent_loop.cancel_task()
 
-        self.pill.set_status("idle", "Task stopped by user")
-        self.pill.set_task_running(False)
+        self.pill.set_status("executing", "Stopping task...")
         self.signal_chat_assistant_message.emit("⏹ *Task stopped by user.*")
 
     @pyqtSlot(str)

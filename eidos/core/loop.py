@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -193,6 +194,7 @@ class AgentLoop:
             gatekeeper=self.gatekeeper,
             sandbox_config=self.config.get("sandbox"),
         )
+        self.shell.stop_checker = self.is_stop_requested
         self.inputs = InputSimulator(gatekeeper=self.gatekeeper)
         self.web = WebResearchEngine(model_router=self.router)
 
@@ -211,6 +213,7 @@ class AgentLoop:
             project_skills_dir=skills_cfg.get("project_directory"),
         )
         self.active_skill: Optional[Dict[str, Any]] = None
+        self.active_job: Optional[Dict[str, Any]] = None
         self.job_processor = SkillJobProcessor(
             model_router=self.router,
             web_research_engine=self.web,
@@ -257,14 +260,7 @@ class AgentLoop:
         }
         self.conversation_history: List[Dict[str, Any]] = []
         self.last_turn_trace: Dict[str, Any] = {}
-
-        # Restore past turns from active conversation if persisted
-        if self.conversation_store and self.active_conversation_id:
-            past_messages = self.conversation_store.get_messages(self.active_conversation_id)
-            for pm in past_messages:
-                role = (pm.get("role") or "").lower()
-                if role in ("user", "assistant"):
-                    self.conversation_history.append({"role": role, "content": pm.get("content", "")})
+        self.reload_conversation_history()
 
     def register_callback(self, event_name: str, callback: Any):
         """Register an observer callback for execution events."""
@@ -279,6 +275,18 @@ class AgentLoop:
             except Exception as e:
                 logger.warning("Error in callback %s: %s", event_name, e)
 
+    def reload_conversation_history(self) -> None:
+        """Replace in-memory turns with the active conversation's stored messages."""
+        self.conversation_history.clear()
+        if not self.conversation_store or not self.active_conversation_id:
+            return
+        for message in self.conversation_store.get_messages(self.active_conversation_id):
+            role = (message.get("role") or "").lower()
+            if role in ("user", "assistant"):
+                self.conversation_history.append(
+                    {"role": role, "content": message.get("content", "")}
+                )
+
     def clear_history(self):
         """Clear conversational turn history and stored messages for active conversation."""
         self.conversation_history.clear()
@@ -290,10 +298,51 @@ class AgentLoop:
                 title = conv.get("title", "New Chat")
         self._emit("on_conversation_changed", self.active_conversation_id, title)
 
+    def _abort_model(self) -> None:
+        """Close the model HTTP call that is generating the current step."""
+        seen = set()
+        for client in (
+            getattr(self, "model", None),
+            getattr(self, "router", None),
+            getattr(self, "ollama", None),
+            getattr(self, "chutes", None),
+        ):
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            abort = getattr(client, "abort", None)
+            if not callable(abort):
+                continue
+            try:
+                abort()
+            except Exception:
+                logger.debug("Model abort failed", exc_info=True)
+
+    def _reset_model_abort(self) -> None:
+        """Clear stop flags on model clients before a new task."""
+        seen = set()
+        for client in (
+            getattr(self, "model", None),
+            getattr(self, "router", None),
+            getattr(self, "ollama", None),
+            getattr(self, "chutes", None),
+        ):
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            reset = getattr(client, "reset_abort", None)
+            if not callable(reset):
+                continue
+            try:
+                reset()
+            except Exception:
+                logger.debug("Model abort reset failed", exc_info=True)
+
     def cancel_task(self) -> None:
         """Request graceful cancellation of the running agent task."""
         logger.info("AgentLoop task cancellation requested.")
         self._stop_requested.set()
+        self._abort_model()
         try:
             if self.voice:
                 self.voice.stop_speaking()
@@ -329,12 +378,7 @@ class AgentLoop:
         if not conv:
             return False
         self.active_conversation_id = conversation_id
-        self.conversation_history.clear()
-        messages = self.conversation_store.get_messages(conversation_id)
-        for m in messages:
-            role = (m.get("role") or "").lower()
-            if role in ("user", "assistant"):
-                self.conversation_history.append({"role": role, "content": m.get("content", "")})
+        self.reload_conversation_history()
         title = conv.get("title", "New Chat")
         self._emit("on_conversation_title_changed", title)
         self._emit("on_conversation_changed", conversation_id, title)
@@ -372,6 +416,7 @@ class AgentLoop:
             self.ollama.base_url = local_cfg.get("base_url", self.ollama.base_url).rstrip("/")
             self.ollama.reasoning_model = local_cfg.get("reasoning_model", self.ollama.reasoning_model)
             self.ollama.vision_model = local_cfg.get("vision_model", self.ollama.vision_model)
+            self.ollama.clear_vision_capability_cache()
 
         # Update cloud Chutes settings
         cloud_cfg = new_config.get("models", {}).get("cloud", {})
@@ -577,7 +622,7 @@ class AgentLoop:
         user_profile_ctx: Optional[str] = None,
         episodic_ctx: Optional[str] = None,
     ) -> str:
-        """Construct lean system prompt and append active skill procedure if scoped."""
+        """Construct lean system prompt, appending active job context and active skill procedure if scoped."""
         prompt = build_system_prompt(
             active_win,
             os.getcwd(),
@@ -586,6 +631,33 @@ class AgentLoop:
             episodic_context=episodic_ctx,
             workspace_dir=self.workspace_dir,
         )
+        if self.active_job:
+            job_id = self.active_job.get("job_id", "")
+            job_name = self.active_job.get("name") or self.active_job.get("job_name", "")
+            status = self.active_job.get("status", "")
+            skill_info = self.active_job.get("skill", {})
+            skill_name = skill_info.get("name") if isinstance(skill_info, dict) else self.active_job.get("skill_name", "")
+            dirs = self.active_job.get("directories", {})
+            job_dir = dirs.get("job_dir") or dirs.get("output_dir", "")
+            artifacts_dir = dirs.get("artifacts_dir") or dirs.get("portfolios_dir", "")
+            prog = self.active_job.get("progress", {})
+            total = prog.get("total_items", 0)
+            done = prog.get("completed_items", 0)
+            pct = prog.get("percent", 0.0)
+
+            prompt += f"""
+
+---
+ACTIVE JOB MODE: {job_name} ({job_id})
+- Status: {status}
+- Assigned Skill: {skill_name}
+- Working Directory: {job_dir}
+- Artifacts Directory: {artifacts_dir}
+- Progress: {done}/{total} items ({pct}%)
+- Queue State: {dirs.get('queue_file', '')}
+- Manifest: {dirs.get('manifest_file', '')}
+---"""
+
         if self.active_skill:
             skill_name = self.active_skill.get("name", "unnamed-skill")
             skill_body = (self.active_skill.get("body") or "").strip()
@@ -593,9 +665,34 @@ class AgentLoop:
         return prompt
 
     def _assemble_active_tools(self) -> List[Dict[str, Any]]:
-        """Return base tools or scoped tools unlocked by active skill."""
+        """Return base tools or scoped tools unlocked by active skill and active job."""
+        req_tools: List[str] = []
+
+        if self.active_job:
+            req_tools.extend([
+                "init_batch_job",
+                "run_batch_job",
+                "step_batch_job",
+                "get_job_status",
+                "pause_batch_job",
+                "resume_batch_job",
+                "generate_batch_summary",
+                "load_job",
+                "close_job",
+            ])
+
         if self.active_skill:
-            req_tools = self.active_skill.get("tools_required") or []
+            for t in (self.active_skill.get("tools_required") or []):
+                if t not in req_tools:
+                    req_tools.append(t)
+        elif self.active_job:
+            skill_info = self.active_job.get("skill")
+            if isinstance(skill_info, dict):
+                for t in (skill_info.get("tools_required") or []):
+                    if t not in req_tools:
+                        req_tools.append(t)
+
+        if req_tools:
             return ToolRegistry.get_scoped_tools(req_tools)
         return ToolRegistry.get_base_tools()
 
@@ -745,8 +842,10 @@ class AgentLoop:
             outcome=outcome,
         )
         self._emit("on_task_finish", headline, success)
+        stopped = outcome == "aborted" and "stopped by user" in headline.lower()
         return {
             "success": success,
+            "stopped": stopped,
             "summary": headline,
             "detail": detail,
             "steps_taken": step,
@@ -764,7 +863,9 @@ class AgentLoop:
         max_steps = self._resolve_max_steps(max_steps)
         logger.info("Starting EidosBot task: %s", user_goal)
         self._stop_requested.clear()
+        self._reset_model_abort()
         self.active_skill = None
+        self.active_job = None
         self._emit("on_task_start", user_goal)
         try:
             self.voice.stop_speaking()
@@ -797,6 +898,7 @@ class AgentLoop:
             self._emit("on_task_finish", summary, False)
             return {
                 "success": False,
+                "stopped": True,
                 "summary": summary,
                 "steps_taken": 0,
             }
@@ -906,6 +1008,27 @@ class AgentLoop:
 
             # 2. Reason: Call model
             response = self.model.chat(messages=messages, tools=active_tools)
+            if self._stop_requested.is_set() or self.kill_switch.is_triggered() or (
+                isinstance(getattr(response, "raw", None), dict) and response.raw.get("cancelled")
+            ):
+                logger.warning("Agent loop stopped during model generation at step %d", step)
+                killed = self.kill_switch.is_triggered()
+                return self._complete_run(
+                    episode_id=episode_id,
+                    headline=(
+                        f"Aborted by emergency kill switch at step {step}."
+                        if killed
+                        else "Task stopped by user."
+                    ),
+                    success=False,
+                    outcome="aborted",
+                    step=step,
+                    speak=False,
+                    speak_summary=speak_summary,
+                    thoughts=turn_thoughts,
+                    actions=turn_actions,
+                    include_trace=bool(turn_thoughts or turn_actions),
+                )
 
             if response.thinking:
                 logger.info("[Thinking]: %s", response.thinking)
@@ -1129,6 +1252,7 @@ class AgentLoop:
 
         if name == "finish_task":
             self.active_skill = None
+            self.active_job = None
             return {"status": "completed", "summary": args.get("summary", "")}, True
 
         if name == "update_user_profile":
@@ -1604,6 +1728,9 @@ class AgentLoop:
             skill_name = args.get("skill_name", "")
             items_data = args.get("items_data", [])
             output_dir = args.get("output_dir")
+            description = args.get("description")
+            project = args.get("project")
+            phase = args.get("phase")
             allowed, reason = self.gatekeeper.evaluate(
                 "init_batch_job",
                 {"job_name": job_name, "skill_name": skill_name, "output_dir": output_dir},
@@ -1616,7 +1743,17 @@ class AgentLoop:
                     skill_name=skill_name,
                     input_data=items_data,
                     output_dir=output_dir,
+                    description=description,
+                    project=project,
+                    phase=phase,
                 )
+                # Automatically enter Job Mode and activate assigned skill
+                manifest = self.jobs.load_manifest(str(queue.output_dir))
+                self.active_job = manifest or queue.to_manifest_dict()
+                if queue.skill_name:
+                    skill_res = self.skills.load_skill(queue.skill_name)
+                    if skill_res:
+                        self.active_skill = skill_res
                 return {
                     "success": True,
                     "job_id": queue.job_id,
@@ -1625,12 +1762,64 @@ class AgentLoop:
                     "total_items": queue.total_items,
                     "output_dir": queue.output_dir,
                     "status": queue.status,
+                    "job_mode": "activated",
+                    "manifest_file": str(Path(queue.output_dir) / "job.yaml"),
                 }, False
             except Exception as e:
                 return {"success": False, "error": str(e)}, False
 
+        if name == "load_job":
+            job_id = args.get("job_id") or args.get("job_path") or args.get("job_id_or_path", "")
+            if not job_id:
+                return {"success": False, "error": "job_id or job_path is required."}, False
+            allowed, reason = self.gatekeeper.evaluate("load_job", {"job_id": job_id})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            queue = self.jobs.load_job(job_id)
+            if not queue:
+                return {"success": False, "error": f"Could not find or load job '{job_id}'."}, False
+
+            manifest = self.jobs.load_manifest(job_id)
+            self.active_job = manifest or queue.to_manifest_dict()
+
+            # Activate assigned skill if present
+            skill_name = queue.skill_name
+            if skill_name:
+                skill_res = self.skills.load_skill(skill_name)
+                if skill_res:
+                    self.active_skill = skill_res
+
+            logger.info("Loaded job '%s' (%s) into Job Mode with skill '%s'", queue.job_name, queue.job_id, skill_name)
+            return {
+                "success": True,
+                "status": "activated",
+                "job_id": queue.job_id,
+                "job_name": queue.job_name,
+                "assigned_skill": skill_name,
+                "total_items": queue.total_items,
+                "completed_items": queue.completed_items,
+                "pending_items": queue.pending_items,
+                "output_dir": queue.output_dir,
+                "message": f"Job '{queue.job_name}' loaded into Job Mode. Assigned skill '{skill_name}' activated.",
+            }, False
+
+        if name == "close_job":
+            if not self.active_job:
+                return {"success": True, "message": "No job is currently active. Operating in base kernel mode."}, False
+            prev_job_name = self.active_job.get("name") or self.active_job.get("job_name", "job")
+            self.active_job = None
+            self.active_skill = None
+            logger.info("Closed active job '%s'. Returned to base kernel mode.", prev_job_name)
+            return {
+                "success": True,
+                "status": "closed",
+                "previous_job": prev_job_name,
+                "message": f"Job '{prev_job_name}' closed. Returned to base kernel mode.",
+            }, False
+
         if name == "run_batch_job":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             background = args.get("background", True)
             if isinstance(background, str):
                 background = background.lower() in ("true", "1", "yes")
@@ -1668,39 +1857,59 @@ class AgentLoop:
                     kill_switch_checker=self.kill_switch.is_triggered,
                     stop_event=self._stop_requested,
                 )
+            if job_id and self.active_job:
+                updated_manifest = self.jobs.load_manifest(job_id)
+                if updated_manifest:
+                    self.active_job = updated_manifest
             return res, False
 
         if name == "step_batch_job":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             allowed, reason = self.gatekeeper.evaluate("step_batch_job", {"job_id": job_id})
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
             res = self.jobs.step_next(job_id_or_path=job_id)
+            if job_id and self.active_job:
+                updated_manifest = self.jobs.load_manifest(job_id)
+                if updated_manifest:
+                    self.active_job = updated_manifest
             return res, False
 
         if name == "get_job_status":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             res = self.jobs.get_status(job_id_or_path=job_id)
+            if job_id and self.active_job:
+                updated_manifest = self.jobs.load_manifest(job_id)
+                if updated_manifest:
+                    self.active_job = updated_manifest
             return res, False
 
         if name == "pause_batch_job":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             allowed, reason = self.gatekeeper.evaluate("pause_batch_job", {"job_id": job_id})
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
             res = self.jobs.pause(job_id_or_path=job_id)
+            if job_id and self.active_job:
+                updated_manifest = self.jobs.load_manifest(job_id)
+                if updated_manifest:
+                    self.active_job = updated_manifest
             return res, False
 
         if name == "resume_batch_job":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             allowed, reason = self.gatekeeper.evaluate("resume_batch_job", {"job_id": job_id})
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
             res = self.jobs.resume(job_id_or_path=job_id)
+            if job_id and self.active_job:
+                updated_manifest = self.jobs.load_manifest(job_id)
+                if updated_manifest:
+                    self.active_job = updated_manifest
             return res, False
 
         if name == "generate_batch_summary":
-            job_id = args.get("job_id")
+            job_id = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
             allowed, reason = self.gatekeeper.evaluate("generate_batch_summary", {"job_id": job_id})
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False

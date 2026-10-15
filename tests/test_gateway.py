@@ -136,13 +136,34 @@ class TestRemoteGateway(unittest.TestCase):
                     self.assertTrue(data.get("ok"))
                     self.mock_agent.kill_switch.reset.assert_called()
 
-                # Trigger stop
+                # Stop cancels a task that is still running.
+                self.server.current_state = "thinking"
                 self.mock_agent.cancel_task = MagicMock()
                 async with session.post(f"http://127.0.0.1:{self.port}/api/stop", headers=headers) as resp:
                     self.assertEqual(resp.status, 200)
                     data = await resp.json()
                     self.assertTrue(data.get("ok"))
                     self.mock_agent.cancel_task.assert_called()
+
+                # Stopping again after the reply finished must not cancel the
+                # agent or emit a finish event that would replace that reply.
+                self.server.current_state = "idle"
+                self.mock_agent.cancel_task.reset_mock()
+                events = []
+                original_broadcast = self.server.broadcast_event
+
+                def _capture_broadcast(event, data):
+                    events.append(event)
+                    return original_broadcast(event, data)
+
+                self.server.broadcast_event = _capture_broadcast
+                try:
+                    async with session.post(f"http://127.0.0.1:{self.port}/api/stop", headers=headers) as resp:
+                        self.assertEqual(resp.status, 200)
+                finally:
+                    self.server.broadcast_event = original_broadcast
+                self.mock_agent.cancel_task.assert_not_called()
+                self.assertNotIn("task_finished", events)
 
         asyncio.run(_test())
 
@@ -290,6 +311,45 @@ class TestRemoteGateway(unittest.TestCase):
                     data = await resp.json()
                     self.assertTrue(data.get("ok"))
                     self.mock_agent.inputs.click.assert_called_with(x=100, y=200, button="left")
+
+        asyncio.run(_test())
+
+    def test_type_endpoint(self):
+        """Phone keyboard text and special keys are relayed to the desktop."""
+        async def _test():
+            self.mock_agent.inputs.relay_typing.return_value = {"success": True}
+            headers = {"Authorization": f"Bearer {self.auth_token}"}
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"http://127.0.0.1:{self.port}/api/type",
+                    headers=headers,
+                    json={"text": "Hi", "backspaces": 1},
+                ) as resp:
+                    self.assertEqual(resp.status, 200)
+                    data = await resp.json()
+                    self.assertTrue(data.get("ok"))
+                self.mock_agent.inputs.relay_typing.assert_called_with("Hi", 1, "")
+
+                async with session.post(
+                    f"http://127.0.0.1:{self.port}/api/type",
+                    headers=headers,
+                    json={"key": "enter"},
+                ) as resp:
+                    self.assertEqual(resp.status, 200)
+                self.mock_agent.inputs.relay_typing.assert_called_with("", 0, "enter")
+
+                async with session.post(
+                    f"http://127.0.0.1:{self.port}/api/type",
+                    headers=headers,
+                    json={"key": "f12"},
+                ) as resp:
+                    self.assertEqual(resp.status, 400)
+
+                async with session.post(
+                    f"http://127.0.0.1:{self.port}/api/type",
+                    json={"text": "Hi"},
+                ) as resp:
+                    self.assertEqual(resp.status, 401)
 
         asyncio.run(_test())
 

@@ -1,11 +1,24 @@
 import React, { useState } from 'react';
-import { ChevronDown, ChevronRight, Brain, Copy, Check } from 'lucide-react';
+import { ChevronDown, ChevronRight, Brain, Copy, Check, Volume2, Square, Loader2 } from 'lucide-react';
+import { copyToClipboard } from './MarkdownRenderer';
 
 interface ThoughtAccordionProps {
   thoughts: string[];
+  playbackId?: string;
+  isPlaying?: boolean;
+  isBuffering?: boolean;
+  onPlayAudio?: (text: string, messageId: string) => void;
+  onStopAudio?: () => void;
 }
 
-export const ThoughtAccordion: React.FC<ThoughtAccordionProps> = ({ thoughts }) => {
+export const ThoughtAccordion: React.FC<ThoughtAccordionProps> = ({
+  thoughts,
+  playbackId,
+  isPlaying = false,
+  isBuffering = false,
+  onPlayAudio,
+  onStopAudio,
+}) => {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -13,11 +26,22 @@ export const ThoughtAccordion: React.FC<ThoughtAccordionProps> = ({ thoughts }) 
 
   const fullThoughtText = thoughts.join('\n\n');
 
-  const handleCopy = (e: React.MouseEvent) => {
+  const handleCopy = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(fullThoughtText);
+    await copyToClipboard(fullThoughtText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  const handleSpeak = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!onPlayAudio || !playbackId) return;
+    if (isPlaying) {
+      onStopAudio?.();
+      return;
+    }
+    onPlayAudio(fullThoughtText, playbackId);
   };
 
   return (
@@ -33,6 +57,33 @@ export const ThoughtAccordion: React.FC<ThoughtAccordionProps> = ({ thoughts }) 
           </span>
         </div>
         <div className="flex items-center gap-2">
+          {onPlayAudio && playbackId && (
+            <span
+              onClick={handleSpeak}
+              title={
+                isBuffering
+                  ? 'Synthesizing Kokoro speech...'
+                  : isPlaying
+                  ? 'Stop speech playback'
+                  : 'Read reasoning aloud on this device (Kokoro TTS)'
+              }
+              className={`p-1 transition ${
+                isPlaying
+                  ? 'text-[#ff5555]'
+                  : isBuffering
+                  ? 'text-[#bd93f9]'
+                  : 'hover:text-[#f8f8f2]'
+              }`}
+            >
+              {isBuffering ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : isPlaying ? (
+                <Square className="w-3 h-3 fill-current" />
+              ) : (
+                <Volume2 className="w-3 h-3" />
+              )}
+            </span>
+          )}
           <span
             onClick={handleCopy}
             title="Copy reasoning"

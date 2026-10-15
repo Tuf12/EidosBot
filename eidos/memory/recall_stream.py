@@ -16,6 +16,19 @@ logger = logging.getLogger(__name__)
 RECALL_TAG_PATTERN = re.compile(r"<recall>(.*?)</recall>", re.DOTALL | re.IGNORECASE)
 
 
+def _stop_requested(should_stop: Optional[Callable[[], bool]]) -> bool:
+    if should_stop is None:
+        return False
+    try:
+        return bool(should_stop())
+    except Exception:
+        return False
+
+
+def _cancelled_response(model_name: str) -> ModelResponse:
+    return ModelResponse(content="", model=model_name, raw={"cancelled": True})
+
+
 class RecallStreamInterceptor:
     """Interceps `<recall>query</recall>` tags during token streaming and splices episodic memory & OptimalX notes."""
 
@@ -129,6 +142,8 @@ class RecallStreamInterceptor:
         tools: Optional[List[Dict[str, Any]]] = None,
         timeout: float = 120.0,
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
+        on_response: Optional[Callable[[Any], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> ModelResponse:
         """Stream chat completion, intercepting `<recall>` tags and splicing memories until complete."""
         current_messages = list(messages)
@@ -161,8 +176,14 @@ class RecallStreamInterceptor:
                     timeout=timeout,
                 )
                 resp.raise_for_status()
+                if on_response is not None:
+                    on_response(resp)
+                if _stop_requested(should_stop):
+                    return _cancelled_response(model_name)
 
                 for line in resp.iter_lines():
+                    if _stop_requested(should_stop):
+                        return _cancelled_response(model_name)
                     if not line:
                         continue
 
@@ -244,6 +265,9 @@ class RecallStreamInterceptor:
                         break
 
             except Exception as exc:
+                if _stop_requested(should_stop):
+                    logger.info("Ollama stream cancelled for model %s", model_name)
+                    return _cancelled_response(model_name)
                 logger.error("Error during streaming chat with recall: %s", exc)
                 if resp is not None:
                     try:
@@ -302,6 +326,8 @@ class RecallStreamInterceptor:
         timeout: float = 180.0,
         headers: Optional[Dict[str, str]] = None,
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
+        on_response: Optional[Callable[[Any], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> ModelResponse:
         """Stream OpenAI-compatible SSE chat completion, intercepting `<recall>` tags and splicing memories."""
         current_messages = list(messages)
@@ -343,8 +369,14 @@ class RecallStreamInterceptor:
                     timeout=timeout,
                 )
                 resp.raise_for_status()
+                if on_response is not None:
+                    on_response(resp)
+                if _stop_requested(should_stop):
+                    return _cancelled_response(model_name)
 
                 for line in resp.iter_lines():
+                    if _stop_requested(should_stop):
+                        return _cancelled_response(model_name)
                     if not line:
                         continue
 
@@ -433,6 +465,9 @@ class RecallStreamInterceptor:
                             break
 
             except Exception as exc:
+                if _stop_requested(should_stop):
+                    logger.info("OpenAI stream cancelled for model %s", model_name)
+                    return _cancelled_response(model_name)
                 logger.error("Error during OpenAI streaming chat with recall: %s", exc)
                 if resp is not None:
                     try:

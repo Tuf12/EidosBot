@@ -276,7 +276,46 @@ def test_agent_loop_cancel_task():
 
         res = agent.run_task("Task to cancel", max_steps=5)
         assert res["success"] is False
+        assert res["stopped"] is True
         assert "stopped by user" in res["summary"].lower()
+
+
+def test_agent_loop_cancel_discards_finished_reply():
+    """A reply that arrives after Stop must not be spoken or treated as success."""
+    with tempfile.NamedTemporaryFile(suffix=".json") as tmp_allow:
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=tmp_allow.name)
+        gatekeeper = Gatekeeper(allowlist=allowlist, kill_switch=kill_switch)
+
+        class ReplyAfterCancel(BaseModelClient):
+            def __init__(self):
+                self.agent = None
+
+            def chat(self, messages, tools=None, model_override=None):
+                if self.agent:
+                    self.agent.cancel_task()
+                return ModelResponse(content="This reply should not be delivered or spoken.")
+
+            def vision_chat(self, prompt, image_base64, system_prompt=None, model_override=None):
+                return ModelResponse(content="")
+
+        mock_model = ReplyAfterCancel()
+        mock_voice = MagicMock()
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+            voice_manager=mock_voice,
+        )
+        mock_model.agent = agent
+
+        res = agent.run_task("Task to cancel after the model answers", max_steps=5)
+        assert res["success"] is False
+        assert res["stopped"] is True
+        assert "stopped by user" in res["summary"].lower()
+        assert "should not be delivered" not in res["summary"].lower()
+        mock_voice.speak.assert_not_called()
+        mock_voice.speak_response.assert_not_called()
 
 
 def test_agent_loop_optimalx_tool_dispatch():

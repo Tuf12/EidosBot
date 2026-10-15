@@ -1,11 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
 import { useEidosWS } from './hooks/useEidosWS';
+import { usePinchTextScale } from './hooks/usePinchTextScale';
 import { useAudioPlayback } from './hooks/useAudioPlayback';
+import { useBackgroundKeepAlive } from './hooks/useBackgroundKeepAlive';
 import { Header } from './components/Header';
 import { ChatView } from './components/ChatView';
 import { ScreenViewport } from './components/ScreenViewport';
 import { SafetyModal } from './components/SafetyModal';
 import { ConversationsModal } from './components/ConversationsModal';
+import { BackgroundSettingsModal } from './components/BackgroundSettingsModal';
+import { AudioPlayerBar } from './components/AudioPlayerBar';
 import { MessageSquare, Monitor, Terminal, ShieldAlert } from 'lucide-react';
 
 type Tab = 'chat' | 'screen' | 'logs';
@@ -13,6 +17,13 @@ type Tab = 'chat' | 'screen' | 'logs';
 export function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
   const [showConversationsModal, setShowConversationsModal] = useState(false);
+  const [showBackgroundSettings, setShowBackgroundSettings] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const { scale: textScale, showBadge: showTextScale } = usePinchTextScale();
+
+  const sendNotificationRef = useRef<(title: string, opts?: NotificationOptions) => Promise<boolean> | void>(
+    () => Promise.resolve(false)
+  );
 
   const {
     token,
@@ -32,21 +43,36 @@ export function App() {
     startNewChat,
     switchConversation,
     sendPrompt,
+    editAndRetry,
+    retryNotice,
+    clearRetryNotice,
     stopTask,
     triggerKill,
     resetKill,
     resolveConfirmation,
-  } = useEidosWS();
+  } = useEidosWS({
+    onSendNotification: (title, opts) => sendNotificationRef.current?.(title, opts),
+  });
 
   const {
     isPlaying,
+    playbackActive,
+    isPaused,
     playingMessageId,
     isBuffering,
+    position,
+    duration,
     autoSpeak,
     toggleAutoSpeak,
     playbackError,
     playText,
     stopAudio,
+    pauseAudio,
+    resumeAudio,
+    seekBy,
+    skipChunk,
+    armBackgroundPlayback,
+    releaseBackgroundArm,
   } = useAudioPlayback({ token });
 
   const handleKill = () => {
@@ -102,8 +128,30 @@ export function App() {
 
   const isThinking = ['thinking', 'executing', 'perceiving'].includes(agentState.toLowerCase());
 
+  const {
+    notificationPermission,
+    requestNotificationPermission,
+    sendNotification,
+    testNotification,
+    isWakeLockActive,
+  } = useBackgroundKeepAlive({
+    isThinking,
+    isPlaying: isPlaying || isPaused || isBuffering,
+    isRecording,
+  });
+
+  sendNotificationRef.current = sendNotification;
+
   return (
     <div className="flex flex-col h-[100dvh] max-w-2xl mx-auto bg-[#1e1f29] text-[#f8f8f2] relative overflow-hidden select-none">
+      {showTextScale && (
+        <div
+          aria-live="polite"
+          className="pointer-events-none fixed left-1/2 top-16 z-[60] -translate-x-1/2 rounded-full border border-[#44475a] bg-[#282a36]/95 px-3 py-1 text-xs font-semibold text-[#f8f8f2] shadow-lg"
+        >
+          Text {Math.round(textScale * 100)}%
+        </div>
+      )}
       {/* Sticky Header */}
       <Header
         connected={connected}
@@ -113,9 +161,8 @@ export function App() {
         token={token}
         conversationTitle={conversationTitle}
         isSyncing={isSyncing}
-        isThinking={isThinking}
-        isPlaying={isPlaying}
-        onStopCallOrTask={handleStopCallOrTask}
+        notificationPermission={notificationPermission}
+        onOpenBackgroundSettings={() => setShowBackgroundSettings(true)}
         onRefreshSync={refreshSync}
         onNewChat={() => startNewChat('New Chat')}
         onOpenConversations={() => setShowConversationsModal(true)}
@@ -124,34 +171,50 @@ export function App() {
         onReset={resetKill}
       />
 
-      {/* Main View Area */}
+      {/* Main View Area - Views kept mounted to prevent killing active background audio/recording on tab switch */}
       <main className="flex-1 overflow-hidden relative">
-        {activeTab === 'chat' && (
+        <div className={`h-full w-full ${activeTab === 'chat' ? 'flex flex-col' : 'hidden'}`}>
           <ChatView
             messages={messages}
             sharedFiles={sharedFiles}
             onSendMessage={sendPrompt}
+            onEditRetry={editAndRetry}
+            retryNotice={retryNotice}
+            onDismissRetryNotice={clearRetryNotice}
             token={token}
             isThinking={isThinking}
             isPlaying={isPlaying}
+            playbackActive={playbackActive}
+            isPaused={isPaused}
+            position={position}
+            duration={duration}
             playingMessageId={playingMessageId}
             isBuffering={isBuffering}
             autoSpeak={autoSpeak}
             onToggleAutoSpeak={toggleAutoSpeak}
             onPlayAudio={playText}
             onStopAudio={stopAudio}
+            onPauseAudio={pauseAudio}
+            onResumeAudio={resumeAudio}
+            onSeekBy={seekBy}
+            onSkipChunk={skipChunk}
+            onPreparePlayback={armBackgroundPlayback}
+            onReleasePreparedPlayback={releaseBackgroundArm}
             onStopTask={handleStopCallOrTask}
             playbackError={playbackError}
             conversationTitle={conversationTitle}
             onNewChat={() => startNewChat('New Chat')}
             onRefreshSync={refreshSync}
             isSyncing={isSyncing}
+            onRecordingChange={setIsRecording}
           />
-        )}
+        </div>
 
-        {activeTab === 'screen' && <ScreenViewport token={token} />}
+        <div className={`h-full w-full ${activeTab === 'screen' ? 'block' : 'hidden'}`}>
+          <ScreenViewport token={token} isActive={activeTab === 'screen'} />
+        </div>
 
-        {activeTab === 'logs' && (
+        <div className={`h-full w-full ${activeTab === 'logs' ? 'flex flex-col' : 'hidden'}`}>
           <div className="flex flex-col h-full p-4 overflow-hidden bg-[#1e1f29]">
             <div className="flex items-center justify-between pb-3 border-b border-[#44475a] mb-3">
               <span className="text-xs font-bold text-[#f8f8f2] flex items-center gap-2">
@@ -171,8 +234,24 @@ export function App() {
               )}
             </div>
           </div>
-        )}
+        </div>
       </main>
+
+      {/* Persistent Audio Player Bar across ALL tabs (Chat, Screen, Logs) */}
+      <AudioPlayerBar
+        playbackActive={playbackActive}
+        isPlaying={isPlaying}
+        isPaused={isPaused}
+        isBuffering={isBuffering}
+        position={position}
+        duration={duration}
+        playbackError={playbackError}
+        onPauseAudio={pauseAudio}
+        onResumeAudio={resumeAudio}
+        onStopAudio={stopAudio}
+        onSeekBy={seekBy}
+        onSkipChunk={skipChunk}
+      />
 
       {/* Bottom Tab Navigation Bar */}
       <nav className="bg-[#1e1f29] border-t border-[#44475a] px-4 py-2 flex items-center justify-around z-20">
@@ -233,6 +312,16 @@ export function App() {
         activeConversationId={conversationId}
         onSelectConversation={switchConversation}
         onNewChat={() => startNewChat('New Chat')}
+      />
+
+      {/* Android Background Execution & Permissions Settings */}
+      <BackgroundSettingsModal
+        isOpen={showBackgroundSettings}
+        onClose={() => setShowBackgroundSettings(false)}
+        permission={notificationPermission}
+        onRequestPermission={requestNotificationPermission}
+        onTestNotification={testNotification}
+        isWakeLockActive={isWakeLockActive}
       />
     </div>
   );

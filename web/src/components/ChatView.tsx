@@ -1,14 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { ChatMessage, SharedFile } from '../types/gateway';
 import { ThoughtAccordion } from './ThoughtAccordion';
-import { MarkdownRenderer } from './MarkdownRenderer';
+import { MarkdownRenderer, copyToClipboard, markdownToPlainText } from './MarkdownRenderer';
 import {
   Send,
   Volume2,
   VolumeX,
   Loader2,
   Square,
-  PhoneOff,
   Mic,
   MicOff,
   Bot,
@@ -22,28 +21,61 @@ import {
   Plus,
   RefreshCw,
   Paperclip,
+  Pencil,
+  Pause,
+  Play,
+  RotateCcw,
+  RotateCw,
+  SkipBack,
+  SkipForward,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { SharedFiles } from './SharedFiles';
+
+function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+  const whole = Math.floor(seconds);
+  const minutes = Math.floor(whole / 60);
+  const remain = whole % 60;
+  return `${minutes}:${remain.toString().padStart(2, '0')}`;
+}
 
 interface ChatViewProps {
   messages: ChatMessage[];
   sharedFiles?: SharedFile[];
   onSendMessage: (text: string) => void;
+  onEditRetry?: (messageIndex: number, prompt: string, messageId: string) => void;
+  retryNotice?: string | null;
+  onDismissRetryNotice?: () => void;
   token: string;
   isThinking: boolean;
   isPlaying?: boolean;
+  playbackActive?: boolean;
+  isPaused?: boolean;
+  position?: number;
+  duration?: number;
   playingMessageId?: string | null;
   isBuffering?: boolean;
   autoSpeak?: boolean;
   onToggleAutoSpeak?: () => void;
   onPlayAudio?: (text: string, messageId: string) => void;
   onStopAudio?: () => void;
+  onPauseAudio?: () => void;
+  onResumeAudio?: () => void;
+  onSeekBy?: (seconds: number) => void;
+  onSkipChunk?: (direction: -1 | 1) => void;
+  /** Start the background audio session in the send gesture, before the reply exists. */
+  onPreparePlayback?: () => void;
+  /** Drop that session when the send is cancelled or fails before a reply. */
+  onReleasePreparedPlayback?: () => void;
   onStopTask?: () => void;
   playbackError?: string | null;
   conversationTitle?: string;
   onNewChat?: () => void;
   onRefreshSync?: () => void;
   isSyncing?: boolean;
+  onRecordingChange?: (isRecording: boolean) => void;
 }
 
 function parseEmbeddedThoughts(
@@ -72,27 +104,45 @@ export const ChatView: React.FC<ChatViewProps> = ({
   messages,
   sharedFiles = [],
   onSendMessage,
+  onEditRetry,
+  retryNotice,
+  onDismissRetryNotice,
   token,
   isThinking,
   isPlaying = false,
+  playbackActive = false,
+  isPaused = false,
+  position = 0,
+  duration = 0,
   playingMessageId = null,
   isBuffering = false,
   autoSpeak = false,
   onToggleAutoSpeak,
   onPlayAudio,
   onStopAudio,
+  onPauseAudio,
+  onResumeAudio,
+  onSeekBy,
+  onSkipChunk,
+  onPreparePlayback,
+  onReleasePreparedPlayback,
   onStopTask,
   playbackError,
   conversationTitle = 'New Chat',
   onNewChat,
   onRefreshSync,
   isSyncing = false,
+  onRecordingChange,
 }) => {
   const [inputText, setInputText] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
+
+  useEffect(() => {
+    onRecordingChange?.(isRecording);
+  }, [isRecording, onRecordingChange]);
   const [recordingDuration, setRecordingDuration] = useState(0);
   const [autoSubmitVoice, setAutoSubmitVoice] = useState<boolean>(() => {
     return localStorage.getItem('eidos_auto_submit_voice') !== 'false';
@@ -101,15 +151,33 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [pendingFiles, setPendingFiles] = useState<File[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState('');
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const editRef = useRef<HTMLTextAreaElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const cancelledRef = useRef<boolean>(false);
   const recordingTimerRef = useRef<number | null>(null);
+  const micArmedPlaybackRef = useRef(false);
+  const preparePlaybackRef = useRef(onPreparePlayback);
+  const releasePlaybackRef = useRef(onReleasePreparedPlayback);
+  const autoSpeakRef = useRef(autoSpeak);
+  const autoSubmitVoiceRef = useRef(autoSubmitVoice);
+  preparePlaybackRef.current = onPreparePlayback;
+  releasePlaybackRef.current = onReleasePreparedPlayback;
+  autoSpeakRef.current = autoSpeak;
+  autoSubmitVoiceRef.current = autoSubmitVoice;
+
+  const releaseMicPlayback = () => {
+    if (!micArmedPlaybackRef.current) return;
+    micArmedPlaybackRef.current = false;
+    releasePlaybackRef.current?.();
+  };
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -171,11 +239,66 @@ export const ChatView: React.FC<ChatViewProps> = ({
     adjustTextareaHeight();
   }, [inputText, isExpanded, adjustTextareaHeight]);
 
+  useEffect(() => {
+    if (!editingId) return;
+    const el = editRef.current;
+    if (!el) return;
+    el.focus();
+    const end = el.value.length;
+    el.setSelectionRange(end, end);
+  }, [editingId]);
+
+  useEffect(() => {
+    if (editingId && !messages.some((message) => message.id === editingId)) {
+      setEditingId(null);
+      setEditDraft('');
+    }
+  }, [messages, editingId]);
+
+  const beginEdit = (message: ChatMessage) => {
+    if (isThinking || !onEditRetry) return;
+    setEditingId(message.id);
+    setEditDraft(message.content);
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditDraft('');
+  };
+
+  const submitEdit = (messageIndex: number, messageId: string) => {
+    const text = editDraft.trim();
+    if (!text || !onEditRetry || isThinking) return;
+    if (autoSpeak) onPreparePlayback?.();
+    onEditRetry(messageIndex, text, messageId);
+    setEditingId(null);
+    setEditDraft('');
+  };
+
+  const retryFrom = (messageIndex: number) => {
+    if (isThinking || !onEditRetry) return;
+    let userIndex = messageIndex;
+    const selected = messages[messageIndex];
+    if (!selected || selected.role !== 'user') {
+      for (let index = messageIndex; index >= 0; index -= 1) {
+        if (messages[index]?.role === 'user' && messages[index].content.trim()) {
+          userIndex = index;
+          break;
+        }
+      }
+    }
+    const user = messages[userIndex];
+    if (!user || user.role !== 'user' || !user.content.trim()) return;
+    if (autoSpeak) onPreparePlayback?.();
+    onEditRetry(userIndex, user.content, user.id);
+  };
+
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (isThinking || isUploading) return;
     const text = inputText.trim();
     if (!text && pendingFiles.length === 0) return;
+    if (autoSpeak) onPreparePlayback?.();
     if (pendingFiles.length === 0) {
       onSendMessage(text);
       setInputText('');
@@ -203,6 +326,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.ok === false) {
         setAttachNotice(data.error || `Upload failed (${res.status})`);
+        if (autoSpeak) onReleasePreparedPlayback?.();
         return;
       }
       setInputText('');
@@ -213,13 +337,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
       }
     } catch (err) {
       setAttachNotice(err instanceof Error ? err.message : 'Upload failed');
+      if (autoSpeak) onReleasePreparedPlayback?.();
     } finally {
       setIsUploading(false);
     }
   };
 
-  const handleCopy = (id: string, text: string) => {
-    navigator.clipboard.writeText(text);
+  const handleCopy = async (id: string, text: string) => {
+    await copyToClipboard(markdownToPlainText(text));
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
   };
@@ -251,6 +376,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
       mediaStreamRef.current = stream;
       audioChunksRef.current = [];
 
+      // Handle physical track termination (e.g. mic hardware disconnect)
+      stream.getAudioTracks().forEach((track) => {
+        track.onended = () => {
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            stopRecording();
+          }
+        };
+      });
+
       let mimeType = '';
       if (typeof MediaRecorder !== 'undefined') {
         if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
@@ -281,6 +415,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         if (cancelledRef.current) {
           cancelledRef.current = false;
           audioChunksRef.current = [];
+          releaseMicPlayback();
           return;
         }
 
@@ -295,6 +430,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         if (audioBlob.size < 600) {
           setMicNotice('Recording was too short to transcribe.');
           setTimeout(() => setMicNotice(null), 3000);
+          releaseMicPlayback();
           return;
         }
 
@@ -320,17 +456,21 @@ export const ChatView: React.FC<ChatViewProps> = ({
           if (transcribed) {
             if (autoSubmitVoice) {
               setInputText('');
+              micArmedPlaybackRef.current = false;
               onSendMessage(transcribed);
             } else {
               setInputText((prev) => (prev ? `${prev} ${transcribed}` : transcribed));
+              releaseMicPlayback();
             }
           } else {
             setMicNotice('No speech detected in audio.');
             setTimeout(() => setMicNotice(null), 3000);
+            releaseMicPlayback();
           }
         } catch (err: any) {
           console.error('Host Parakeet STT error:', err);
           setMicNotice(`Host Parakeet STT error: ${err.message || 'Transcription failed'}`);
+          releaseMicPlayback();
         } finally {
           setIsTranscribing(false);
         }
@@ -355,6 +495,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
   }, [token, autoSubmitVoice, onSendMessage]);
 
   const stopRecording = useCallback(() => {
+    if (
+      autoSpeakRef.current &&
+      autoSubmitVoiceRef.current &&
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state !== 'inactive'
+    ) {
+      micArmedPlaybackRef.current = true;
+      preparePlaybackRef.current?.();
+    }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
@@ -385,34 +534,50 @@ export const ChatView: React.FC<ChatViewProps> = ({
     }
   }, [isRecording, isTranscribing, stopRecording, startRecording]);
 
-  const handleStopAll = useCallback(() => {
-    if (isRecording) {
-      cancelRecording();
-    }
+  const handleStopSpeech = useCallback(() => {
     onStopAudio?.();
+  }, [onStopAudio]);
+
+  const handleStopTask = useCallback(() => {
     onStopTask?.();
-  }, [isRecording, cancelRecording, onStopAudio, onStopTask]);
+  }, [onStopTask]);
 
   useEffect(() => {
+    const isMobile =
+      typeof navigator !== 'undefined' &&
+      (/android|iphone|ipad|ipod/i.test(navigator.userAgent) ||
+        ('maxTouchPoints' in navigator && navigator.maxTouchPoints > 1));
+
     const handleGlobalKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        if (isThinking || isPlaying || isRecording) {
-          e.preventDefault();
-          handleStopAll();
-        }
+      // NEVER allow mobile/Android back gestures or virtual keyboard dismissals
+      // (which emit Escape keydown events) to kill running tasks or cancel recordings!
+      if (isMobile) return;
+
+      if (e.key !== 'Escape') return;
+      if (isThinking) {
+        e.preventDefault();
+        if (isRecording) stopRecording();
+        handleStopTask();
+        return;
+      }
+      if (isPlaying || isRecording) {
+        e.preventDefault();
+        if (isRecording) stopRecording();
+        if (isPlaying) handleStopSpeech();
       }
     };
     window.addEventListener('keydown', handleGlobalKeyDown);
     return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [isThinking, isPlaying, isRecording, handleStopAll]);
+  }, [isThinking, isPlaying, isRecording, handleStopSpeech, handleStopTask, stopRecording]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Escape') {
-      if (isThinking || isPlaying || isRecording) {
+      if (editingId) {
         e.preventDefault();
-        handleStopAll();
+        cancelEdit();
         return;
       }
+      return;
     }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -476,14 +641,18 @@ export const ChatView: React.FC<ChatViewProps> = ({
             </div>
           </div>
         ) : (
-          messages.map((msg) => {
+          messages.map((msg, messageIndex) => {
             const isUser = msg.role === 'user';
+            const isEditing = isUser && editingId === msg.id;
             const { cleanContent, allThoughts } = isUser
               ? { cleanContent: msg.content, allThoughts: [] }
               : parseEmbeddedThoughts(msg.content, msg.thoughts || []);
 
             const isThisMsgBuffering = isBuffering && playingMessageId === msg.id;
-            const isThisMsgPlaying = isPlaying && playingMessageId === msg.id;
+            const isThisMsgActive = Boolean(
+              playbackActive && playingMessageId === msg.id && (isPlaying || isPaused || isBuffering)
+            );
+            const isThisMsgPlaying = isThisMsgActive && !isThisMsgBuffering;
             const isErrorMsg = !isUser && (
               cleanContent.startsWith('Error communicating with') ||
               cleanContent.includes('429 Client Error') ||
@@ -503,15 +672,22 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 )}
 
                 <div
-                  className={`max-w-[88%] sm:max-w-xl rounded-2xl px-4 py-3 text-xs leading-relaxed relative group ${
+                  className={`min-w-0 rounded-2xl px-4 py-3 text-xs leading-relaxed relative group ${
                     isUser
-                      ? 'bg-[#bd93f9] text-[#1e1f29] font-medium rounded-tr-none'
-                      : 'bg-[#282a36] border border-[#44475a] text-[#f8f8f2] rounded-tl-none shadow-md'
+                      ? 'max-w-[88%] sm:max-w-xl bg-[#bd93f9] text-[#1e1f29] font-medium rounded-tr-none'
+                      : 'max-w-[calc(100%-2.75rem)] bg-[#282a36] border border-[#44475a] text-[#f8f8f2] rounded-tl-none shadow-md'
                   }`}
                 >
                   {/* Collapsible Thoughts (for assistant messages) */}
                   {!isUser && allThoughts.length > 0 && (
-                    <ThoughtAccordion thoughts={allThoughts} />
+                    <ThoughtAccordion
+                      thoughts={allThoughts}
+                      playbackId={`${msg.id}:reasoning`}
+                      isPlaying={isPlaying && playingMessageId === `${msg.id}:reasoning`}
+                      isBuffering={isBuffering && playingMessageId === `${msg.id}:reasoning`}
+                      onPlayAudio={onPlayAudio}
+                      onStopAudio={onStopAudio}
+                    />
                   )}
 
                   {!isUser && (msg.actions?.length || 0) > 0 && (
@@ -537,7 +713,26 @@ export const ChatView: React.FC<ChatViewProps> = ({
 
                   {/* Message Body with Rich Markdown */}
                   <div className="select-text font-sans text-xs">
-                    {isUser ? (
+                    {isEditing ? (
+                      <textarea
+                        ref={editRef}
+                        value={editDraft}
+                        onChange={(event) => setEditDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Escape') {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            cancelEdit();
+                            return;
+                          }
+                          if (event.key === 'Enter' && !event.shiftKey) {
+                            event.preventDefault();
+                            submitEdit(messageIndex, msg.id);
+                          }
+                        }}
+                        className="w-full min-h-[72px] max-h-48 bg-[#1e1f29] text-[#f8f8f2] rounded-lg px-2.5 py-2 text-xs leading-relaxed resize-none focus:outline-none"
+                      />
+                    ) : isUser ? (
                       <div className="whitespace-pre-wrap break-words">{msg.content}</div>
                     ) : isErrorMsg ? (
                       <div className="p-2.5 rounded-lg bg-[#ff5555]/15 border border-[#ff5555]/40 text-[#ff5555] space-y-1">
@@ -550,7 +745,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
                         </div>
                       </div>
                     ) : cleanContent ? (
-                      <MarkdownRenderer content={cleanContent} />
+                      <MarkdownRenderer
+                        content={cleanContent}
+                        playbackPrefix={msg.id}
+                        playingMessageId={playingMessageId}
+                        playbackActive={Boolean(playbackActive && (isPlaying || isPaused || isBuffering))}
+                        isBuffering={isBuffering}
+                        onPlayAudio={onPlayAudio}
+                        onStopAudio={onStopAudio}
+                      />
                     ) : msg.streaming && isThinking ? (
                       <span className="italic text-[#6272a4] animate-pulse">Deliberating response...</span>
                     ) : allThoughts.length > 0 ? (
@@ -560,14 +763,76 @@ export const ChatView: React.FC<ChatViewProps> = ({
                     )}
                   </div>
 
+                  {isUser && onEditRetry && (
+                    isEditing ? (
+                      <div className="mt-2 space-y-1.5">
+                        <div className="flex items-center justify-end gap-2">
+                          <button
+                            type="button"
+                            onClick={cancelEdit}
+                            className="px-2 py-1 rounded-lg text-[11px] font-semibold text-[#1e1f29]/70 hover:bg-[#1e1f29]/10"
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => submitEdit(messageIndex, msg.id)}
+                            disabled={!editDraft.trim() || isThinking}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-[#1e1f29] text-[#f8f8f2] text-[11px] font-semibold disabled:opacity-40"
+                          >
+                            <RotateCcw className="w-3 h-3" />
+                            Save &amp; Retry
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-[#1e1f29]/60 text-right">
+                          Enter to retry · Shift+Enter for a new line · Esc to cancel
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-end gap-1 mt-2 pt-1 border-t border-[#1e1f29]/15">
+                        <button
+                          type="button"
+                          onClick={() => beginEdit(msg)}
+                          disabled={isThinking}
+                          title={isThinking ? 'Wait for the current reply to finish' : 'Edit this prompt and run it again. Later messages in this chat are replaced.'}
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-semibold text-[#1e1f29]/80 hover:bg-[#1e1f29]/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <Pencil className="w-3 h-3" />
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => retryFrom(messageIndex)}
+                          disabled={isThinking}
+                          title={isThinking ? 'Wait for the current reply to finish' : 'Run this prompt again. Later messages in this chat are replaced.'}
+                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[11px] font-semibold text-[#1e1f29]/80 hover:bg-[#1e1f29]/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Retry
+                        </button>
+                      </div>
+                    )
+                  )}
+
                   {/* Action Row for Assistant Messages */}
                   {!isUser && !msg.streaming && (
                     <div className="flex items-center justify-end gap-2.5 mt-2 pt-1 border-t border-[#44475a]/40 text-[#6272a4]">
+                      {onEditRetry && (
+                        <button
+                          type="button"
+                          onClick={() => retryFrom(messageIndex)}
+                          disabled={isThinking}
+                          className="p-1 hover:text-[#f8f8f2] transition active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed"
+                          title={isThinking ? 'Wait for the current reply to finish' : 'Run the prompt above again. Later messages in this chat are replaced.'}
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                       {/* Copy message text */}
                       <button
                         onClick={() => handleCopy(msg.id, cleanContent || msg.content)}
                         className="p-1 hover:text-[#f8f8f2] transition active:scale-95"
-                        title="Copy message"
+                        title="Copy message as shown"
                       >
                         {copiedId === msg.id ? (
                           <Check className="w-3.5 h-3.5 text-[#50fa7b]" />
@@ -580,7 +845,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
                       {onPlayAudio && (
                         <button
                           onClick={() => {
-                            if (isThisMsgPlaying) {
+                            if (isThisMsgActive) {
                               onStopAudio?.();
                             } else {
                               onPlayAudio(cleanContent || msg.content, msg.id);
@@ -649,7 +914,17 @@ export const ChatView: React.FC<ChatViewProps> = ({
         <div ref={messagesEndRef} />
       </div>
 
-      <SharedFiles files={sharedFiles} token={token} />
+      <SharedFiles
+        files={sharedFiles}
+        token={token}
+        readAloud={{
+          playingMessageId,
+          playbackActive: Boolean(playbackActive && (isPlaying || isPaused || isBuffering)),
+          isBuffering,
+          onPlayAudio,
+          onStopAudio,
+        }}
+      />
 
       {/* Voice Controls Bar & Input Form */}
       <div className="p-3 bg-[#1e1f29] border-t border-[#44475a] space-y-2">
@@ -683,28 +958,6 @@ export const ChatView: React.FC<ChatViewProps> = ({
               <span>Auto-Send Voice: {autoSubmitVoice ? 'ON' : 'OFF'}</span>
             </button>
           </div>
-
-          {isPlaying ? (
-            <button
-              type="button"
-              onClick={handleStopAll}
-              className="px-2.5 py-1 rounded-lg bg-[#ff5555] text-white hover:bg-[#ff5555]/90 flex items-center gap-1.5 font-bold text-xs shadow-md active:scale-95 animate-pulse"
-              title="End Call / Stop Speech Playback (Esc)"
-            >
-              <PhoneOff className="w-3.5 h-3.5" />
-              <span>End Call</span>
-            </button>
-          ) : isThinking ? (
-            <button
-              type="button"
-              onClick={handleStopAll}
-              className="px-2.5 py-1 rounded-lg bg-[#ff5555]/20 border border-[#ff5555] text-[#ff5555] hover:bg-[#ff5555]/30 flex items-center gap-1.5 font-bold text-xs active:scale-95 animate-pulse"
-              title="Stop active task / Cancel (Esc)"
-            >
-              <Square className="w-3.5 h-3.5 fill-current" />
-              <span>Stop Task</span>
-            </button>
-          ) : null}
         </div>
 
         {/* Active Recording / Transcription Banner */}
@@ -738,6 +991,21 @@ export const ChatView: React.FC<ChatViewProps> = ({
           <div className="flex items-center gap-2 px-3 py-2 bg-[#50fa7b]/15 border border-[#50fa7b]/40 rounded-xl text-xs text-[#50fa7b] animate-fadeIn">
             <Loader2 className="w-4 h-4 animate-spin text-[#50fa7b] shrink-0" />
             <span className="font-medium">Transcribing audio with Parakeet STT...</span>
+          </div>
+        )}
+
+        {retryNotice && (
+          <div className="text-[11px] text-[#ffb86c] bg-[#ffb86c]/10 border border-[#ffb86c]/30 rounded-lg p-2 flex items-start justify-between gap-2">
+            <span>{retryNotice}</span>
+            {onDismissRetryNotice && (
+              <button
+                type="button"
+                onClick={onDismissRetryNotice}
+                className="text-[#6272a4] hover:text-[#f8f8f2] font-bold px-1"
+              >
+                ✕
+              </button>
+            )}
           </div>
         )}
 
@@ -884,26 +1152,32 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
               </button>
 
-              {/* Submit or Stop / End Call button */}
+              {/* Submit, stop audio, or stop the running task. Audio stop never cancels the reply. */}
               {isThinking || isPlaying ? (
-                <button
-                  type="button"
-                  onClick={handleStopAll}
-                  title={isPlaying ? 'End Call / Stop Speech (Esc)' : 'Stop active task / Cancel generation (Esc)'}
-                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition active:scale-95 shadow-md animate-pulse"
-                >
-                  {isPlaying ? (
-                    <>
-                      <PhoneOff className="w-3.5 h-3.5" />
-                      <span>End Call</span>
-                    </>
-                  ) : (
-                    <>
+                <>
+                  {isPlaying && (
+                    <button
+                      type="button"
+                      onClick={handleStopSpeech}
+                      title="Stop audio playback. The reply stays in the chat."
+                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#44475a] text-[#f8f8f2] font-bold text-xs hover:bg-[#6272a4] transition active:scale-95 shadow-md"
+                    >
+                      <VolumeX className="w-3.5 h-3.5" />
+                      <span>Stop audio</span>
+                    </button>
+                  )}
+                  {isThinking && (
+                    <button
+                      type="button"
+                      onClick={handleStopTask}
+                      title="Stop the current task (Esc)"
+                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition active:scale-95 shadow-md animate-pulse"
+                    >
                       <Square className="w-3.5 h-3.5 fill-current" />
                       <span>Stop</span>
-                    </>
+                    </button>
                   )}
-                </button>
+                </>
               ) : (
                 <button
                   type="submit"

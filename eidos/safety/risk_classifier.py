@@ -79,6 +79,7 @@ class RiskClassifier:
             "web_search", "web_fetch", "speak", "speak_aloud",
             "browser_open", "browser_extract", "browser_screenshot", "browser_close",
             "list_skills", "load_skill", "close_skill", "get_job_status", "share_file",
+            "load_job", "close_job",
             "optimalx_search_notes", "optimalx_read_note", "optimalx_list_folders",
             "optimalx_read_notex_doc", "optimalx_list_notex_docs", "optimalx_list_pending_reviews",
         ):
@@ -86,7 +87,7 @@ class RiskClassifier:
 
         if action_type in (
             "click", "double_click", "move_mouse", "scroll", "type_text",
-            "hotkey", "drag", "click_element",
+            "press_key", "hotkey", "drag", "click_element",
             "browser_click", "browser_type", "browser_evaluate",
             "create_skill", "update_skill",
             "init_batch_job", "run_batch_job", "step_batch_job", "pause_batch_job", "resume_batch_job",

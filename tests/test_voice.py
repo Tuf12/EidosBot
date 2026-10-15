@@ -272,6 +272,74 @@ class TestProgressiveChunker(unittest.TestCase):
         self.assertEqual(rest, "")
 
 
+class TestClipPlayer(unittest.TestCase):
+    """Seekable speech timeline used by the desktop player bar."""
+
+    def _player(self):
+        from eidos.voice.clip_player import ClipPlayer
+
+        return ClipPlayer(enable_output=False)
+
+    def _tone(self, seconds: float, rate: int = 48000):
+        import numpy as np
+
+        count = int(seconds * rate)
+        return np.linspace(-0.2, 0.2, count, dtype=np.float32), rate
+
+    def test_append_builds_duration_and_playback_reaches_the_end(self):
+        player = self._player()
+        player.begin()
+        tone, rate = self._tone(1.0)
+        player.append(tone, rate)
+        player.mark_complete()
+        snap = player.snapshot()
+        self.assertTrue(snap["active"])
+        self.assertTrue(snap["playing"])
+        self.assertAlmostEqual(snap["duration"], 1.0, places=2)
+        player.advance(rate)
+        done = player.snapshot()
+        self.assertTrue(done["finished"])
+        self.assertFalse(done["playing"])
+        self.assertAlmostEqual(done["position"], done["duration"], places=2)
+
+    def test_play_after_finish_starts_at_the_beginning(self):
+        player = self._player()
+        player.begin()
+        tone, rate = self._tone(1.0)
+        player.append(tone, rate)
+        player.mark_complete()
+        player.advance(rate)
+        self.assertTrue(player.snapshot()["finished"])
+        player.resume()
+        again = player.snapshot()
+        self.assertTrue(again["playing"])
+        self.assertFalse(again["finished"])
+        self.assertLess(again["position"], 0.05)
+
+    def test_rewind_from_the_end_pauses_five_seconds_back(self):
+        player = self._player()
+        player.begin()
+        tone, rate = self._tone(8.0)
+        player.append(tone, rate)
+        player.mark_complete()
+        player.advance(int(8 * rate))
+        self.assertTrue(player.snapshot()["finished"])
+        player.seek_by(-5)
+        parked = player.snapshot()
+        self.assertTrue(parked["paused"])
+        self.assertFalse(parked["playing"])
+        self.assertFalse(parked["finished"])
+        self.assertAlmostEqual(parked["position"], 3.0, places=1)
+
+    def test_stop_hides_the_session(self):
+        player = self._player()
+        player.begin()
+        tone, rate = self._tone(0.2)
+        player.append(tone, rate)
+        player.dismiss()
+        self.assertFalse(player.snapshot()["active"])
+
+
 class TestSpeechStreamer(unittest.TestCase):
     """Queued synth-while-playing pipeline."""
 

@@ -2,6 +2,7 @@
 
 Runs local NVIDIA Parakeet TDT 0.6B v2 via sherpa-onnx INT8 on CPU.
 Transcribes microphone WAV audio into text for the agent loop.
+Recordings longer than the model's 240s decode cap are sliced inside transcribe.py.
 """
 
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import subprocess
 from typing import Any, Dict, Optional
+import wave
 
 from eidos.voice.helpers import resolve_voice_runtime
 
@@ -59,13 +61,14 @@ class ParakeetSTT:
             wav_path,
         ]
 
-        logger.debug("Running Parakeet transcription: %s", cmd)
+        timeout = _transcribe_timeout_seconds(wav_path)
+        logger.debug("Running Parakeet transcription (timeout %ss): %s", timeout, cmd)
         proc = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
+            timeout=timeout,
             cwd=self.voice_dir,
         )
 
@@ -80,6 +83,9 @@ class ParakeetSTT:
                 try:
                     res = json.loads(line_str)
                     if res.get("ok"):
+                        chunks = _chunk_count(res)
+                        if chunks > 1:
+                            logger.info("Parakeet transcribed long audio in %s slices", chunks)
                         return res.get("text", "").strip()
                     else:
                         raise RuntimeError(f"Transcription error: {res.get('error')}")
@@ -112,3 +118,33 @@ class ParakeetSTT:
             return {"ok": proc.returncode == 0, "raw": proc.stdout}
         except Exception as e:
             return {"ok": False, "error": str(e)}
+
+
+def _chunk_count(result: Dict[str, Any]) -> int:
+    try:
+        return max(1, int(result.get("chunks") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _wav_duration_seconds(wav_path: str) -> Optional[float]:
+    try:
+        with wave.open(wav_path, "rb") as handle:
+            rate = handle.getframerate()
+            frames = handle.getnframes()
+        if not rate or frames < 0:
+            return None
+        return frames / float(rate)
+    except (wave.Error, EOFError, OSError):
+        return None
+
+
+def _transcribe_timeout_seconds(wav_path: str) -> int:
+    """Budget for model load plus chunked decode of a long recording.
+
+    A fixed 60s cap kills messages that are allowed to run past a few minutes.
+    """
+    seconds = _wav_duration_seconds(wav_path)
+    if seconds is None:
+        return 600
+    return int(min(1800, max(90, seconds * 1.5 + 45)))

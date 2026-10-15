@@ -389,7 +389,7 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 
 #### Deliverables & Tasks:
 1. [x] **Decoupled Tool Registry (`eidos/core/tool_registry.py`):**
-   - Partition global tool catalog into `BASE_TOOLS` (6 universal tools: `execute_shell`, `load_skill`, `close_skill`, `get_current_time`, `finish_task`, `share_file`) and `SPECIALIZED_TOOLS` (on-demand functions). `share_file` stays in the base set so the web app, including a phone, can receive files without loading a skill.
+   - Partition global tool catalog into `BASE_TOOLS` (7 universal tools: `execute_shell`, `load_skill`, `close_skill`, `get_current_time`, `finish_task`, `share_file`, `list_skills`) and `SPECIALIZED_TOOLS` (on-demand functions). `share_file` stays in the base set so the web app, including a phone, can receive files without loading a skill. `list_skills` stays in the base set so the agent can see which skills exist before calling `load_skill`.
    - Purge redundant deadweight tools (`optimalx_reject_pending_review`, `optimalx_accept_pending_review`, `optimalx_list_pending_reviews`).
 2. [x] **Built-in System Skills Catalog (`eidos/skills/builtin/`):**
    - Package specialized toolsets into self-contained skills with `tools_required: [...]` frontmatter:
@@ -412,6 +412,33 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
    - Reinforce shell-first scripting via `execute_shell` for multi-step data tasks to finish deterministically.
 6. [x] **Regression & Safety Verification:**
    - Add unit tests (`tests/test_tool_registry.py`, `tests/test_skills.py`, `tests/test_context.py`, `tests/test_dynamic_scoping.py`) with zero system overload and isolated test execution.
+
+---
+
+### Phase 13: Project Jobs — Scoped Working Memory
+**Goal:** Make a job the project EidosBot is working inside. `job.yaml` holds a short brief that survives every turn. Longer notes stay in files the brief points at. One primary job fills the prompt. Extra jobs may run in the background and show up as secondary tags on the pill and the web app.
+
+*(See full specification and the phased task list in [`docs/PROJECT_JOBS.md`](PROJECT_JOBS.md))*
+
+#### Deliverables & Tasks:
+1. [ ] **Durable brief (`eidos/jobs/types.py`, `eidos/jobs/runner.py`):**
+   - Identity, boundary, decisions, skills, and document pointers in `job.yaml`.
+   - Saving `queue.json` updates progress only and leaves the brief intact.
+2. [ ] **Focus that survives the turn (`eidos/core/loop.py`):**
+   - One primary job plus attached jobs in `focus.yaml`.
+   - `finish_task` and a new user message keep the primary job. `close_job` clears it.
+3. [ ] **Prompt and base tools (`eidos/core/context.py`, `eidos/core/tool_registry.py`):**
+   - Inject the primary brief and one status line per running job.
+   - Base tools: `create_job`, `focus_job`, `list_jobs`, `update_job_brief`, `read_job_document`.
+   - Batch tools stay on the `batch-runner` skill.
+4. [ ] **Scoped recall (`eidos/memory/episodic_store.py`, `eidos/memory/recall_stream.py`):**
+   - Tag episodes with `job_id`. Search this job first. Do not backfill with another project's content.
+5. [ ] **Workers receive the brief (`eidos/jobs/processor.py`):**
+   - Identity and boundary precede skill text and prior-art hits. Similar results are comparison material.
+6. [ ] **Scope tags (`eidos/ui/pill.py`, `web/src/components/Header.tsx`, `eidos/gateway/server.py`):**
+   - Primary job tag on the floating pill and the web header.
+   - Secondary tags for additional jobs that are running.
+7. [ ] **Regression:** job, context, scoping, and recall tests, plus loading an older `queue.json` that has no brief yet.
 
 ---
 

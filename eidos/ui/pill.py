@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from eidos.ui.chat import ChatHistoryWidget
+from eidos.ui.speech_bar import SpeechPlayerBar
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +195,9 @@ class StatusPill(QWidget):
     signal_quit_app = pyqtSignal()
     signal_toggle_mic = pyqtSignal()  # voice push-to-talk toggle
     signal_toggle_auto_speak = pyqtSignal(bool)  # auto-read responses on/off
+    signal_playback_toggle = pyqtSignal()
+    signal_playback_stop = pyqtSignal()
+    signal_playback_seek = pyqtSignal(int)
     signal_toggle_expand = pyqtSignal(bool)  # is_expanded
     signal_clear_chat = pyqtSignal()
     signal_new_chat = pyqtSignal()
@@ -412,6 +416,14 @@ class StatusPill(QWidget):
         self.set_auto_speak(True)
         card_layout.addWidget(self.voice_bar)
 
+        # Same player as the phone: play, pause, ±5s, and stop. Stays up after the
+        # read-aloud ends so Play can start over and -5s can step back.
+        self.speech_bar = SpeechPlayerBar()
+        self.speech_bar.toggle_requested.connect(self.signal_playback_toggle.emit)
+        self.speech_bar.stop_requested.connect(self.signal_playback_stop.emit)
+        self.speech_bar.seek_requested.connect(self.signal_playback_seek.emit)
+        card_layout.addWidget(self.speech_bar)
+
         # 4. Prompt Input Bar: Quick prompt entry, mic push-to-talk, send button
         prompt_bar = QHBoxLayout()
         prompt_bar.setSpacing(6)
@@ -523,6 +535,20 @@ class StatusPill(QWidget):
         else:
             self.expand_chat()
 
+    def _apply_layout_while_hidden(self, apply_fn) -> None:
+        """Hide during resize so Linux compositors do not leave stale pill frames."""
+        visible = self.isVisible()
+        if visible:
+            self.hide()
+        self.setUpdatesEnabled(False)
+        try:
+            apply_fn()
+        finally:
+            self.setUpdatesEnabled(True)
+            if visible:
+                self.show()
+                self.raise_()
+
     @pyqtSlot()
     def expand_chat(self):
         """Expand floating widget into full chat interface."""
@@ -560,22 +586,20 @@ class StatusPill(QWidget):
 
         self._expanded_pos = QPoint(target_x, target_y)
 
-        # Atomic layout transition: freeze visual updates during layout changes
-        self.setUpdatesEnabled(False)
-        try:
+        def _apply_expand() -> None:
             self.btn_collapse.setVisible(True)
             self.details_label.setVisible(False)
             self.chat_container.setVisible(True)
             self.lbl_hint.setVisible(True)
             self.size_grip.setVisible(True)
-
             self.setGeometry(target_x, target_y, target_w, target_h)
             self.card.layout().activate()
             self.layout().activate()
-        finally:
-            self.setUpdatesEnabled(True)
+
+        self._apply_layout_while_hidden(_apply_expand)
 
         self.prompt_input.set_chat_expanded(True)
+        self.chat_history._fit_container_width()
         QTimer.singleShot(40, self.chat_history.scroll_to_bottom)
         self.prompt_input.setFocus()
         self.signal_toggle_expand.emit(True)
@@ -595,30 +619,27 @@ class StatusPill(QWidget):
         self.btn_expand.setToolTip("Chat / History (Ctrl+E)")
         self._reset_expand_button_style()
 
-        # Atomic layout transition: freeze visual updates during layout changes
-        self.setUpdatesEnabled(False)
-        try:
+        target_w = self._collapsed_width if self._collapsed_width > 0 else self.minimumSizeHint().width()
+        target_h = self._collapsed_height if self._collapsed_height > 0 else self.minimumSizeHint().height()
+        restore_pos = self._collapsed_pos
+        expanded_pos = self._expanded_pos
+
+        def _apply_collapse() -> None:
             self.btn_collapse.setVisible(False)
             self.details_label.setVisible(True)
             self.chat_container.setVisible(False)
             self.lbl_hint.setVisible(False)
             self.size_grip.setVisible(False)
-
             self.prompt_input.set_chat_expanded(False)
             self.card.layout().activate()
             self.layout().activate()
-
-            # Restore pre-expansion position if user didn't drag the expanded window
-            if self._collapsed_pos is not None and self._expanded_pos is not None:
-                if self.pos() == self._expanded_pos:
-                    self.move(self._collapsed_pos)
-
-            # Shrink back down to compact pill minimal size
-            target_w = self._collapsed_width if self._collapsed_width > 0 else self.minimumSizeHint().width()
-            target_h = self._collapsed_height if self._collapsed_height > 0 else self.minimumSizeHint().height()
+            if restore_pos is not None and expanded_pos is not None and self.pos() == expanded_pos:
+                self.move(restore_pos)
             self.resize(target_w, target_h)
-        finally:
-            self.setUpdatesEnabled(True)
+
+        self._apply_layout_while_hidden(_apply_collapse)
+        if self.speech_bar.isVisible():
+            self._fit_collapsed_to_content()
 
         self.unsetCursor()
         self.signal_toggle_expand.emit(False)
@@ -633,9 +654,15 @@ class StatusPill(QWidget):
     # Chat Message Slots
     @pyqtSlot(str)
     def add_user_message(self, text: str, message_id: Optional[str] = None):
-        """Append user message bubble to chat."""
+        """Append one user bubble. A repeat of the bubble already at the bottom is ignored."""
         if not text:
             return
+        cleaned = text.strip()
+        bubbles = getattr(self.chat_history, "bubbles", None) or []
+        if bubbles:
+            last = bubbles[-1]
+            if getattr(last, "role", "") == "user" and (getattr(last, "raw_content", "") or "").strip() == cleaned:
+                return
         self.chat_history.add_message("user", text, message_id=message_id)
         if not self.is_expanded:
             self.expand_chat()
@@ -833,6 +860,25 @@ class StatusPill(QWidget):
         self.signal_link_clicked.emit(link)
 
     @pyqtSlot(bool)
+    def set_playback(self, snap: dict) -> None:
+        """Show or update the speech player. Grows the collapsed pill while it is open."""
+        was_visible = self.speech_bar.isVisible()
+        self.speech_bar.apply(snap or {"active": False})
+        if self.speech_bar.isVisible() != was_visible and not self.is_expanded:
+            self._fit_collapsed_to_content()
+
+    def _fit_collapsed_to_content(self) -> None:
+        if self.is_expanded:
+            return
+        self.card.layout().activate()
+        self.layout().activate()
+        height = max(self.minimumSizeHint().height(), self.sizeHint().height())
+        width = max(self.width(), self.minimumSizeHint().width())
+        self._collapsed_height = height
+        self._collapsed_width = max(self._collapsed_width, width)
+        if self.height() != height or self.width() < width:
+            self.resize(width, height)
+
     def set_auto_speak(self, enabled: bool):
         """Show the same Auto-Read on/off state the web app uses."""
         self._auto_speak = bool(enabled)
@@ -941,7 +987,7 @@ class StatusPill(QWidget):
         action_past = menu.addAction("📜  Past Conversations...")
         menu.addSeparator()
         action_workspace = menu.addAction("📂  Open Workspace (~/EidosWorkspace)...")
-        action_skills = menu.addAction("🧠  Open Skills Directory (~/.eidos/skills)...")
+        action_skills = menu.addAction("🧠  Open Skills Directory (~/EidosWorkspace/skills)...")
         menu.addSeparator()
         action_settings = menu.addAction("⚙️  Settings (Models & API Keys)...")
         action_allowlist = menu.addAction("🛡️  Shell Allowlist Manager...")

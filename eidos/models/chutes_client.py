@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
+from eidos.models.inflight import InflightRequest
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,7 @@ class ChutesClient(BaseModelClient):
         self.reasoning_model = reasoning_model
         self.timeout = timeout
         self.stream = stream
+        self._inflight = InflightRequest()
         self.recall_interceptor = recall_interceptor
         self.on_recall_callback = on_recall_callback
 
@@ -86,6 +88,17 @@ class ChutesClient(BaseModelClient):
             logger.error("Failed to list Chutes models: %s", e)
         return []
 
+    def abort(self) -> None:
+        """Close the model request that is currently generating."""
+        self._inflight.abort()
+
+    def reset_abort(self) -> None:
+        """Clear a previous stop so the next task can call the model."""
+        self._inflight.reset()
+
+    def _cancelled_response(self, model_name: str) -> ModelResponse:
+        return ModelResponse(content="", model=model_name, raw={"cancelled": True})
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -112,6 +125,8 @@ class ChutesClient(BaseModelClient):
                 tools=tools,
                 timeout=self.timeout,
                 on_recall_callback=self.on_recall_callback,
+                on_response=self._inflight.bind,
+                should_stop=self._inflight.cancelled,
             )
 
         payload: Dict[str, Any] = {
@@ -127,16 +142,11 @@ class ChutesClient(BaseModelClient):
                 return self._stream_openai_chat(model_name, payload)
             else:
                 payload["stream"] = False
-                resp = requests.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self._get_headers(),
-                    json=payload,
-                    timeout=self.timeout
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                return self._parse_openai_response(data, model_name)
+                return self._post_openai_chat(model_name, payload)
         except Exception as e:
+            if self._inflight.cancelled():
+                logger.info("Chutes chat cancelled for model %s", model_name)
+                return self._cancelled_response(model_name)
             logger.error("Chutes chat error with model %s: %s", model_name, e)
             status_code = getattr(getattr(e, "response", None), "status_code", None)
             if status_code == 429 or "429" in str(e):
@@ -149,6 +159,30 @@ class ChutesClient(BaseModelClient):
                 raw={"error": str(e), "status_code": status_code}
             )
 
+    def _post_openai_chat(self, model_name: str, payload: Dict[str, Any]) -> ModelResponse:
+        """POST a non-streaming chat call that Stop can close."""
+        session = requests.Session()
+        self._inflight.arm(session)
+        try:
+            if self._inflight.cancelled():
+                return self._cancelled_response(model_name)
+            resp = session.post(
+                f"{self.base_url}/chat/completions",
+                headers=self._get_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            if self._inflight.cancelled():
+                return self._cancelled_response(model_name)
+            resp.raise_for_status()
+            return self._parse_openai_response(resp.json(), model_name)
+        finally:
+            self._inflight.release(session=session)
+            try:
+                session.close()
+            except Exception:
+                pass
+
     def _stream_openai_chat(
         self,
         model_name: str,
@@ -156,6 +190,8 @@ class ChutesClient(BaseModelClient):
     ) -> ModelResponse:
         """Stream chat completion via SSE, accumulating tokens, thoughts, and tool calls."""
         payload["stream"] = True
+        if self._inflight.cancelled():
+            return self._cancelled_response(model_name)
         resp = requests.post(
             f"{self.base_url}/chat/completions",
             headers=self._get_headers(),
@@ -163,15 +199,19 @@ class ChutesClient(BaseModelClient):
             stream=True,
             timeout=self.timeout
         )
-        resp.raise_for_status()
-
+        self._inflight.bind(resp)
         total_content = ""
         total_thinking = ""
         tool_call_deltas: Dict[int, Dict[str, Any]] = {}
         raw_final_data: Dict[str, Any] = {}
 
         try:
+            if self._inflight.cancelled():
+                return self._cancelled_response(model_name)
+            resp.raise_for_status()
             for line in resp.iter_lines():
+                if self._inflight.cancelled():
+                    return self._cancelled_response(model_name)
                 if not line:
                     continue
                 line_str = line.decode("utf-8") if isinstance(line, bytes) else line
@@ -217,7 +257,13 @@ class ChutesClient(BaseModelClient):
                             tool_call_deltas[idx]["name"] = fn["name"]
                         if fn.get("arguments"):
                             tool_call_deltas[idx]["arguments"] += fn["arguments"]
+        except Exception as exc:
+            if self._inflight.cancelled():
+                logger.info("Chutes stream cancelled for model %s", model_name)
+                return self._cancelled_response(model_name)
+            raise exc
         finally:
+            self._inflight.release(response=resp)
             resp.close()
 
         accumulated_tool_calls: List[ToolCall] = []

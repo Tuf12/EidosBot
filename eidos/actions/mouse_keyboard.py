@@ -9,6 +9,24 @@ from eidos.safety.gatekeeper import Gatekeeper
 
 logger = logging.getLogger(__name__)
 
+# Keys the phone keyboard bar is allowed to press on the desktop.
+_RELAY_KEYS = {
+    "enter": "enter",
+    "return": "enter",
+    "backspace": "backspace",
+    "tab": "tab",
+    "esc": "esc",
+    "escape": "esc",
+    "space": "space",
+    "delete": "delete",
+    "up": "up",
+    "down": "down",
+    "left": "left",
+    "right": "right",
+    "home": "home",
+    "end": "end",
+}
+
 # Configure PyAutoGUI safety settings
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.05
@@ -87,6 +105,57 @@ class InputSimulator:
             return {"success": True, "text": text}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def relay_typing(self, text: str = "", backspaces: int = 0, key: str = "") -> Dict[str, Any]:
+        """Type a burst from the phone keyboard into the focused desktop field."""
+        text = text or ""
+        key_name = (key or "").lower().strip()
+        if not isinstance(text, str) or backspaces < 0 or backspaces > 500 or len(text) > 4000:
+            return {"success": False, "error": "Typing request is out of range"}
+        if key_name and key_name not in _RELAY_KEYS:
+            return {"success": False, "error": "Unsupported key"}
+        if not text and backspaces == 0 and not key_name:
+            return {"success": False, "error": "Nothing to type"}
+
+        allowed, reason = self._check_safety(
+            "type_text", {"text": text, "backspaces": backspaces, "key": key_name}
+        )
+        if not allowed:
+            return {"success": False, "error": reason}
+        try:
+            for _ in range(backspaces):
+                pyautogui.press("backspace", _pause=False)
+            if text:
+                self._inject_text(text)
+            if key_name:
+                pyautogui.press(_RELAY_KEYS[key_name], _pause=False)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _inject_text(self, text: str) -> None:
+        """Type characters, using real Enter and Tab keys for line breaks."""
+        from pynput.keyboard import Controller
+
+        controller = Controller()
+        chunk: List[str] = []
+
+        def flush() -> None:
+            if not chunk:
+                return
+            controller.type("".join(chunk))
+            chunk.clear()
+
+        for char in text:
+            if char in "\r\n":
+                flush()
+                pyautogui.press("enter", _pause=False)
+            elif char == "\t":
+                flush()
+                pyautogui.press("tab", _pause=False)
+            else:
+                chunk.append(char)
+        flush()
 
     def press_key(self, key: str) -> Dict[str, Any]:
         """Press a single key (e.g., 'enter', 'tab', 'esc', 'space')."""

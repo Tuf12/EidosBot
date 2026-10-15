@@ -1,5 +1,5 @@
-// EidosBot Mobile PWA Service Worker (v6 - Stop & End Call Support)
-const CACHE_NAME = 'eidos-pwa-v6';
+// EidosBot Mobile PWA Service Worker (v10 - background keep-alive & notifications)
+const CACHE_NAME = 'eidos-pwa-v10';
 const PRECACHE_ASSETS = [
   '/manifest.json',
   '/icons/icon-192.png',
@@ -43,7 +43,28 @@ self.addEventListener('message', (event) => {
     });
   } else if (event.data && event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+  } else if (event.data && event.data.type === 'SHOW_NOTIFICATION') {
+    const { title, options } = event.data;
+    self.registration.showNotification(title, options);
   }
+});
+
+// Handle notification tap on Android / desktop to refocus or open the PWA
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const urlToOpen = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
+      for (const client of clientList) {
+        if ('focus' in client) {
+          return client.focus();
+        }
+      }
+      if (self.clients.openWindow) {
+        return self.clients.openWindow(urlToOpen);
+      }
+    })
+  );
 });
 
 self.addEventListener('fetch', (event) => {

@@ -33,8 +33,31 @@ class SpeechStreamer:
         self._feed_voice: Optional[str] = None
         self._feed_speed: Optional[float] = None
 
+    def _session(self):
+        playback = getattr(self.tts, "_playback", None)
+        return getattr(playback, "session", None)
+
+    def _use_session(self) -> bool:
+        playback = getattr(self.tts, "_playback", None)
+        session = self._session()
+        return bool(
+            playback is not None
+            and getattr(playback, "uses_native_audio", False)
+            and session is not None
+            and session.available
+        )
+
     def is_speaking(self) -> bool:
         """Return True if speech streaming is actively synthesizing or playing audio."""
+        session = self._session()
+        if session is not None and session.active:
+            if session.busy():
+                return True
+            return (
+                self._is_synthesizing
+                or (not self._synth_q.empty())
+                or (not self._play_q.empty())
+            )
         return (
             self._is_synthesizing
             or self._is_playing
@@ -70,6 +93,8 @@ class SpeechStreamer:
 
         self.stop()
         self._ensure_workers()
+        if self._use_session():
+            self._session().begin()
         with self._lock:
             gen = self._generation
         logger.info(
@@ -79,7 +104,7 @@ class SpeechStreamer:
             prepared.voice,
             prepared.speed,
         )
-        self._synth_q.put((gen, prepared.text, prepared.voice, prepared.speed, prepared.pieces))
+        self._synth_q.put((gen, prepared.text, prepared.voice, prepared.speed, prepared.pieces, True))
         return True
 
     def begin(self, voice: Optional[str] = None, speed: Optional[float] = None) -> None:
@@ -110,7 +135,7 @@ class SpeechStreamer:
                 self._feed_stage = stage
                 emitted.append(piece)
         for piece in emitted:
-            self._synth_q.put((gen, piece, voice, speed, [piece]))
+            self._synth_q.put((gen, piece, voice, speed, [piece], False))
 
     def finish(self) -> None:
         """Flush remaining buffered stream text as final clip(s)."""
@@ -131,8 +156,11 @@ class SpeechStreamer:
         )
         if not prepared:
             return
-        for piece in prepared.pieces:
-            self._synth_q.put((gen, piece, prepared.voice, prepared.speed, [piece]))
+        last = len(prepared.pieces) - 1
+        for index, piece in enumerate(prepared.pieces):
+            self._synth_q.put(
+                (gen, piece, prepared.voice, prepared.speed, [piece], index == last)
+            )
 
     def stop(self) -> None:
         """Cancel queued clips and stop the current player."""
@@ -180,7 +208,7 @@ class SpeechStreamer:
             item = self._synth_q.get()
             if item is _SENTINEL:
                 return
-            gen, text, voice, speed, pieces = item
+            gen, text, voice, speed, pieces, final = item
             if gen != self._generation:
                 continue
             self._is_synthesizing = True
@@ -202,6 +230,8 @@ class SpeechStreamer:
                 continue
             finally:
                 self._is_synthesizing = False
+                if final and gen == self._generation:
+                    self._play_q.put((gen, None))
 
     def _play_loop(self) -> None:
         """Play Kokoro stream chunks back-to-back as they arrive."""
@@ -210,13 +240,25 @@ class SpeechStreamer:
             if item is _SENTINEL:
                 return
             gen, wav_path = item
+            if wav_path is None:
+                if gen == self._generation:
+                    session = self._session()
+                    if session is not None and session.active:
+                        session.mark_complete()
+                continue
             if gen != self._generation:
                 self._cleanup_wav(wav_path)
                 continue
             self._is_playing = True
             try:
                 playback = self.tts._playback
-                if playback.uses_native_audio:
+                session = self._session()
+                if self._use_session():
+                    pcm, sample_rate = playback.load_pcm(wav_path)
+                    if not session.active:
+                        session.begin()
+                    session.append(pcm, sample_rate)
+                elif playback.uses_native_audio:
                     pcm, sample_rate = playback.load_pcm(wav_path)
                     playback.play_pcm(pcm, sample_rate, blocking=True)
                 else:
@@ -224,7 +266,8 @@ class SpeechStreamer:
             except Exception as e:
                 logger.error("TTS clip playback failed: %s", e)
             finally:
-                self._is_playing = False
+                if not self._use_session():
+                    self._is_playing = False
                 self._cleanup_wav(wav_path)
 
     @staticmethod

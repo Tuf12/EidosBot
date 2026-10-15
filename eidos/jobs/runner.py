@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 import uuid
+import yaml
 
 from eidos.jobs.summary import RankingSummaryGenerator
 from eidos.jobs.types import JobQueue, JobSettings, QueueItem
@@ -32,6 +33,7 @@ class BatchJobRunner:
         summary_generator: Optional[RankingSummaryGenerator] = None,
     ):
         self.skills = skills_manager or SkillManager()
+        self.skills_manager = self.skills
         self.default_jobs_dir = Path(
             os.path.abspath(os.path.expanduser(default_jobs_dir or "~/EidosWorkspace/jobs"))
         )
@@ -91,8 +93,11 @@ class BatchJobRunner:
     def _resolve_queue_file(self, target: str) -> Optional[Path]:
         """Resolve a path or job ID to a queue.json file Path."""
         p = Path(os.path.abspath(os.path.expanduser(target)))
-        if p.is_file() and p.name == "queue.json":
-            return p
+        if p.is_file():
+            if p.name == "queue.json":
+                return p
+            if p.name == "job.yaml" and (p.parent / "queue.json").is_file():
+                return p.parent / "queue.json"
         if p.is_dir() and (p / "queue.json").is_file():
             return p / "queue.json"
 
@@ -101,15 +106,22 @@ class BatchJobRunner:
             cand_dir = self.default_jobs_dir / target
             if (cand_dir / "queue.json").is_file():
                 return cand_dir / "queue.json"
-            # Try matching by prefix or full job_id
-            for sub in self.default_jobs_dir.iterdir():
-                if sub.is_dir() and target in sub.name and (sub / "queue.json").is_file():
-                    return sub / "queue.json"
+            # Try matching by prefix, folder name, or nested subdirectories
+            for sub in self.default_jobs_dir.rglob("queue.json"):
+                if target in str(sub.parent.name) or target in str(sub.parent):
+                    return sub
+
+        # Fallback check under parent workspace (e.g. ~/EidosWorkspace/documents/<target>)
+        ws_parent = self.default_jobs_dir.parent
+        if ws_parent.exists():
+            cand_doc = ws_parent / "documents" / target / "queue.json"
+            if cand_doc.is_file():
+                return cand_doc
 
         return None
 
     def save_queue(self, queue: JobQueue, queue_path: Optional[Union[str, Path]] = None) -> None:
-        """Atomically persist queue state to queue.json."""
+        """Atomically persist queue state to queue.json and job.yaml manifest."""
         dest_path = (
             Path(os.path.abspath(os.path.expanduser(queue_path)))
             if queue_path
@@ -131,8 +143,54 @@ class BatchJobRunner:
             logger.error("Failed to atomically save queue to %s: %s", dest_path, e)
             raise
 
+        # Atomically save job.yaml manifest
+        yaml_dest = dest_path.parent / "job.yaml"
+        skill_meta = None
+        if self.skills_manager and queue.skill_name:
+            try:
+                skill_meta = self.skills_manager.load_skill(queue.skill_name)
+            except Exception:
+                pass
+        manifest_data = queue.to_manifest_dict(skill_meta=skill_meta)
+        tmp_y_fd, tmp_y_path = tempfile.mkstemp(
+            prefix="job_manifest_", suffix=".tmp", dir=str(dest_path.parent)
+        )
+        try:
+            with os.fdopen(tmp_y_fd, "w", encoding="utf-8") as f:
+                yaml.dump(manifest_data, f, sort_keys=False, allow_unicode=True)
+            os.replace(tmp_y_path, yaml_dest)
+        except Exception as e:
+            if os.path.exists(tmp_y_path):
+                os.remove(tmp_y_path)
+            logger.warning("Failed to save job.yaml manifest to %s: %s", yaml_dest, e)
+
+    def load_manifest(self, job_id_or_path: str) -> Optional[Dict[str, Any]]:
+        """Load lean manifest dict from job.yaml or queue."""
+        q_path = self._resolve_queue_file(job_id_or_path)
+        if not q_path:
+            return None
+        yaml_path = q_path.parent / "job.yaml"
+        if yaml_path.is_file():
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as yf:
+                    data = yaml.safe_load(yf)
+                    if isinstance(data, dict):
+                        return data
+            except Exception as e:
+                logger.debug("Failed reading job.yaml: %s", e)
+        queue = self.load_job(job_id_or_path)
+        if queue:
+            skill_meta = None
+            if self.skills_manager and queue.skill_name:
+                try:
+                    skill_meta = self.skills_manager.load_skill(queue.skill_name)
+                except Exception:
+                    pass
+            return queue.to_manifest_dict(skill_meta=skill_meta)
+        return None
+
     def load_job(self, job_id_or_path: str) -> Optional[JobQueue]:
-        """Load an existing queue from queue.json path or job ID."""
+        """Load an existing queue from queue.json path, job.yaml, or job ID."""
         q_path = self._resolve_queue_file(job_id_or_path)
         if not q_path or not q_path.is_file():
             return None
@@ -142,6 +200,15 @@ class BatchJobRunner:
                 data = json.load(f)
             queue = JobQueue.model_validate(data)
             self.active_job = queue
+
+            # Ensure job.yaml manifest exists
+            yaml_path = q_path.parent / "job.yaml"
+            if not yaml_path.exists():
+                try:
+                    with open(yaml_path, "w", encoding="utf-8") as yf:
+                        yaml.dump(queue.to_manifest_dict(), yf, sort_keys=False, allow_unicode=True)
+                except Exception as ye:
+                    logger.debug("Could not create job.yaml on load: %s", ye)
             return queue
         except Exception as e:
             logger.error("Failed to parse queue from %s: %s", q_path, e)
@@ -154,6 +221,9 @@ class BatchJobRunner:
         input_data: Union[List[Any], str, Dict[str, Any]],
         output_dir: Optional[str] = None,
         settings: Optional[Dict[str, Any]] = None,
+        description: Optional[str] = None,
+        project: Optional[str] = None,
+        phase: Optional[str] = None,
     ) -> JobQueue:
         """Initialize a new batch job queue with generic input items."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -164,18 +234,24 @@ class BatchJobRunner:
         if output_dir:
             out_path = Path(os.path.abspath(os.path.expanduser(output_dir)))
         else:
-            slug = self._slugify(job_name)
-            out_path = self.default_jobs_dir / f"{job_id}_{slug}"
+            if "/" in job_name:
+                parts = [self._slugify(part) for part in job_name.split("/") if part.strip()]
+                out_path = self.default_jobs_dir / Path(*parts)
+            else:
+                slug = self._slugify(job_name)
+                out_path = self.default_jobs_dir / f"{job_id}_{slug}"
 
         out_path.mkdir(parents=True, exist_ok=True)
 
         # Parse and normalize input items
         raw_items: List[Any] = []
+        input_file_path: Optional[str] = None
         if isinstance(input_data, str):
             clean_str = input_data.strip()
             # File path check (.json or .csv)
             potential_file = Path(os.path.abspath(os.path.expanduser(clean_str)))
             if potential_file.is_file():
+                input_file_path = str(potential_file)
                 if potential_file.suffix.lower() == ".json":
                     with open(potential_file, "r", encoding="utf-8") as f:
                         loaded = json.load(f)
@@ -222,6 +298,10 @@ class BatchJobRunner:
             job_id=job_id,
             job_name=job_name,
             skill_name=skill_name,
+            description=description,
+            project=project,
+            phase=phase,
+            input_file=input_file_path,
             created_at=now_iso,
             updated_at=now_iso,
             status="initialized",

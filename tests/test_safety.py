@@ -36,6 +36,9 @@ def test_risk_classifier_levels():
     level, _ = RiskClassifier.classify_action("type_text", {"text": "hello"})
     assert level == RiskLevel.LEVEL_1_UI
 
+    level, _ = RiskClassifier.classify_action("press_key", {"key": "enter"})
+    assert level == RiskLevel.LEVEL_1_UI
+
     # Level 1 OptimalX mutation/review tools
     for opt_write in ("optimalx_write_note", "optimalx_accept_pending_review", "optimalx_reject_pending_review"):
         lvl, _ = RiskClassifier.classify_action(opt_write, {})

@@ -38,6 +38,105 @@ function mapHistoryMessage(m: any, index: number): ChatMessage {
   };
 }
 
+function sameText(left: string | undefined, right: string | undefined): boolean {
+  return (left || '').trim() === (right || '').trim();
+}
+
+function sameMessage(left: ChatMessage | undefined, right: ChatMessage | undefined): boolean {
+  return !!left && !!right && left.role === right.role && sameText(left.content, right.content);
+}
+
+/** The reply that is still being written, if this turn already has one. */
+function openReply(messages: ChatMessage[]): ChatMessage | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === 'assistant' && message.streaming) return message;
+  }
+  return undefined;
+}
+
+/**
+ * Start the on-screen turn for a task.
+ * A repeat of the same start (a second socket, or the echo of a message already shown)
+ * leaves the existing user bubble and reply in place.
+ */
+function beginLiveTurn(prev: ChatMessage[], goal: string, assistantId: string): ChatMessage[] {
+  const streaming = openReply(prev);
+  if (streaming) {
+    const index = prev.indexOf(streaming);
+    const userBefore = index > 0 ? prev[index - 1] : undefined;
+    const alreadyThisTurn = !goal || (userBefore?.role === 'user' && sameText(userBefore.content, goal));
+    if (alreadyThisTurn) return prev;
+  }
+
+  const last = prev[prev.length - 1];
+  const needsUser = !!goal && !(last?.role === 'user' && sameText(last.content, goal));
+  const withUser = needsUser
+    ? [
+        ...prev,
+        {
+          id: `user_${Date.now()}`,
+          role: 'user' as const,
+          content: goal,
+          timestamp: Date.now(),
+        },
+      ]
+    : prev;
+
+  if (openReply(withUser)) return withUser;
+  return [
+    ...withUser,
+    {
+      id: assistantId,
+      role: 'assistant' as const,
+      content: '',
+      thoughts: [],
+      timestamp: Date.now(),
+      streaming: true,
+      isHistorical: false,
+    },
+  ];
+}
+
+/** Fold a token, thought, or tool update into the open reply instead of starting another one. */
+function updateOpenReply(
+  prev: ChatMessage[],
+  update: (message: ChatMessage) => ChatMessage,
+  create: () => ChatMessage
+): ChatMessage[] {
+  const streaming = openReply(prev);
+  const target = streaming || (prev[prev.length - 1]?.role === 'assistant' ? prev[prev.length - 1] : undefined);
+  if (!target) return [...prev, create()];
+  const index = prev.lastIndexOf(target);
+  return [...prev.slice(0, index), update(target), ...prev.slice(index + 1)];
+}
+
+/**
+ * Keep a live reply on screen when a rewind snapshot arrives after that reply started.
+ * A different conversation replaces the thread outright.
+ * The snapshot's copy of this turn is kept once; the live user bubble is not appended again.
+ */
+function mergeHistoryWithLiveTail(loaded: ChatMessage[], prev: ChatMessage[]): ChatMessage[] {
+  if (loaded.length === 0) return loaded;
+  const streamIdx = prev.findIndex((message) => message.streaming);
+  if (streamIdx === -1) return loaded;
+  const isSameThread = loaded.every((message, index) => sameMessage(prev[index], message));
+  if (!isSameThread) return loaded;
+
+  const liveTail = prev.slice(streamIdx).filter((live, offset) => !sameMessage(loaded[streamIdx + offset], live));
+  const before = streamIdx > 0 ? prev[streamIdx - 1] : undefined;
+  const userAlreadySaved =
+    !!before &&
+    before.role === 'user' &&
+    loaded
+      .slice(Math.max(0, streamIdx - 1))
+      .some((saved) => saved.role === 'user' && sameText(saved.content, before.content));
+  if (before && before.role === 'user' && !userAlreadySaved) {
+    return [...loaded, before, ...liveTail];
+  }
+  return [...loaded, ...liveTail];
+}
+
 /** Coerce a shared-file payload into the shape the file list renders. */
 function normalizeSharedFile(raw: any): SharedFile {
   return {
@@ -54,8 +153,16 @@ function normalizeSharedFile(raw: any): SharedFile {
   };
 }
 
+export interface UseEidosWSOptions {
+  onSendNotification?: (title: string, options?: NotificationOptions) => Promise<boolean> | void;
+}
+
 /** Live gateway connection: chat, agent status, files, and safety confirmations. */
-export function useEidosWS() {
+export function useEidosWS(options: UseEidosWSOptions = {}) {
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const connectRef = useRef<() => void>(() => {});
+
   const [token, setTokenState] = useState<string>(() => {
     const urlToken = new URLSearchParams(window.location.search).get('token');
     if (urlToken) {
@@ -82,6 +189,7 @@ export function useEidosWS() {
   const [conversationTitle, setConversationTitle] = useState<string>('New Chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [retryNotice, setRetryNotice] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
@@ -127,6 +235,23 @@ export function useEidosWS() {
           headers,
           body: JSON.stringify({ approved: msg.approved, allowlist: msg.allowlist }),
         }).catch((e) => addLog(`HTTP error: ${e}`));
+      } else if (msg.type === 'edit_retry' && msg.prompt) {
+        fetch('/api/edit_retry', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            prompt: msg.prompt,
+            id: msg.id,
+            message_index: msg.message_index,
+          }),
+        })
+          .then(async (res) => {
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || data.ok === false) {
+              setRetryNotice(data.error || 'Could not retry that message.');
+            }
+          })
+          .catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'new_chat') {
         fetch('/api/conversations/new', {
           method: 'POST',
@@ -163,15 +288,12 @@ export function useEidosWS() {
           }
           if (Array.isArray(data.messages)) {
             setMessages((prev) => {
-              // If not forced and prev already has active streaming message, keep it
-              if (!force && prev.length > 0 && prev.length >= data.messages.length && prev.some((m) => m.streaming)) {
-                return prev;
-              }
               const loaded: ChatMessage[] = data.messages.map((m: any, i: number) => ({
                 ...mapHistoryMessage(m, i),
                 timestamp: m.timestamp || Date.now() - (data.messages.length - i) * 1000,
               }));
-              return loaded;
+              // Preserve any live streaming tail so an active response is never wiped when syncing
+              return mergeHistoryWithLiveTail(loaded, prev);
             });
           }
         }
@@ -231,10 +353,23 @@ export function useEidosWS() {
     if (!token) return;
 
     let isUnmounted = false;
+    let pingTimer: number | null = null;
 
-    /** Open the gateway socket and keep reconnecting until this hook unmounts. */
+    /** Open one gateway socket. A second call while this socket is up does not open another. */
     function connect() {
       if (isUnmounted) return;
+      const existing = wsRef.current;
+      if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      if (pingTimer) clearInterval(pingTimer);
+      if (existing) {
+        existing.onopen = null;
+        existing.onmessage = null;
+        existing.onerror = null;
+        existing.onclose = null;
+        if (existing.readyState !== WebSocket.CLOSED) existing.close();
+      }
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const host = window.location.host;
       const wsUrl = `${proto}//${host}/ws?token=${encodeURIComponent(token)}`;
@@ -242,14 +377,24 @@ export function useEidosWS() {
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
+      // Keepalive heartbeat every 20 seconds to prevent mobile carriers, NAT, and Tailscale from dropping idle socket
+      pingTimer = window.setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ping' }));
+          } catch {}
+        }
+      }, 20000);
+
       ws.onopen = () => {
-        if (isUnmounted) return;
+        if (isUnmounted || wsRef.current !== ws) return;
         setConnected(true);
         addLog('Connected to EidosBot Gateway.');
-        loadHistory(true);
+        refreshSync();
       };
 
       ws.onmessage = (event) => {
+        if (isUnmounted || wsRef.current !== ws) return;
         try {
           const data: InboundWSEvent = JSON.parse(event.data);
           const ev = data.event;
@@ -298,7 +443,9 @@ export function useEidosWS() {
               setSharedFiles(data.files.map(normalizeSharedFile));
             }
             if (Array.isArray(data.messages)) {
-              setMessages(data.messages.map((m: any, i: number) => mapHistoryMessage(m, i)));
+              const loaded = data.messages.map((m: any, i: number) => mapHistoryMessage(m, i));
+              setMessages((prev) => mergeHistoryWithLiveTail(loaded, prev));
+              setRetryNotice(null);
             } else {
               loadHistory(true);
             }
@@ -315,58 +462,29 @@ export function useEidosWS() {
               setSharedFiles(data.files.map(normalizeSharedFile));
             }
             if (Array.isArray(data.messages)) {
-              setMessages(data.messages.map((m: any, i: number) => mapHistoryMessage(m, i)));
+              const loaded = data.messages.map((m: any, i: number) => mapHistoryMessage(m, i));
+              setMessages((prev) => mergeHistoryWithLiveTail(loaded, prev));
             }
           } else if (ev === 'task_start') {
-            // Task initiated (either locally from web or remotely from desktop app)
+            // One user bubble and one open reply. A repeated start for this turn is ignored.
             const goal = (data.goal || '').trim();
             const newAssistantId = `msg_${Date.now()}`;
-            currentAssistantMsgIdRef.current = newAssistantId;
-
             setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              const alreadyHasUserGoal = last && last.role === 'user' && last.content.trim() === goal;
-
-              const base = alreadyHasUserGoal || !goal
-                ? prev
-                : [
-                    ...prev,
-                    {
-                      id: `user_${Date.now()}`,
-                      role: 'user' as const,
-                      content: goal,
-                      timestamp: Date.now(),
-                    },
-                  ];
-
-              return [
-                ...base,
-                {
-                  id: newAssistantId,
-                  role: 'assistant' as const,
-                  content: '',
-                  thoughts: [],
-                  timestamp: Date.now(),
-                  streaming: true,
-                  isHistorical: false,
-                },
-              ];
+              const next = beginLiveTurn(prev, goal, newAssistantId);
+              const streaming = openReply(next);
+              currentAssistantMsgIdRef.current = streaming?.id || null;
+              return next;
             });
           } else if (ev === 'token_chunk' && data.chunk) {
             const chunk = data.chunk;
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (last && last.role === 'assistant' && last.streaming) {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, content: last.content + chunk },
-                ];
-              } else {
-                const newId = `msg_${Date.now()}`;
-                currentAssistantMsgIdRef.current = newId;
-                return [
-                  ...prev,
-                  {
+            setMessages((prev) =>
+              updateOpenReply(
+                prev,
+                (message) => ({ ...message, content: message.content + chunk }),
+                () => {
+                  const newId = `msg_${Date.now()}`;
+                  currentAssistantMsgIdRef.current = newId;
+                  return {
                     id: newId,
                     role: 'assistant',
                     content: chunk,
@@ -374,35 +492,31 @@ export function useEidosWS() {
                     timestamp: Date.now(),
                     streaming: true,
                     isHistorical: false,
-                  },
-                ];
-              }
-            });
+                  };
+                }
+              )
+            );
           } else if (ev === 'thought_chunk' && data.chunk) {
             const thought = data.chunk;
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (last && last.role === 'assistant') {
-                const existingThoughts = last.thoughts || [];
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, thoughts: [...existingThoughts, thought] },
-                ];
-              } else {
-                return [
-                  ...prev,
-                  {
-                    id: `msg_${Date.now()}`,
-                    role: 'assistant',
-                    content: '',
-                    thoughts: [thought],
-                    timestamp: Date.now(),
-                    streaming: true,
-                    isHistorical: false,
-                  },
-                ];
-              }
-            });
+            setMessages((prev) =>
+              updateOpenReply(
+                prev,
+                (message) => {
+                  const existingThoughts = message.thoughts || [];
+                  if (existingThoughts[existingThoughts.length - 1] === thought) return message;
+                  return { ...message, thoughts: [...existingThoughts, thought] };
+                },
+                () => ({
+                  id: `msg_${Date.now()}`,
+                  role: 'assistant',
+                  content: '',
+                  thoughts: [thought],
+                  timestamp: Date.now(),
+                  streaming: true,
+                  isHistorical: false,
+                })
+              )
+            );
           } else if (ev === 'tool_start') {
             const tool = String(data.tool || 'action');
             const args =
@@ -411,18 +525,19 @@ export function useEidosWS() {
                 : typeof data.arguments === 'string'
                 ? data.arguments
                 : JSON.stringify(data.arguments);
-            setMessages((prev) => {
-              const action: ChatAction = { tool, arguments: args, result: '', pending: true };
-              const last = prev[prev.length - 1];
-              if (last && last.role === 'assistant') {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, actions: [...(last.actions || []), action] },
-                ];
-              }
-              return [
-                ...prev,
-                {
+            const action: ChatAction = { tool, arguments: args, result: '', pending: true };
+            setMessages((prev) =>
+              updateOpenReply(
+                prev,
+                (message) => {
+                  const actions = message.actions || [];
+                  const lastAction = actions[actions.length - 1];
+                  if (lastAction && lastAction.tool === action.tool && lastAction.arguments === action.arguments && lastAction.pending) {
+                    return message;
+                  }
+                  return { ...message, actions: [...actions, action] };
+                },
+                () => ({
                   id: `msg_${Date.now()}`,
                   role: 'assistant' as const,
                   content: '',
@@ -431,24 +546,37 @@ export function useEidosWS() {
                   timestamp: Date.now(),
                   streaming: true,
                   isHistorical: false,
-                },
-              ];
-            });
+                })
+              )
+            );
           } else if (ev === 'tool_end') {
             const tool = String(data.tool || 'action');
             const result = data.result == null ? '' : String(data.result);
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              if (!last || last.role !== 'assistant') return prev;
-              const actions = [...(last.actions || [])];
-              for (let i = actions.length - 1; i >= 0; i -= 1) {
-                if (actions[i].tool === tool && actions[i].pending) {
-                  actions[i] = { ...actions[i], result, pending: false };
-                  break;
-                }
-              }
-              return [...prev.slice(0, -1), { ...last, actions }];
-            });
+            setMessages((prev) =>
+              updateOpenReply(
+                prev,
+                (message) => {
+                  const actions = [...(message.actions || [])];
+                  for (let i = actions.length - 1; i >= 0; i -= 1) {
+                    if (actions[i].tool === tool && actions[i].pending) {
+                      actions[i] = { ...actions[i], result, pending: false };
+                      break;
+                    }
+                  }
+                  return { ...message, actions };
+                },
+                () => ({
+                  id: `msg_${Date.now()}`,
+                  role: 'assistant',
+                  content: '',
+                  thoughts: [],
+                  actions: [{ tool, arguments: '', result, pending: false }],
+                  timestamp: Date.now(),
+                  streaming: true,
+                  isHistorical: false,
+                })
+              )
+            );
           } else if (ev === 'task_finished') {
             const failed = data.success === false;
             const record = failed ? (data.detail || data.summary || '').trim() : '';
@@ -482,13 +610,23 @@ export function useEidosWS() {
               };
             };
             setMessages((prev) => {
-              const hasStreaming = prev.some((m) => m.streaming);
-              if (hasStreaming) {
-                return prev.map((m) => (m.streaming ? applyFinish(m) : m));
+              const streaming = openReply(prev);
+              if (streaming) {
+                const index = prev.lastIndexOf(streaming);
+                return [...prev.slice(0, index), applyFinish(streaming), ...prev.slice(index + 1)];
               }
               const last = prev[prev.length - 1];
               if (last && last.role === 'assistant') {
-                return [...prev.slice(0, -1), applyFinish(last)];
+                // A reply that already finished stays as it was sent. Stopping
+                // read-aloud, or a late cancel, must not replace that text.
+                if (!last.streaming && last.content.trim() && failed) return prev;
+                const finished = applyFinish(last);
+                if (sameText(last.content, finished.content) && !last.streaming) return prev;
+                return [...prev.slice(0, -1), finished];
+              }
+              const text = record || headline;
+              if (text && prev.some((message) => message.role === 'assistant' && sameText(message.content, text))) {
+                return prev;
               }
               if (record || headline || incomingThoughts.length || incomingActions.length) {
                 return [
@@ -507,6 +645,24 @@ export function useEidosWS() {
             });
             currentAssistantMsgIdRef.current = null;
             addLog(`Task finished: ${data.headline || data.summary || 'Done'}`);
+
+            // Dispatch notification if app is in background or permission granted
+            if (optionsRef.current?.onSendNotification) {
+              const headline =
+                data.headline ||
+                data.summary ||
+                (data.success !== false ? 'Task completed successfully.' : 'Task ended before it finished.');
+              optionsRef.current.onSendNotification(
+                data.success !== false ? 'EidosBot: Task Complete' : 'EidosBot: Task Failed',
+                {
+                  body: headline,
+                  tag: 'eidos-task-finished',
+                  data: { url: '/' },
+                }
+              );
+            }
+          } else if (ev === 'edit_retry_failed') {
+            setRetryNotice(data.error || data.message || 'Could not retry that message.');
           } else if (ev === 'error') {
             const errorMsg = data.error || data.message || 'Unknown error occurred.';
             setMessages((prev) =>
@@ -540,6 +696,14 @@ export function useEidosWS() {
             };
             setConfirmations((prev) => [...prev.filter((c) => c.id !== rec.id), rec]);
             addLog(`Safety confirmation required: ${rec.action_type}`);
+
+            if (optionsRef.current?.onSendNotification) {
+              optionsRef.current.onSendNotification('EidosBot: Approval Required', {
+                body: `${rec.action_type || 'Action'}: ${rec.reason || 'Safety confirmation requested'}`,
+                tag: `eidos-confirm-${rec.id}`,
+                data: { url: '/' },
+              });
+            }
           } else if (ev === 'confirmation_resolved') {
             setConfirmations((prev) => prev.filter((c) => c.id !== data.id));
             addLog(`Confirmation ${data.id} resolved.`);
@@ -575,32 +739,44 @@ export function useEidosWS() {
       };
 
       ws.onclose = () => {
-        if (isUnmounted) return;
+        if (pingTimer) clearInterval(pingTimer);
+        if (wsRef.current === ws) wsRef.current = null;
+        if (isUnmounted || wsRef.current !== null) return;
         setConnected(false);
         addLog('Disconnected from EidosBot Gateway. Reconnecting in 3s...');
         reconnectTimeoutRef.current = window.setTimeout(connect, 3000);
       };
 
       ws.onerror = () => {
+        if (wsRef.current !== ws) return;
+        if (pingTimer) clearInterval(pingTimer);
         ws.close();
       };
     }
 
+    connectRef.current = connect;
     connect();
 
     return () => {
       isUnmounted = true;
+      if (pingTimer) clearInterval(pingTimer);
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [token, addLog, loadHistory]);
+  }, [token, addLog, refreshSync]);
 
   // Auto-sync when user returns to browser tab or phone wakes up
   useEffect(() => {
     /** Refresh when the tab or phone becomes visible again, so a backgrounded client is not stale. */
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible' && connected) {
-        refreshSync();
+      if (document.visibilityState === 'visible') {
+        const socket = wsRef.current;
+        if (!socket || socket.readyState === WebSocket.CLOSED) {
+          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+          connectRef.current();
+        } else if (socket.readyState === WebSocket.OPEN) {
+          refreshSync();
+        }
       }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -609,13 +785,31 @@ export function useEidosWS() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', handleVisibilityChange);
     };
-  }, [connected, refreshSync]);
+  }, [refreshSync]);
+
+  /** Rewind to a user turn and run that prompt again, optionally with edited text. */
+  const editAndRetry = useCallback(
+    (messageIndex: number, promptText: string, messageId?: string) => {
+      const clean = promptText.trim();
+      if (!clean) return;
+      setRetryNotice(null);
+      currentAssistantMsgIdRef.current = null;
+      sendMessage({
+        type: 'edit_retry',
+        prompt: clean,
+        id: messageId,
+        message_index: messageIndex,
+      });
+    },
+    [sendMessage]
+  );
 
   /** Show the user's message immediately, then send it to the agent. */
   const sendPrompt = useCallback(
     (promptText: string) => {
       const clean = promptText.trim();
       if (!clean) return;
+      setRetryNotice(null);
 
       // Optimistically add user turn
       setMessages((prev) => [
@@ -707,6 +901,9 @@ export function useEidosWS() {
     startNewChat,
     switchConversation,
     sendPrompt,
+    editAndRetry,
+    retryNotice,
+    clearRetryNotice: () => setRetryNotice(null),
     stopTask,
     triggerKill,
     resetKill,

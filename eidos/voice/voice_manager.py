@@ -143,6 +143,28 @@ class VoiceManager:
         """Speak a chat reply using progressive clips so the first words start quickly."""
         return self.speech_stream.speak_text(text=text, voice=voice, speed=speed)
 
+    def playback_snapshot(self) -> dict:
+        """Position and transport state for the desktop speech bar."""
+        session = getattr(getattr(self.tts, "_playback", None), "session", None)
+        if session is None:
+            return {"active": False}
+        return session.snapshot()
+
+    def pause_playback(self) -> None:
+        session = getattr(getattr(self.tts, "_playback", None), "session", None)
+        if session is not None:
+            session.pause()
+
+    def resume_playback(self) -> None:
+        session = getattr(getattr(self.tts, "_playback", None), "session", None)
+        if session is not None:
+            session.resume()
+
+    def seek_playback(self, seconds: float) -> None:
+        session = getattr(getattr(self.tts, "_playback", None), "session", None)
+        if session is not None:
+            session.seek_by(seconds)
+
     def stop_speaking(self):
         """Immediately stop ongoing TTS playback and discard queued clips."""
         self.speech_stream.stop()

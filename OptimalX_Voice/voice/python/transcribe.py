@@ -15,9 +15,11 @@ import sys
 import traceback
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 
 from device_resolve import cuda_mem_info, resolve_stt_provider
+from stt_chunk import SAFE_SINGLE_PASS_SECONDS, plan_slices, stitch_transcripts
 from stt_model import DEFAULT_MODEL, ensure_model, model_paths, model_ready, normalize_model_id
 
 _RECOGNIZER = None
@@ -91,6 +93,42 @@ def status(model_name: str) -> dict:
     }
 
 
+def _mono_f32(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 2 and audio.shape[1] > 1:
+        audio = audio[:, 0]
+    return np.ascontiguousarray(audio.reshape(-1), dtype=np.float32)
+
+
+def _rms_envelope(audio: np.ndarray, frame_size: int) -> list[float]:
+    n_frames = int(audio.shape[0] // frame_size)
+    if n_frames <= 0:
+        return []
+    frames = audio[: n_frames * frame_size].reshape(n_frames, frame_size)
+    return np.sqrt(np.mean(frames * frames, axis=1)).tolist()
+
+
+def _decode_slice(recognizer, audio: np.ndarray, sample_rate: int) -> str:
+    if audio.size == 0:
+        return ""
+    stream = recognizer.create_stream()
+    stream.accept_waveform(int(sample_rate), np.ascontiguousarray(audio, dtype=np.float32))
+    recognizer.decode_stream(stream)
+    return (stream.result.text or "").strip()
+
+
+def _audio_slices(audio: np.ndarray, sample_rate: int) -> list[tuple[int, int]]:
+    """Split long audio so each Parakeet decode stays under the 240s cap."""
+    n_samples = int(audio.shape[0])
+    if sample_rate <= 0 or n_samples <= 0:
+        return []
+    duration = n_samples / float(sample_rate)
+    if duration <= SAFE_SINGLE_PASS_SECONDS:
+        return [(0, n_samples)]
+    frame_size = max(1, int(sample_rate * 0.02))
+    rms = _rms_envelope(audio, frame_size)
+    return plan_slices(n_samples, int(sample_rate), rms=rms, frame_size=frame_size)
+
+
 def transcribe(wav_path: str, model_name: str, device: str | None) -> dict:
     path = Path(wav_path)
     if not path.is_file():
@@ -101,19 +139,24 @@ def transcribe(wav_path: str, model_name: str, device: str | None) -> dict:
     recognizer = load_model(model_id, provider)
 
     audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=True)
-    if audio.ndim == 2 and audio.shape[1] > 1:
-        audio = audio[:, 0]
-    else:
-        audio = audio.reshape(-1)
+    audio = _mono_f32(audio)
+    rate = int(sample_rate)
+    slices = _audio_slices(audio, rate)
+    if len(slices) > 1:
+        duration = audio.shape[0] / float(rate) if rate else 0.0
+        print(
+            f"STT chunking {duration:.1f}s audio into {len(slices)} slices (240s model cap)",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    stream = recognizer.create_stream()
-    stream.accept_waveform(int(sample_rate), audio)
-    recognizer.decode_stream(stream)
-    text = (stream.result.text or "").strip()
+    parts = [_decode_slice(recognizer, audio[start:end], rate) for start, end in slices]
+    text = stitch_transcripts(parts)
 
     return {
         "ok": True,
         "text": text,
+        "chunks": len(slices),
         "model": model_id,
         "provider": provider,
         "device": provider,

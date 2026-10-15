@@ -22,8 +22,14 @@ import uuid
 from aiohttp import web, WSMsgType
 
 from eidos.gateway.files import SharedFileRegistry, content_disposition
+from eidos.gateway.llm_proxy import (
+    handle_llm_health,
+    handle_proxy_openai_chat,
+    handle_proxy_tags,
+)
 from eidos.perception.screen import ScreenCapture
 from eidos.safety.risk_classifier import RiskLevel
+from eidos.gateway.tts_live import MAX_TEXT_CHARS, LiveTtsHub, valid_session_id
 from eidos.voice.voices import DEFAULT_VOICE_ID, list_voices
 
 logger = logging.getLogger(__name__)
@@ -454,6 +460,7 @@ class RemoteGatewayServer:
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._confirm_lock = threading.Lock()
         self.files = SharedFileRegistry(on_shared=self._on_file_shared)
+        self.live_tts = LiveTtsHub()
         try:
             self.agent_loop.file_share = self.files
         except Exception:
@@ -479,6 +486,32 @@ class RemoteGatewayServer:
 
         return False
 
+    def _ollama_upstream_base(self) -> str:
+        """Local Ollama URL from the running agent (not exposed on the tailnet directly)."""
+        mc = getattr(self.agent_loop, "model_client", None)
+        if mc is not None:
+            ollama = getattr(mc, "ollama", None)
+            if ollama is not None:
+                base = getattr(ollama, "base_url", None)
+                if base:
+                    return str(base).rstrip("/")
+        cfg = getattr(self.agent_loop, "config", None) or {}
+        if isinstance(cfg, dict):
+            local = cfg.get("models", {}).get("local", {})
+            if isinstance(local, dict) and local.get("base_url"):
+                return str(local["base_url"]).rstrip("/")
+        return "http://localhost:11434"
+
+    async def _handle_llm_health(self, request: web.Request) -> web.Response:
+        """Stockzilla / companions: detect gateway + upstream Ollama without auth."""
+        return await handle_llm_health(request, self._ollama_upstream_base())
+
+    async def _handle_proxy_ollama_tags(self, request: web.Request) -> web.StreamResponse:
+        return await handle_proxy_tags(request, self._ollama_upstream_base(), self._verify_auth)
+
+    async def _handle_proxy_openai_chat(self, request: web.Request) -> web.StreamResponse:
+        return await handle_proxy_openai_chat(request, self._ollama_upstream_base(), self._verify_auth)
+
     async def _handle_dashboard(self, request: web.Request) -> web.Response:
         """Serve the mobile-friendly web dashboard or compiled SPA bundle."""
         index_file = WEB_DIST_DIR / "index.html"
@@ -494,7 +527,7 @@ class RemoteGatewayServer:
     async def _handle_spa_fallback(self, request: web.Request) -> web.Response:
         """Fallback handler for SPA routing and static assets."""
         path = request.path
-        if path.startswith("/api/") or path == "/ws":
+        if path.startswith("/api/") or path.startswith("/v1/") or path == "/ws":
             return web.json_response({"ok": False, "error": "Endpoint not found"}, status=404)
 
         # Check if the requested file directly exists in WEB_DIST_DIR
@@ -792,6 +825,41 @@ class RemoteGatewayServer:
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
+    async def _handle_type(self, request: web.Request) -> web.Response:
+        """Type phone-keyboard text into the focused desktop field."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        try:
+            data = await request.json()
+            text = data.get("text") or ""
+            key = str(data.get("key") or "").lower().strip()
+            if not isinstance(text, str):
+                return web.json_response({"ok": False, "error": "Text must be a string"}, status=400)
+            try:
+                backspaces = int(data.get("backspaces") or 0)
+            except (TypeError, ValueError):
+                return web.json_response({"ok": False, "error": "Invalid backspaces"}, status=400)
+            if backspaces < 0 or backspaces > 500 or len(text) > 4000:
+                return web.json_response({"ok": False, "error": "Typing request is out of range"}, status=400)
+            if key and key not in {
+                "enter", "return", "backspace", "tab", "esc", "escape", "space",
+                "delete", "up", "down", "left", "right", "home", "end",
+            }:
+                return web.json_response({"ok": False, "error": "Unsupported key"}, status=400)
+            if not text and backspaces == 0 and not key:
+                return web.json_response({"ok": False, "error": "Nothing to type"}, status=400)
+
+            inputs = getattr(self.agent_loop, "inputs", None)
+            if not inputs or not hasattr(inputs, "relay_typing"):
+                return web.json_response({"ok": False, "error": "Input simulator unavailable"}, status=400)
+
+            res = await asyncio.to_thread(inputs.relay_typing, text, backspaces, key)
+            status = 200 if res.get("success") else 400
+            return web.json_response({"ok": bool(res.get("success")), "result": res}, status=status)
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def _handle_screenshot(self, request: web.Request) -> web.Response:
         """Capture current screen and stream as JPEG."""
         if not self._verify_auth(request):
@@ -820,6 +888,31 @@ class RemoteGatewayServer:
 
             self.dispatch_task(prompt, speak_on_host=speak_host)
             return web.json_response({"ok": True, "message": "Task dispatched"})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
+    async def _handle_edit_retry(self, request: web.Request) -> web.Response:
+        """Rewind to a user turn and run the edited or original prompt again."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        try:
+            data = await request.json()
+            prompt = str(data.get("prompt", "")).strip()
+            message_id = str(data.get("id") or data.get("message_id") or "").strip()
+            message_index = self._coerce_message_index(data.get("message_index"))
+            if not prompt:
+                return web.json_response({"ok": False, "error": "Empty prompt"}, status=400)
+            ok = self.edit_and_retry(prompt, message_id=message_id, message_index=message_index)
+            if not ok:
+                reason = getattr(self, "_edit_retry_error", "") or "Could not retry that message"
+                return web.json_response({"ok": False, "error": reason}, status=409)
+            _cid, title, messages = self.get_active_conversation_info()
+            return web.json_response({
+                "ok": True,
+                "title": title,
+                "messages": messages,
+            })
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
 
@@ -968,6 +1061,151 @@ class RemoteGatewayServer:
         pieces = split_for_tts_playback(cleaned)
         return web.json_response({"ok": True, "chunks": pieces, "total": len(pieces)})
 
+    def _kokoro_tts(self):
+        voice_mgr = getattr(self.agent_loop, "voice", None)
+        tts = getattr(voice_mgr, "tts", None) if voice_mgr else None
+        if not tts or not getattr(tts, "is_available", False):
+            return None
+        return tts
+
+    def _stream_live_speech(self, text: str, voice: Optional[str], speed: Optional[float]):
+        tts = self._kokoro_tts()
+        if not tts:
+            raise RuntimeError("Kokoro TTS is not available on host")
+        return tts.synthesize_stream(text, voice=voice, speed=speed)
+
+    async def _handle_tts_live_post(self, request: web.Request) -> web.Response:
+        """Attach reply text to a live playback session the phone already opened."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        session_id = request.match_info.get("session_id", "")
+        if not valid_session_id(session_id):
+            return web.json_response({"ok": False, "error": "Invalid session"}, status=400)
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Invalid JSON body"}, status=400)
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return web.json_response({"ok": False, "error": "Missing or empty 'text'"}, status=400)
+        if len(text) > MAX_TEXT_CHARS:
+            return web.json_response({"ok": False, "error": "Text is too long to speak"}, status=400)
+        voice = data.get("voice")
+        speed = None
+        if data.get("speed") is not None:
+            try:
+                speed = float(data["speed"])
+            except (TypeError, ValueError):
+                return web.json_response({"ok": False, "error": "Invalid speed"}, status=400)
+        session = self.live_tts.get_or_create(session_id)
+        if self._kokoro_tts() is None:
+            session.fail("Kokoro TTS is not available on host")
+            return web.json_response({"ok": False, "error": "Kokoro TTS is not available on host"}, status=503)
+        title = " ".join(text.split())
+        if len(title) > 80:
+            title = title[:77] + "…"
+        session.submit(text, voice if isinstance(voice, str) else None, speed, title or "EidosBot")
+        self.live_tts.ensure_started(session, self._stream_live_speech)
+        return web.json_response({"ok": True, "id": session_id})
+
+    async def _handle_tts_live_get(self, request: web.Request) -> web.Response:
+        """Stream one WAV. The phone's audio element owns this response, including while the screen is off."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        session_id = request.match_info.get("session_id", "")
+        if not valid_session_id(session_id):
+            return web.json_response({"ok": False, "error": "Invalid session"}, status=400)
+        if self._kokoro_tts() is None:
+            session = self.live_tts.get_or_create(session_id)
+            session.fail("Kokoro TTS is not available on host")
+            return web.json_response({"ok": False, "error": "Kokoro TTS is not available on host"}, status=503)
+        session = self.live_tts.get_or_create(session_id)
+        self.live_tts.ensure_started(session, self._stream_live_speech)
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "audio/wav",
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+        await response.prepare(request)
+        offset = 0
+        try:
+            while True:
+                chunk = await asyncio.to_thread(session.wait_chunk, offset, 16384)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                await response.write(chunk)
+                await response.drain()
+        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            session.cancel()
+            raise
+        except Exception as exc:
+            logger.warning("Live TTS stream closed: %s", exc)
+            session.cancel()
+        try:
+            await response.write_eof()
+        except Exception:
+            session.cancel()
+        return response
+
+    async def _handle_tts_live_meta(self, request: web.Request) -> web.Response:
+        """Cue points and duration for 5-second and per-chunk seeking."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        session_id = request.match_info.get("session_id", "")
+        session = self.live_tts.get(session_id) if valid_session_id(session_id) else None
+        if session is None:
+            return web.json_response({"ok": False, "error": "Session not found"}, status=404)
+        return web.json_response(session.meta())
+
+    async def _handle_tts_live_file(self, request: web.Request) -> web.Response:
+        """Finished WAV with a real length, so pause/seek can reopen the same track."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        session_id = request.match_info.get("session_id", "")
+        session = self.live_tts.get(session_id) if valid_session_id(session_id) else None
+        if session is None:
+            return web.json_response({"ok": False, "error": "Session not found"}, status=404)
+        if not session.complete:
+            return web.json_response({"ok": False, "error": "Audio is still being generated"}, status=409)
+        blob = session.wav_bytes()
+        start, end = 0, len(blob) - 1
+        status = 200
+        range_header = request.headers.get("Range", "")
+        if range_header.startswith("bytes=") and len(blob) > 0:
+            spec = range_header[6:].split(",", 1)[0].strip()
+            left, _, right = spec.partition("-")
+            try:
+                start = int(left) if left else 0
+                end = int(right) if right else len(blob) - 1
+            except ValueError:
+                start, end = 0, len(blob) - 1
+            start = max(0, min(start, len(blob) - 1))
+            end = max(start, min(end, len(blob) - 1))
+            status = 206
+        body = blob[start : end + 1] if blob else b""
+        headers = {
+            "Content-Type": "audio/wav",
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-store",
+            "Content-Length": str(len(body)),
+        }
+        if status == 206:
+            headers["Content-Range"] = f"bytes {start}-{end}/{len(blob)}"
+        return web.Response(status=status, body=body, headers=headers)
+
+    async def _handle_tts_live_delete(self, request: web.Request) -> web.Response:
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        session_id = request.match_info.get("session_id", "")
+        session = self.live_tts.get(session_id) if valid_session_id(session_id) else None
+        if session is not None:
+            session.cancel()
+        return web.json_response({"ok": True})
+
     async def _handle_voices(self, request: web.Request) -> web.Response:
         """Return available Kokoro TTS voices."""
         if not self._verify_auth(request):
@@ -1031,7 +1269,8 @@ class RemoteGatewayServer:
                     "-c:a", "pcm_s16le",
                     wav_path,
                 ]
-                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=15)
+                # Long dictation can take a while to remux into 16 kHz PCM before Parakeet.
+                proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=180)
                 if proc.returncode != 0:
                     err_msg = proc.stderr.decode("utf-8", errors="replace")[:300]
                     raise RuntimeError(f"Audio conversion failed: {err_msg}")
@@ -1231,6 +1470,7 @@ class RemoteGatewayServer:
         self.broadcast_event("log", {"message": f"Remote task requested: '{prompt}'"})
 
         def _run():
+            called_loop = False
             try:
                 # If agent_loop supports speak_summary, pass speak_on_host so remote tasks don't blare on host PC
                 run_task_fn = getattr(self.agent_loop, "run_task", None)
@@ -1248,14 +1488,12 @@ class RemoteGatewayServer:
                             res = run_task_fn(prompt, speak_summary=speak_on_host)
                         except TypeError:
                             res = run_task_fn(prompt)
+                    called_loop = True
                 else:
                     res = {"success": False, "summary": "No agent loop available"}
 
                 summary = res.get("summary", "Done") if isinstance(res, dict) else str(res)
-                success = res.get("success", True) if isinstance(res, dict) else True
-                detail = res.get("detail", summary) if isinstance(res, dict) else summary
-                thoughts = res.get("thoughts") if isinstance(res, dict) else None
-                actions = res.get("actions") if isinstance(res, dict) else None
+                stopped = bool(res.get("stopped")) if isinstance(res, dict) else False
 
                 is_killed = False
                 if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
@@ -1264,20 +1502,18 @@ class RemoteGatewayServer:
                 if is_killed or self.current_state == "killed":
                     self.current_state = "killed"
                     self.broadcast_event("status_change", {"state": "killed", "details": summary, "killed": True})
+                elif stopped:
+                    summary = "Task stopped by user."
+                    self.current_state = "idle"
+                    self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
                 else:
                     self.current_state = "idle"
                     self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
 
                 self.broadcast_event("log", {"message": f"Task completed: {summary}"})
-                chat_text = detail if not success else summary
-                self.broadcast_event("task_finished", {
-                    "summary": chat_text,
-                    "detail": detail,
-                    "headline": summary,
-                    "success": success,
-                    "thoughts": thoughts or [],
-                    "actions": actions or [],
-                })
+                # run_task already emits on_task_finish, which is the one reply for this turn.
+                if not called_loop:
+                    self.broadcast_event("task_finished", {"summary": summary, "success": False})
             except Exception as e:
                 is_killed = False
                 if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
@@ -1296,7 +1532,14 @@ class RemoteGatewayServer:
         threading.Thread(target=_run, daemon=True, name="GatewayTaskWorker").start()
 
     def stop_task(self):
-        """Stop active task, TTS speech, and unblock confirmations without engaging the emergency kill switch."""
+        """Stop the running agent task without engaging the emergency kill switch.
+
+        A stop while nothing is running must not emit another finish event.
+        That event was replacing a reply that had already been delivered when
+        the user only wanted speech playback to end.
+        """
+        if self.current_state not in ("thinking", "executing", "perceiving"):
+            return
         if hasattr(self.agent_loop, "cancel_task") and callable(self.agent_loop.cancel_task):
             try:
                 self.agent_loop.cancel_task()
@@ -1427,6 +1670,169 @@ class RemoteGatewayServer:
         self.broadcast_event("conversation_cleared", {})
         self.broadcast_event("log", {"message": "Active conversation history cleared."})
 
+    @staticmethod
+    def _coerce_message_index(value: Any) -> Optional[int]:
+        """Accept a JSON message index from the web client."""
+        if isinstance(value, bool) or value is None:
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+            return int(value.strip())
+        return None
+
+    @staticmethod
+    def _user_turn_index(
+        messages: List[Dict[str, Any]],
+        message_id: str = "",
+        message_index: Optional[int] = None,
+        prompt: str = "",
+    ) -> Optional[int]:
+        """Find the user turn an edit or retry should start from."""
+
+        def is_user(index: int) -> bool:
+            return str(messages[index].get("role") or "").lower() == "user"
+
+        def previous_user(start: int) -> Optional[int]:
+            for cursor in range(start, -1, -1):
+                if is_user(cursor) and str(messages[cursor].get("content") or "").strip():
+                    return cursor
+            return None
+
+        if message_id:
+            for index, message in enumerate(messages):
+                if str(message.get("id") or "") != message_id:
+                    continue
+                if is_user(index):
+                    return index
+                return previous_user(index - 1)
+
+        if isinstance(message_index, int) and 0 <= message_index < len(messages):
+            if is_user(message_index):
+                return message_index
+            return previous_user(message_index - 1)
+
+        wanted = prompt.strip()
+        if not wanted:
+            return None
+        matches = [
+            index
+            for index, message in enumerate(messages)
+            if is_user(index) and str(message.get("content") or "").strip() == wanted
+        ]
+        if not matches:
+            return None
+        return matches[-1]
+
+    def _replace_history_from_store(self, conv_id: str) -> None:
+        """Rebuild in-memory turns after the stored conversation was rewound."""
+        history = getattr(self.agent_loop, "conversation_history", None)
+        if not isinstance(history, list):
+            return
+        store = getattr(self.agent_loop, "conversation_store", None)
+        history.clear()
+        if not store or not callable(getattr(store, "get_messages", None)):
+            return
+        raw = store.get_messages(conv_id)
+        if not isinstance(raw, list):
+            return
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").lower()
+            if role in ("user", "assistant"):
+                history.append({"role": role, "content": str(item.get("content") or "")})
+
+    def edit_and_retry(
+        self,
+        prompt: str,
+        message_id: str = "",
+        message_index: Optional[int] = None,
+    ) -> bool:
+        """Drop a user turn and everything after it, then run the prompt again."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return self._fail_edit_retry("Nothing to retry.")
+
+        if self.current_state in ("thinking", "executing", "perceiving"):
+            return self._fail_edit_retry(
+                "Wait for the current task to finish before editing or retrying."
+            )
+
+        killed = self.current_state == "killed"
+        kill_switch = getattr(self.agent_loop, "kill_switch", None)
+        if kill_switch and callable(getattr(kill_switch, "is_triggered", None)):
+            try:
+                killed = killed or bool(kill_switch.is_triggered())
+            except Exception:
+                pass
+        if killed:
+            return self._fail_edit_retry("Reset the emergency stop before retrying.")
+
+        conv_id, title, messages = self.get_active_conversation_info()
+        cut = self._user_turn_index(
+            messages,
+            message_id=message_id,
+            message_index=message_index,
+            prompt=prompt,
+        )
+        if cut is None:
+            return self._fail_edit_retry("Could not find that message to retry.")
+
+        target_id = str(messages[cut].get("id") or "")
+        store = getattr(self.agent_loop, "conversation_store", None)
+        rewound = False
+        if (
+            store
+            and conv_id
+            and target_id
+            and not target_id.startswith("hist_")
+            and callable(getattr(store, "delete_messages_after", None))
+        ):
+            try:
+                deleted = int(store.delete_messages_after(conv_id, target_id, inclusive=True) or 0)
+            except Exception as exc:
+                logger.warning("Failed to rewind conversation for retry: %s", exc)
+                deleted = 0
+            if deleted > 0:
+                rewound = True
+                reloader = getattr(self.agent_loop, "reload_conversation_history", None)
+                if callable(reloader):
+                    try:
+                        reloader()
+                    except Exception as exc:
+                        logger.warning("Failed to reload conversation history: %s", exc)
+                        self._replace_history_from_store(conv_id)
+                else:
+                    self._replace_history_from_store(conv_id)
+        elif isinstance(getattr(self.agent_loop, "conversation_history", None), list):
+            history = self.agent_loop.conversation_history
+            if 0 <= cut <= len(history):
+                del history[cut:]
+                rewound = True
+
+        if not rewound:
+            return self._fail_edit_retry("Could not rewind the conversation for that retry.")
+
+        cid, cur_title, msgs = self.get_active_conversation_info()
+        self.broadcast_event("conversation_changed", {
+            "conversation_id": cid or conv_id,
+            "title": cur_title or title,
+            "messages": msgs,
+            "files": self._shared_files_for(cid or conv_id),
+        })
+        self.broadcast_event("log", {"message": "Retrying from an earlier prompt."})
+        self.dispatch_task(prompt)
+        return True
+
+    def _fail_edit_retry(self, error: str) -> bool:
+        """Tell connected clients why an edit or retry did not start."""
+        self._edit_retry_error = error
+        self.broadcast_event("edit_retry_failed", {"error": error})
+        return False
+
     # =========================================================================
     # Agent Observer Callbacks
     # =========================================================================
@@ -1530,6 +1936,16 @@ class RemoteGatewayServer:
                             speak_host = bool(data.get("speak_on_host", False))
                             if prompt:
                                 self.dispatch_task(prompt, speak_on_host=speak_host)
+                        elif msg_type == "edit_retry":
+                            prompt = str(data.get("prompt", "")).strip()
+                            message_id = str(data.get("id") or data.get("message_id") or "").strip()
+                            message_index = self._coerce_message_index(data.get("message_index"))
+                            if prompt:
+                                self.edit_and_retry(
+                                    prompt,
+                                    message_id=message_id,
+                                    message_index=message_index,
+                                )
                         elif msg_type in ("stop", "cancel", "stop_task"):
                             self.stop_task()
                         elif msg_type == "kill":
@@ -1592,6 +2008,15 @@ class RemoteGatewayServer:
                                 "messages": msgs,
                                 "files": self._shared_files_for(cid),
                             })
+                            if msg_type == "sync":
+                                await ws.send_json({
+                                    "event": "status_change",
+                                    "state": "killed" if is_killed else self.current_state,
+                                    "details": self.current_task,
+                                    "killed": is_killed,
+                                    "conversation_id": cid,
+                                    "conversation_title": title,
+                                })
                         elif msg_type == "get_status":
                             await ws.send_json({
                                 "event": "status_change",
@@ -1792,6 +2217,9 @@ class RemoteGatewayServer:
             asyncio.set_event_loop(self._loop)
 
             self._app = web.Application(middlewares=[cors_middleware], client_max_size=100 * 1024 * 1024)
+            self._app.router.add_get("/api/llm/health", self._handle_llm_health)
+            self._app.router.add_get("/api/tags", self._handle_proxy_ollama_tags)
+            self._app.router.add_post("/v1/chat/completions", self._handle_proxy_openai_chat)
             self._app.router.add_get("/api/status", self._handle_status)
             self._app.router.add_get("/api/history", self._handle_history)
             self._app.router.add_post("/api/conversations/new", self._handle_new_chat)
@@ -1803,7 +2231,9 @@ class RemoteGatewayServer:
             self._app.router.add_post("/api/clear", self._handle_clear)
             self._app.router.add_get("/api/screenshot", self._handle_screenshot)
             self._app.router.add_post("/api/click", self._handle_click)
+            self._app.router.add_post("/api/type", self._handle_type)
             self._app.router.add_post("/api/prompt", self._handle_prompt)
+            self._app.router.add_post("/api/edit_retry", self._handle_edit_retry)
             self._app.router.add_post("/api/stop", self._handle_stop)
             self._app.router.add_post("/api/cancel", self._handle_stop)
             self._app.router.add_post("/api/kill", self._handle_kill)
@@ -1817,6 +2247,11 @@ class RemoteGatewayServer:
             self._app.router.add_post("/api/tts", self._handle_tts)
             self._app.router.add_get("/api/tts/split", self._handle_tts_split)
             self._app.router.add_post("/api/tts/split", self._handle_tts_split)
+            self._app.router.add_post("/api/tts/live/{session_id}", self._handle_tts_live_post)
+            self._app.router.add_get("/api/tts/live/{session_id}/meta", self._handle_tts_live_meta)
+            self._app.router.add_get("/api/tts/live/{session_id}/file", self._handle_tts_live_file)
+            self._app.router.add_delete("/api/tts/live/{session_id}", self._handle_tts_live_delete)
+            self._app.router.add_get("/api/tts/live/{session_id}", self._handle_tts_live_get)
             self._app.router.add_get("/api/voices", self._handle_voices)
             self._app.router.add_post("/api/stt", self._handle_stt)
             self._app.router.add_get("/api/confirmations", self._handle_get_confirmations)

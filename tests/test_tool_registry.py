@@ -8,7 +8,7 @@ from eidos.core.context import EIDOS_TOOLS
 def test_base_tools_count_and_presence():
     """Verify the base kernel keeps share_file visible alongside the other universal tools."""
     base_tools = ToolRegistry.get_base_tools()
-    assert len(base_tools) == 6
+    assert len(base_tools) == 7
 
     names = [t["function"]["name"] for t in base_tools]
     assert "execute_shell" in names
@@ -17,17 +17,18 @@ def test_base_tools_count_and_presence():
     assert "get_current_time" in names
     assert "finish_task" in names
     assert "share_file" in names
+    assert "list_skills" in names
 
 
 def test_scoped_tools_default_and_expansion():
     """Verify tool scoping unlocks requested tools without duplicating base tools."""
     # When no specialized tools requested, returns base tools only
     default_scoped = ToolRegistry.get_scoped_tools()
-    assert len(default_scoped) == 6
+    assert len(default_scoped) == 7
 
     # Requesting GUI tools unlocks them alongside base tools
     gui_scoped = ToolRegistry.get_scoped_tools(["take_screenshot", "click_element", "hotkey"])
-    assert len(gui_scoped) == 9
+    assert len(gui_scoped) == 10
     names = [t["function"]["name"] for t in gui_scoped]
     assert "take_screenshot" in names
     assert "click_element" in names
@@ -36,7 +37,7 @@ def test_scoped_tools_default_and_expansion():
 
     # Requesting a tool already in base does not create duplicates
     deduped = ToolRegistry.get_scoped_tools(["execute_shell", "browser_open", "share_file"])
-    assert len(deduped) == 7
+    assert len(deduped) == 8
     assert names.count("execute_shell") == 1
 
 

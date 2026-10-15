@@ -39,7 +39,7 @@ In the monolithic implementation (`eidos/core/context.py` and `eidos/core/loop.p
 
 ### 1.3. The Solution: Dynamic Skills & Durable Job Queues
 1. **Living Skill Documents (`SKILL.md`) as Capability Gates:** Standard operating procedures, evaluation rubrics, and frontmatter tool declarations (`tools_required: [...]`) that dynamically scope the LLM's active tools on demand.
-2. **Lean Base Kernel:** A tight ~120-line system prompt and 6 base tools (including always-on `share_file`) that protect attention heads, eliminate token bloat by ~90%, and save the 15-hop budget.
+2. **Lean Base Kernel:** A tight ~120-line system prompt and 7 base tools (including always-on `share_file` and `list_skills`) that protect attention heads, eliminate token bloat by ~90%, and save the 15-hop budget.
 3. **Generic State-Machine Batch Job Engine (`eidos/jobs/`):** A resilient item-by-item runner that decouples large projects (1 to 1,000+ items) into discrete, checkpointed steps with persistent state, progress tracking, and pause/resume capabilities.
 
 ---
@@ -116,7 +116,7 @@ The base prompt contains no domain-specific rules, no Playwright recipes, and no
    - **Principle 4 (Active Recall):** If uncertain about a command or past lesson, emit `<recall>query</recall>` to query memory.
    - **Principle 5 (Completion):** Call `finish_task` with a clear summary when the user's goal has been met.
 
-### 3.2. Core Base Toolset (6 Tools)
+### 3.2. Core Base Toolset (7 Tools)
 
 | Tool Name | Purpose | Parameters |
 | :--- | :--- | :--- |
@@ -126,6 +126,7 @@ The base prompt contains no domain-specific rules, no Playwright recipes, and no
 | `get_current_time` | Query the high-precision internal clock snapshot. | *(none)* |
 | `finish_task` | Signal completion of the user's task and return the spoken/chat summary. | `summary: str` |
 | `share_file` | Send a local file to the web app for viewing and download, including on a phone. Always available, even while another skill is active. | `path: str`, `note: str = ""` |
+| `list_skills` | List available skills (name, description, tools unlocked) so the agent can choose one before `load_skill`. Always available. | *(none)* |
 
 ---
 
@@ -211,9 +212,9 @@ All specialized tools are mapped to dedicated skills and are only available when
 - **Purpose:** Collaborative authoring and editing of living `SKILL.md` procedures.
 - **When Activated:** Creating or modifying user skills.
 - **Scoped Tools:**
-  - `list_skills`
   - `create_skill`
   - `update_skill`
+- **Discovery:** `list_skills` is a base tool and stays available even when this skill is not loaded.
 
 ---
 
@@ -366,6 +367,8 @@ On every cycle hop:
 
 ## 8. Generic Batch Job State Machine (`eidos/jobs/`)
 
+The queue below is a component a project can attach when it has a list of repeated items. The project itself — the short `job.yaml` brief, depth notes, focus, and scope tags — is specified in [PROJECT_JOBS.md](PROJECT_JOBS.md).
+
 ### 8.1. The Domain-Agnostic State Machine
 
 ```
@@ -472,10 +475,10 @@ Every field in `queue.json` is completely generic:
 | Metric / Dimension | Monolithic Architecture (Old) | Dynamic Skill Scoping (New) | Improvement |
 | :--- | :--- | :--- | :--- |
 | **System Prompt Size** | ~1,050 lines | ~120 lines | **~88% reduction** |
-| **Global Tools per Step** | 49 tools | 6 tools (base mode, including `share_file`) | **~88% reduction** |
+| **Global Tools per Step** | 49 tools | 7 tools (base mode, including `share_file` and `list_skills`) | **~86% reduction** |
 | **Tool Overhead per Step** | ~4,500 tokens | ~450 tokens | **~90% token savings** |
-| **Tools during Desktop GUI** | 49 tools | 14 tools (6 base + 8 GUI) | **71% fewer distraction paths** |
-| **Tools during OptimalX Note** | 49 tools | 13 tools (6 base + 7 OptX) | **73% fewer distraction paths** |
+| **Tools during Desktop GUI** | 49 tools | 15 tools (7 base + 8 GUI) | **69% fewer distraction paths** |
+| **Tools during OptimalX Note** | 49 tools | 14 tools (7 base + 7 OptX) | **71% fewer distraction paths** |
 | **OptimalX Hallucination Bias** | Extreme (hardcoded in prompt) | Zero (only loaded on demand) | **100% eliminated** |
 | **Hop Budget Utilization** | High thrashing; easily hits 15 cap | 2–5 hops for shell; 5–8 for GUI | **Saves 50–70% of steps** |
 | **Extensibility for New Apps** | Add more hardcoded tools to `context.py` | Drop a new `SKILL.md` in `~/.eidos/skills/` | **Modular & user-customizable** |
@@ -485,7 +488,7 @@ Every field in `queue.json` is completely generic:
 ## 10. Phased Migration Plan (Roadmap Phase 12)
 
 1. [x] **Phase 12.1: Tool Registry Decoupling (`eidos/core/tool_registry.py`)**
-   - Separate tool schemas into `BASE_TOOLS` (6 tools, including always-on `share_file`) and `SPECIALIZED_TOOLS`.
+   - Separate tool schemas into `BASE_TOOLS` (7 tools, including always-on `share_file` and `list_skills`) and `SPECIALIZED_TOOLS`.
    - Purge deadweight human-approval tools (`optimalx_reject_pending_review`, `optimalx_accept_pending_review`).
 2. [x] **Phase 12.2: Built-in System Skills Catalog (`eidos/skills/builtin/`)**
    - Author standard `SKILL.md` packages for `desktop-gui`, `optimalx`, `browser-automation`, `batch-runner`, `web-research`, `user-memory`, `skills-manager`.

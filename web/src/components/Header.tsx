@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { AgentState } from '../types/gateway';
+import { NotificationPermissionState } from '../hooks/useBackgroundKeepAlive';
 import {
   Bot,
   ShieldAlert,
@@ -11,8 +12,9 @@ import {
   RefreshCw,
   Plus,
   History,
-  PhoneOff,
-  Square,
+  Bell,
+  BellRing,
+  BellOff,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -23,9 +25,8 @@ interface HeaderProps {
   token: string;
   conversationTitle?: string;
   isSyncing?: boolean;
-  isThinking?: boolean;
-  isPlaying?: boolean;
-  onStopCallOrTask?: () => void;
+  notificationPermission?: NotificationPermissionState;
+  onOpenBackgroundSettings?: () => void;
   onRefreshSync?: () => void;
   onNewChat?: () => void;
   onOpenConversations?: () => void;
@@ -42,9 +43,8 @@ export const Header: React.FC<HeaderProps> = ({
   token,
   conversationTitle = 'New Chat',
   isSyncing = false,
-  isThinking = false,
-  isPlaying = false,
-  onStopCallOrTask,
+  notificationPermission = 'default',
+  onOpenBackgroundSettings,
   onRefreshSync,
   onNewChat,
   onOpenConversations,
@@ -181,15 +181,35 @@ export const Header: React.FC<HeaderProps> = ({
             <Key className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
           </button>
 
-          {/* Quick End Call / Stop Button (Active when speaking or thinking) */}
-          {(isThinking || isPlaying) && onStopCallOrTask && !isKilled && (
+          {/* Background & Notifications Button */}
+          {onOpenBackgroundSettings && (
             <button
-              onClick={onStopCallOrTask}
-              title={isPlaying ? 'End Call / Stop Speech Playback' : 'Stop active task / Cancel'}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition shadow-[0_0_12px_rgba(255,85,85,0.5)] animate-pulse active:scale-95"
+              onClick={onOpenBackgroundSettings}
+              title={
+                notificationPermission === 'granted'
+                  ? 'Background notifications active (Click for settings)'
+                  : notificationPermission === 'denied'
+                  ? 'Notifications blocked (Click for settings)'
+                  : 'Enable background notifications & Android settings'
+              }
+              className={`p-1.5 sm:p-2 rounded-lg border transition active:scale-95 relative ${
+                notificationPermission === 'granted'
+                  ? 'bg-[#282a36] border-[#50fa7b]/50 text-[#50fa7b]'
+                  : notificationPermission === 'denied'
+                  ? 'bg-[#282a36] border-[#ff5555]/50 text-[#ff5555]'
+                  : 'bg-[#282a36] border-[#ffb86c]/50 text-[#ffb86c]'
+              }`}
             >
-              {isPlaying ? <PhoneOff className="w-3.5 h-3.5" /> : <Square className="w-3.5 h-3.5 fill-current" />}
-              <span className="hidden xs:inline sm:inline">{isPlaying ? 'End Call' : 'Stop'}</span>
+              {notificationPermission === 'granted' ? (
+                <BellRing className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              ) : notificationPermission === 'denied' ? (
+                <BellOff className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+              ) : (
+                <>
+                  <Bell className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-[#ffb86c] animate-pulse" />
+                </>
+              )}
             </button>
           )}
 

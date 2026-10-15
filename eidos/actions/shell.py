@@ -4,7 +4,7 @@ import logging
 import os
 import subprocess
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from eidos.safety.gatekeeper import Gatekeeper
 from eidos.sandbox.bwrap import BubblewrapSandbox
@@ -24,6 +24,7 @@ class ShellExecutor:
     ):
         self.gatekeeper = gatekeeper or Gatekeeper()
         self.default_timeout = default_timeout
+        self.stop_checker: Optional[Callable[[], bool]] = None
         self.sandbox: Optional[BubblewrapSandbox] = None
         self.sandbox_enabled: bool = False
         self._init_sandbox(sandbox, sandbox_config)
@@ -71,6 +72,43 @@ class ShellExecutor:
         if stripped.endswith("&&") or stripped.endswith("&>"):
             return False
         return True
+
+    def _stop_requested(self) -> bool:
+        """Return True when the user asked the running task to stop."""
+        checker = self.stop_checker
+        if checker is None:
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    def _killed_process_result(
+        self,
+        *,
+        command: str,
+        start_time: float,
+        sandboxed: bool,
+        by_user: bool,
+    ) -> Dict[str, Any]:
+        duration_ms = (time.time() - start_time) * 1000
+        if by_user:
+            error = "Process killed: task stopped by user."
+            stderr = "Aborted by user stop"
+        else:
+            error = "Process killed: Emergency kill switch activated during execution."
+            stderr = "Aborted by kill switch"
+        return {
+            "success": False,
+            "denied": False,
+            "error": error,
+            "stdout": "",
+            "stderr": stderr,
+            "exit_code": -9,
+            "duration_ms": duration_ms,
+            "command": command,
+            "sandboxed": sandboxed,
+        }
 
     def execute(
         self,
@@ -194,21 +232,17 @@ class ShellExecutor:
                     if ret is not None:
                         break
 
-                    if self.gatekeeper.kill_switch.is_triggered():
+                    killed = self.gatekeeper.kill_switch.is_triggered()
+                    stopped = self._stop_requested()
+                    if killed or stopped:
                         process.kill()
                         process.wait()
-                        duration_ms = (time.time() - start_time) * 1000
-                        return {
-                            "success": False,
-                            "denied": False,
-                            "error": "Process killed: Emergency kill switch activated during execution.",
-                            "stdout": "",
-                            "stderr": "Aborted by kill switch",
-                            "exit_code": -9,
-                            "duration_ms": duration_ms,
-                            "command": cmd_clean,
-                            "sandboxed": True,
-                        }
+                        return self._killed_process_result(
+                            command=cmd_clean,
+                            start_time=start_time,
+                            sandboxed=True,
+                            by_user=stopped and not killed,
+                        )
 
                     time.sleep(poll_interval)
                     elapsed = time.time() - start_time
@@ -348,22 +382,17 @@ class ShellExecutor:
                 if ret is not None:
                     break
 
-                # Emergency kill check
-                if self.gatekeeper.kill_switch.is_triggered():
+                killed = self.gatekeeper.kill_switch.is_triggered()
+                stopped = self._stop_requested()
+                if killed or stopped:
                     process.kill()
                     process.wait()
-                    duration_ms = (time.time() - start_time) * 1000
-                    return {
-                        "success": False,
-                        "denied": False,
-                        "error": "Process killed: Emergency kill switch activated during execution.",
-                        "stdout": "",
-                        "stderr": "Aborted by kill switch",
-                        "exit_code": -9,
-                        "duration_ms": duration_ms,
-                        "command": cmd_clean,
-                        "sandboxed": False,
-                    }
+                    return self._killed_process_result(
+                        command=cmd_clean,
+                        start_time=start_time,
+                        sandboxed=False,
+                        by_user=stopped and not killed,
+                    )
 
                 time.sleep(poll_interval)
                 elapsed = time.time() - start_time

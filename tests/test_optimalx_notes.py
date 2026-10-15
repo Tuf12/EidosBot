@@ -183,7 +183,7 @@ def temp_optimalx_db():
 
 @pytest.fixture
 def temp_notex_tree():
-    """Create a temporary NoteX corpus directory structure for project globalId 's14'."""
+    """UUID NoteX tree for subfolder s14. Named lookup falls back to this directory."""
     with tempfile.TemporaryDirectory() as tmp_dir:
         project_dir = Path(tmp_dir) / "s14"
         project_dir.mkdir(parents=True, exist_ok=True)
@@ -513,6 +513,25 @@ def test_list_notex_docs_fallback_scan(temp_optimalx_db, temp_notex_tree):
     assert "Canon.md" in paths
     assert "Outline.md" in paths
     assert "Sections/Chapter 1.md" in paths
+
+
+def test_list_and_read_notex_at_named_directory(temp_optimalx_db):
+    """Corpus stored as Parent/Subfolder is read without the UUID directory."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "Inventions" / "the list"
+        project_dir.mkdir(parents=True)
+        (project_dir / "Canon.md").write_text("# Named Canon\nSecond line\n", encoding="utf-8")
+
+        bridge = OptimalXBridge(db_path=temp_optimalx_db, notex_dir=tmp_dir)
+        listed = bridge.list_notex_docs(subfolder_id=14)
+        assert listed.get("exists_on_disk") is True
+        assert listed["root_path"] == str(project_dir)
+        assert any(doc["path"] == "Canon.md" for doc in listed["docs"])
+
+        read = bridge.read_notex_doc(subfolder_id=14, doc_path="Canon.md")
+        assert "error" not in read
+        assert "Named Canon" in read["content"]
+        assert read["total_lines"] == 2
 
 
 def test_list_notex_docs_missing_or_disabled(temp_optimalx_db, temp_notex_tree):

@@ -357,3 +357,19 @@ eidos/
 | **Vector Database** | `sqlite-vec` or `LanceDB` | `~/.eidos/memory/vector_store/` | < 5 ms nearest-neighbor lookup |
 | **Trajectory Sync & Distillation** | Observation analyzer in `episodic_store.py` | `~/.eidos/memory/vector_store/episodic.db` | Filters dead ends, preserves forward recipes, auto-syncs on startup |
 | **Stream Interception**| Regex Token Scanner in `ollama_client.py` & `chutes_client.py` | In-memory stream buffer | Zero overhead during regular token generation |
+
+---
+
+## 8. Detailed Architectural Feature Specifications
+
+To complete the full episodic memory lifecycle, four modular engineering specifications expand this foundational design:
+
+1. **Autonomous Post-Task Reflector & Critic:** [`docs/specs/SPEC_EPISODIC_REFLECTOR.md`](specs/SPEC_EPISODIC_REFLECTOR.md)  
+   *Evaluator agent pass to audit goal completion, extract nuanced lessons/pitfalls, and calibrate continuous critic scores ($0.0 \dots 1.0$).*
+2. **Entity Linking & Relational Knowledge Graph:** [`docs/specs/SPEC_EPISODIC_ENTITY_GRAPH.md`](specs/SPEC_EPISODIC_ENTITY_GRAPH.md)  
+   *Deterministic entity extraction (commands, paths, projects, devices) and embedded SQLite graph tables for hybrid Graph-Augmented Retrieval (GAR).*
+3. **Sleep-Time Episodic Consolidation & Pruning:** [`docs/specs/SPEC_EPISODIC_CONSOLIDATION.md`](specs/SPEC_EPISODIC_CONSOLIDATION.md)  
+   *Off-peak clustering of repetitive tasks into canonical golden recipes, deduplication, and habit promotion to Tier B profile rules and skills.*
+4. **Context-Aware Dynamic Task Scoping & Multi-Source Fusion:** [`docs/specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md`](specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md)  
+   *Dynamic environmental scope resolution (project, active skill, window) and soft-boost re-ranking across episodic, note, and chat stores.*
+

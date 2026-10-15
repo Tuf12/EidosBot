@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react';
 import { SharedFile } from '../types/gateway';
-import { MarkdownRenderer } from './MarkdownRenderer';
-import { Download, Eye, FileText, Loader2, X } from 'lucide-react';
+import { MarkdownRenderer, ReadAloudControl } from './MarkdownRenderer';
+import { ChevronDown, ChevronRight, Download, Eye, FileText, Loader2, X } from 'lucide-react';
 
 interface SharedFilesProps {
   files: SharedFile[];
   token: string;
+  readAloud?: Omit<ReadAloudControl, 'playbackPrefix'>;
 }
 
 type PreviewKind = 'image' | 'pdf' | 'text' | 'binary';
@@ -38,8 +39,9 @@ function previewKind(file: SharedFile): PreviewKind {
   return 'binary';
 }
 
-export function SharedFiles({ files, token }: SharedFilesProps) {
+export function SharedFiles({ files, token, readAloud }: SharedFilesProps) {
   const [openFile, setOpenFile] = useState<SharedFile | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
 
   if (!files.length && !openFile) return null;
 
@@ -47,52 +49,71 @@ export function SharedFiles({ files, token }: SharedFilesProps) {
     <>
       {files.length > 0 && (
         <div className="mx-3 mt-2 rounded-xl border border-[#44475a] bg-[#282a36] overflow-hidden">
-          <div className="px-3 py-1.5 text-[11px] font-bold text-[#bd93f9] border-b border-[#44475a]/60">
-            Shared files ({files.length})
-          </div>
-          <div className="max-h-36 overflow-y-auto">
-            {files.map((file) => (
-              <div
-                key={file.id}
-                className="flex items-center gap-2 px-3 py-2 border-b border-[#44475a]/30 last:border-b-0"
-              >
-                <FileText className="w-3.5 h-3.5 text-[#8be9fd] shrink-0" />
-                <div className="min-w-0 flex-1">
-                  <div className="text-xs text-[#f8f8f2] truncate">{file.name}</div>
-                  <div className="text-[10px] text-[#6272a4] truncate">
-                    {file.direction === 'user' ? 'You sent' : 'From Eidos'}
-                    {' · '}
-                    {formatSize(file.size)}
-                    {file.missing ? ' · missing on disk' : ''}
-                    {file.note ? ` · ${file.note}` : ''}
+          <button
+            type="button"
+            onClick={() => setCollapsed((value) => !value)}
+            aria-expanded={!collapsed}
+            aria-controls="shared-files-list"
+            title={collapsed ? 'Expand shared files' : 'Collapse shared files'}
+            className={`w-full flex items-center justify-between gap-2 px-3 py-1.5 text-left hover:bg-[#44475a]/30 transition ${
+              collapsed ? '' : 'border-b border-[#44475a]/60'
+            }`}
+          >
+            <span className="text-[11px] font-bold text-[#bd93f9]">
+              Shared files ({files.length})
+            </span>
+            {collapsed ? (
+              <ChevronRight className="w-3.5 h-3.5 text-[#bd93f9] shrink-0" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5 text-[#bd93f9] shrink-0" />
+            )}
+          </button>
+          {!collapsed && (
+            <div id="shared-files-list" className="max-h-36 overflow-y-auto">
+              {files.map((file) => (
+                <div
+                  key={file.id}
+                  className="flex items-center gap-2 px-3 py-2 border-b border-[#44475a]/30 last:border-b-0"
+                >
+                  <FileText className="w-3.5 h-3.5 text-[#8be9fd] shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs text-[#f8f8f2] truncate">{file.name}</div>
+                    <div className="text-[10px] text-[#6272a4] truncate">
+                      {file.direction === 'user' ? 'You sent' : 'From Eidos'}
+                      {' · '}
+                      {formatSize(file.size)}
+                      {file.missing ? ' · missing on disk' : ''}
+                      {file.note ? ` · ${file.note}` : ''}
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setOpenFile(file)}
+                    disabled={file.missing}
+                    title="View"
+                    className="p-1.5 rounded-lg text-[#50fa7b] hover:bg-[#50fa7b]/10 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    <Eye className="w-3.5 h-3.5" />
+                  </button>
+                  <a
+                    href={file.missing ? undefined : fileUrl(token, file.id, true)}
+                    download={file.name}
+                    title="Download"
+                    className={`p-1.5 rounded-lg text-[#8be9fd] hover:bg-[#8be9fd]/10 ${file.missing ? 'pointer-events-none opacity-30' : ''}`}
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                  </a>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setOpenFile(file)}
-                  disabled={file.missing}
-                  title="View"
-                  className="p-1.5 rounded-lg text-[#50fa7b] hover:bg-[#50fa7b]/10 disabled:opacity-30 disabled:cursor-not-allowed"
-                >
-                  <Eye className="w-3.5 h-3.5" />
-                </button>
-                <a
-                  href={file.missing ? undefined : fileUrl(token, file.id, true)}
-                  download={file.name}
-                  title="Download"
-                  className={`p-1.5 rounded-lg text-[#8be9fd] hover:bg-[#8be9fd]/10 ${file.missing ? 'pointer-events-none opacity-30' : ''}`}
-                >
-                  <Download className="w-3.5 h-3.5" />
-                </a>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
       {openFile && (
         <FileViewer
           file={openFile}
           token={token}
+          readAloud={readAloud}
           onClose={() => setOpenFile(null)}
         />
       )}
@@ -103,10 +124,12 @@ export function SharedFiles({ files, token }: SharedFilesProps) {
 function FileViewer({
   file,
   token,
+  readAloud,
   onClose,
 }: {
   file: SharedFile;
   token: string;
+  readAloud?: Omit<ReadAloudControl, 'playbackPrefix'>;
   onClose: () => void;
 }) {
   const kind = previewKind(file);
@@ -191,7 +214,11 @@ function FileViewer({
             <iframe title={file.name} src={url} className="w-full h-[70dvh] rounded-lg bg-white" />
           )}
           {!loading && !error && kind === 'text' && isMarkdown && (
-            <MarkdownRenderer content={text} />
+            <MarkdownRenderer
+              content={text}
+              playbackPrefix={`file:${file.id}`}
+              {...readAloud}
+            />
           )}
           {!loading && !error && kind === 'text' && !isMarkdown && (
             <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-words text-[#f8f8f2] font-mono">

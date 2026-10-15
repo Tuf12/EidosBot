@@ -6,10 +6,34 @@
   * {
     -webkit-tap-highlight-color: transparent;
   }
+  html,
+  body {
+    /* Let one-finger scrolling work, and leave pinch to the text-size gesture. */
+    touch-action: pan-x pan-y;
+  }
   body {
     overscroll-behavior-y: none;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   }
+}
+
+/*
+ * Text-only scale. These rules sit outside Tailwind's layers so they win over
+ * utility font sizes, and they are applied only while the scale is not 100%.
+ * Spacing, icons, and the page itself stay the same size.
+ */
+html.eidos-text-scale {
+  --eidos-text-scale: 1;
+}
+html.eidos-text-scale .text-\[10px\] { font-size: calc(10px * var(--eidos-text-scale)); line-height: 1.45; }
+html.eidos-text-scale .text-\[11px\] { font-size: calc(11px * var(--eidos-text-scale)); line-height: 1.45; }
+html.eidos-text-scale .text-xs { font-size: calc(0.75rem * var(--eidos-text-scale)); line-height: 1.45; }
+html.eidos-text-scale .text-sm { font-size: calc(0.875rem * var(--eidos-text-scale)); line-height: 1.45; }
+html.eidos-text-scale .text-base { font-size: calc(1rem * var(--eidos-text-scale)); line-height: 1.45; }
+
+@media (min-width: 640px) {
+  html.eidos-text-scale .sm\:text-\[11px\] { font-size: calc(11px * var(--eidos-text-scale)); line-height: 1.45; }
+  html.eidos-text-scale .sm\:text-base { font-size: calc(1rem * var(--eidos-text-scale)); line-height: 1.45; }
 }
 
 /* Custom scrollbars */

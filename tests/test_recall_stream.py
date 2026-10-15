@@ -96,6 +96,35 @@ def test_execute_chat_with_no_recall_tags():
     assert not response.has_tool_calls
 
 
+def test_execute_chat_stops_when_requested():
+    """Stop closes the stream and does not return the rest of the generation."""
+    mock_resp = MagicMock()
+    mock_resp.iter_lines.return_value = [
+        json.dumps({"message": {"role": "assistant", "content": "Keep going"}}).encode(),
+    ]
+    checks = {"n": 0}
+
+    def should_stop():
+        checks["n"] += 1
+        return checks["n"] >= 2
+
+    seen = []
+    with patch("requests.post", return_value=mock_resp):
+        interceptor = RecallStreamInterceptor()
+        response = interceptor.execute_chat_with_recall(
+            base_url="http://localhost:11434",
+            model_name="test-model",
+            messages=[{"role": "user", "content": "Say hello"}],
+            on_response=seen.append,
+            should_stop=should_stop,
+        )
+
+    assert response.raw.get("cancelled") is True
+    assert response.content == ""
+    assert seen == [mock_resp]
+    mock_resp.close.assert_called()
+
+
 def test_execute_chat_with_active_recall_interception():
     """Verify stream is intercepted upon </recall>, vector query is made, and continuation resumes."""
     with tempfile.TemporaryDirectory() as td:
@@ -268,6 +297,7 @@ def test_ollama_client_integration_with_recall_interceptor():
     )
 
     client = OllamaClient(recall_interceptor=mock_interceptor)
+    client.model_supports_vision = lambda _name: False
     resp = client.chat(messages=[{"role": "user", "content": "Test"}])
 
     assert mock_interceptor.execute_chat_with_recall.called
@@ -325,6 +355,7 @@ def test_agent_loop_active_recall_callback_and_interception():
         # Create interceptor and OllamaClient
         interceptor = RecallStreamInterceptor(episodic_store=episodic_store, min_similarity=0.1)
         ollama = OllamaClient(recall_interceptor=interceptor)
+        ollama.model_supports_vision = lambda _name: False
 
         mock_gk = MagicMock()
         mock_gk.evaluate.return_value = (True, "Allowed")

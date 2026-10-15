@@ -63,6 +63,28 @@ class ModelRouter(BaseModelClient):
         if hasattr(self.chutes, "on_recall_callback"):
             self.chutes.on_recall_callback = value
 
+    def abort(self) -> None:
+        """Close whichever provider is generating the current reply."""
+        for client in (self.ollama, self.chutes):
+            abort = getattr(client, "abort", None)
+            if not callable(abort):
+                continue
+            try:
+                abort()
+            except Exception:
+                logger.debug("Model abort failed", exc_info=True)
+
+    def reset_abort(self) -> None:
+        """Clear a previous stop on both providers."""
+        for client in (self.ollama, self.chutes):
+            reset = getattr(client, "reset_abort", None)
+            if not callable(reset):
+                continue
+            try:
+                reset()
+            except Exception:
+                logger.debug("Model abort reset failed", exc_info=True)
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -82,6 +104,8 @@ class ModelRouter(BaseModelClient):
         try:
             self.last_provider_used = "ollama"
             response = self.ollama.chat(messages=messages, tools=tools, model_override=model_override)
+            if isinstance(response.raw, dict) and response.raw.get("cancelled"):
+                return response
 
             has_error = (
                 (bool(response.content) and response.content.startswith("Error communicating with Ollama"))
@@ -132,7 +156,7 @@ class ModelRouter(BaseModelClient):
                     model_override=model_override,
                 )
 
-        # Attempt local vision model first
+        # Local vision uses the primary model when that model can already see images.
         try:
             self.last_provider_used = "ollama"
             response = self.ollama.vision_chat(
@@ -141,6 +165,8 @@ class ModelRouter(BaseModelClient):
                 system_prompt=system_prompt,
                 model_override=model_override,
             )
+            if isinstance(response.raw, dict) and response.raw.get("cancelled"):
+                return response
 
             has_error = (
                 (bool(response.content) and response.content.startswith("Error communicating with Ollama"))

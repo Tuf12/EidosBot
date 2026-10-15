@@ -15,6 +15,7 @@ from eidos.ui.chat import (
     ChatHistoryWidget,
     MessageBubble,
     markdown_to_chat_html,
+    markdown_to_plain_text,
     open_chat_link,
     _resolve_local_file_path,
 )
@@ -350,6 +351,37 @@ def test_markdown_to_chat_html():
     assert "<li>Item A</li>" in result
 
 
+def test_markdown_deep_headings_and_plain_copy():
+    html_out = markdown_to_chat_html(
+        "#### Section\n##### Smaller\n###### Smallest\n### Still three"
+    )
+    assert "<h5" in html_out
+    assert "<h6" in html_out
+    assert "<h4" in html_out
+    assert "####" not in html_out
+    assert ">Section<" in html_out
+
+    plain = markdown_to_plain_text(
+        "#### Shopping list\n"
+        "Here is **bold** and *italic* and `code`.\n"
+        "See [docs](https://example.com/docs).\n"
+        "- Milk\n"
+        "1. Bread\n"
+        "```python\n# comment\nprint('hi')\n```\n"
+    )
+    assert "####" not in plain
+    assert "**" not in plain
+    assert "`" not in plain
+    assert "```" not in plain
+    assert "Shopping list" in plain
+    assert "Here is bold and italic and code." in plain
+    assert "See docs (https://example.com/docs)." in plain
+    assert "• Milk" in plain
+    assert "1. Bread" in plain
+    assert "# comment" in plain
+    assert "print('hi')" in plain
+
+
 def test_message_bubbles_and_copy(qapp):
     # User message
     user_bubble = MessageBubble(role="user", content="Show active windows")
@@ -365,7 +397,7 @@ def test_message_bubbles_and_copy(qapp):
     assert "Copy" in copy_btn.text()
     copy_btn.click()
     clipboard = QApplication.clipboard()
-    assert clipboard.text() == "Here is the output: `active`"
+    assert clipboard.text() == "Here is the output: active"
 
     # Thought message
     thought_bubble = MessageBubble(role="thought", content="Analyzing active desktop state...")
@@ -1146,6 +1178,7 @@ def test_message_bubble_replay_tts(qapp):
 
     u_bubble = chat.add_message("user", "Hello EidosBot")
     a_bubble = chat.add_message("assistant", "Greetings, human!")
+    t_bubble = chat.add_message("thought", "Checking what the user asked.")
 
     # User message should NOT have a TTS button
     assert u_bubble.btn_speak is None
@@ -1156,6 +1189,13 @@ def test_message_bubble_replay_tts(qapp):
     a_bubble.btn_speak.click()
     assert len(spoken_texts) == 1
     assert spoken_texts[-1] == "Greetings, human!"
+
+    # Reasoning boxes speak their own text
+    assert t_bubble.btn_speak is not None
+    assert "Replay" in t_bubble.btn_speak.text()
+    t_bubble.btn_speak.click()
+    assert len(spoken_texts) == 2
+    assert spoken_texts[-1] == "Checking what the user asked."
 
     chat.close()
 

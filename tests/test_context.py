@@ -33,6 +33,7 @@ def test_build_system_prompt_structure_and_lean_size():
     # 2. Core behavioral principles assertions
     assert "1. DETERMINISTIC TIER FIRST:" in prompt
     assert "2. SKILL-DRIVEN CAPABILITY EXPANSION:" in prompt
+    assert "list_skills" in prompt
     assert "load_skill" in prompt
     assert "close_skill" in prompt
     assert "3. CONCISE REASONING:" in prompt

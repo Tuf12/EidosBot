@@ -4,6 +4,7 @@
   "description": "Remote companion and safety control interface for EidosBot OS agent.",
   "start_url": "/?source=pwa",
   "display": "standalone",
+  "categories": ["music", "productivity"],
   "background_color": "#1e1f29",
   "theme_color": "#bd93f9",
   "orientation": "portrait-primary",

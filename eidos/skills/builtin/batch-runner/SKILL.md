@@ -12,6 +12,8 @@ tools_required:
   - pause_batch_job
   - resume_batch_job
   - generate_batch_summary
+  - load_job
+  - close_job
 ---
 
 # State-Machine Batch Queue Runner Procedure

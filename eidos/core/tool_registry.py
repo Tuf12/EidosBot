@@ -1,9 +1,10 @@
 """Dynamic Tool Registry for EidosBot.
 
-Decouples tool schemas into a minimal base kernel toolset (6 universal tools)
-and specialized domain toolsets unlocked on demand via living SKILL.md declarations.
+Decouples tool schemas into a minimal base kernel toolset and specialized
+domain toolsets unlocked on demand via living SKILL.md declarations.
 `share_file` stays in the base set so files can reach the web app, including
-on a phone, without loading a skill.
+on a phone, without loading a skill. `list_skills` stays in the base set so
+the agent can see which skills exist before calling `load_skill`.
 """
 
 from typing import Any, Dict, List, Optional
@@ -125,6 +126,21 @@ class ToolRegistry:
                         },
                     },
                     "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_skills",
+                "description": (
+                    "List every available skill with its name, description, and tools it unlocks. "
+                    "Call this when a task needs a specialized skill and you do not already know which "
+                    "name to pass to load_skill. Covers built-in skills plus ~/.eidos/skills and .eidos/skills."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
                 },
             },
         },
@@ -709,7 +725,19 @@ class ToolRegistry:
                         },
                         "output_dir": {
                             "type": "string",
-                            "description": "Optional destination directory for queue.json and generated artifacts.",
+                            "description": "Optional destination directory for queue.json, job.yaml manifest, and generated artifacts.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional high-level description of the batch task.",
+                        },
+                        "project": {
+                            "type": "string",
+                            "description": "Optional project group name (e.g., 'Inventions_List').",
+                        },
+                        "phase": {
+                            "type": "string",
+                            "description": "Optional project phase name (e.g., 'phase_1_triage').",
                         },
                     },
                     "required": ["job_name", "skill_name", "items_data"],
@@ -824,6 +852,34 @@ class ToolRegistry:
                 },
             },
         },
+        "load_job": {
+            "type": "function",
+            "function": {
+                "name": "load_job",
+                "description": "Enter Job Mode by loading an existing batch job by ID, directory path, or queue/manifest file. Automatically activates the job's assigned skill and scoped tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id_or_path": {
+                            "type": "string",
+                            "description": "Job ID (e.g. 'job_20261005_1234_abcd') or filesystem path to the job directory, queue.json, or job.yaml.",
+                        },
+                    },
+                    "required": ["job_id_or_path"],
+                },
+            },
+        },
+        "close_job": {
+            "type": "function",
+            "function": {
+                "name": "close_job",
+                "description": "Exit Job Mode for the currently active batch job and return to base kernel mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
 
         # --- User Profile & Memory Tools ---
         "update_user_profile": {
@@ -913,17 +969,6 @@ class ToolRegistry:
         },
 
         # --- Skills Authoring Tools ---
-        "list_skills": {
-            "type": "function",
-            "function": {
-                "name": "list_skills",
-                "description": "Discover all available human/bot co-authored skills and evaluation rubrics from ~/.eidos/skills/.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {},
-                },
-            },
-        },
         "create_skill": {
             "type": "function",
             "function": {

@@ -1,5 +1,6 @@
 """Targeted unit tests for Dynamic Skill & Tool Scoping in AgentLoop (Roadmap Phase 12)."""
 
+from pathlib import Path
 import tempfile
 from unittest.mock import MagicMock
 import pytest
@@ -29,7 +30,7 @@ def test_loop_default_scoping_state():
 
         assert agent.active_skill is None
         base_tools = agent._assemble_active_tools()
-        assert len(base_tools) == 6
+        assert len(base_tools) == 7
         base_tool_names = [t["function"]["name"] for t in base_tools]
         assert "execute_shell" in base_tool_names
         assert "load_skill" in base_tool_names
@@ -37,6 +38,7 @@ def test_loop_default_scoping_state():
         assert "get_current_time" in base_tool_names
         assert "finish_task" in base_tool_names
         assert "share_file" in base_tool_names
+        assert "list_skills" in base_tool_names
 
         prompt = agent._assemble_system_prompt({"title": "Terminal", "class_name": "term"})
         assert "ACTIVE SKILL:" not in prompt
@@ -75,8 +77,9 @@ def test_loop_load_and_close_skill_dispatch():
         # Check scoped tools now include desktop-gui tools
         scoped_tools = agent._assemble_active_tools()
         scoped_names = [t["function"]["name"] for t in scoped_tools]
-        assert len(scoped_tools) == 6 + len(res["tools_unlocked"])
+        assert len(scoped_tools) == 7 + len(res["tools_unlocked"])
         assert "share_file" in scoped_names
+        assert "list_skills" in scoped_names
         assert "take_screenshot" in scoped_names
         assert "click_element" in scoped_names
         assert "hotkey" in scoped_names
@@ -96,7 +99,7 @@ def test_loop_load_and_close_skill_dispatch():
         lean_prompt = agent._assemble_system_prompt({"title": "Terminal", "class_name": "term"})
         assert "ACTIVE SKILL:" not in lean_prompt
         base_tools = agent._assemble_active_tools()
-        assert len(base_tools) == 6
+        assert len(base_tools) == 7
 
 
 def test_loop_finish_task_resets_active_skill():
@@ -190,6 +193,7 @@ def test_switching_active_skills():
         web_tools = [t["function"]["name"] for t in agent._assemble_active_tools()]
         assert "web_search" in web_tools
         assert "share_file" in web_tools
+        assert "list_skills" in web_tools
         assert "init_batch_job" not in web_tools
 
         # 2. Directly load batch-runner
@@ -199,6 +203,7 @@ def test_switching_active_skills():
         batch_tools = [t["function"]["name"] for t in agent._assemble_active_tools()]
         assert "init_batch_job" in batch_tools
         assert "share_file" in batch_tools
+        assert "list_skills" in batch_tools
         assert "web_search" not in batch_tools
 
 
@@ -259,13 +264,100 @@ def test_run_task_dynamic_scoping_flow():
         assert "Successfully read OptimalX notes" in res["summary"]
 
         # Turn 1 only had the base tools, including share_file
-        assert len(mock_model.tools_seen_per_step[0]) == 6
+        assert len(mock_model.tools_seen_per_step[0]) == 7
         assert "share_file" in mock_model.tools_seen_per_step[0]
+        assert "list_skills" in mock_model.tools_seen_per_step[0]
         assert "optimalx_search_notes" not in mock_model.tools_seen_per_step[0]
 
         # Turn 2 had base tools + 7 optimalx tools
-        assert len(mock_model.tools_seen_per_step[1]) == 13
+        assert len(mock_model.tools_seen_per_step[1]) == 14
         assert "optimalx_search_notes" in mock_model.tools_seen_per_step[1]
 
         # After task completion, active skill is reset
         assert agent.active_skill is None
+
+
+def test_loop_init_batch_job_enters_job_mode():
+    """Verify init_batch_job creates job.yaml, enters Job Mode, and unlocks scoped tools."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_allow = Path(tmp_dir) / "allow.json"
+        kill_switch = KillSwitch()
+        allowlist = AllowlistManager(storage_path=str(tmp_allow))
+        gatekeeper = Gatekeeper(
+            allowlist=allowlist,
+            kill_switch=kill_switch,
+            confirm_level_1_ui=False,
+            confirm_level_2_shell=False,
+        )
+        mock_model = MagicMock(spec=BaseModelClient)
+
+        jobs_output_dir = Path(tmp_dir) / "jobs" / "Inventions_List" / "phase_1_triage"
+
+        agent = AgentLoop(
+            kill_switch=kill_switch,
+            gatekeeper=gatekeeper,
+            model_client=mock_model,
+        )
+
+        # 1. Initialize batch job
+        init_call = ToolCall(
+            name="init_batch_job",
+            arguments={
+                "job_name": "Inventions Phase 1",
+                "skill_name": "batch-runner",
+                "items_data": ["invention 1", "invention 2", "invention 3"],
+                "output_dir": str(jobs_output_dir),
+                "description": "Initial triage of 3 invention items",
+                "project": "Inventions_List",
+                "phase": "phase_1_triage",
+            },
+        )
+        res, is_finish = agent._dispatch_tool(init_call)
+
+        assert is_finish is False
+        assert res.get("success") is True, f"init_batch_job failed with res={res}"
+        assert res["job_mode"] == "activated"
+        assert (jobs_output_dir / "queue.json").is_file()
+        assert (jobs_output_dir / "job.yaml").is_file()
+
+        # Check loop state
+        assert agent.active_job is not None
+        assert agent.active_job.get("job_id") == res["job_id"]
+        assert agent.active_skill is not None
+        assert agent.active_skill.get("name") == "batch-runner"
+
+        # Check prompt contains lean ACTIVE JOB MODE packet
+        prompt = agent._assemble_system_prompt({"title": "Terminal", "class_name": "term"})
+        assert "ACTIVE JOB MODE: Inventions Phase 1" in prompt
+        assert "Assigned Skill: batch-runner" in prompt
+        assert "Progress: 0/3 items (0.0%)" in prompt
+
+        # Check scoped tools contain batch tools + base tools
+        tools = agent._assemble_active_tools()
+        tool_names = [t["function"]["name"] for t in tools]
+        assert "init_batch_job" in tool_names
+        assert "step_batch_job" in tool_names
+        assert "load_job" in tool_names
+        assert "close_job" in tool_names
+        assert "execute_shell" in tool_names
+
+        # 2. Close job
+        close_res, _ = agent._dispatch_tool(ToolCall(name="close_job", arguments={}))
+        assert close_res["success"] is True
+        assert close_res["status"] == "closed"
+        assert agent.active_job is None
+        assert agent.active_skill is None
+
+        # Verify dropped back to base kernel mode
+        lean_prompt = agent._assemble_system_prompt({"title": "Terminal", "class_name": "term"})
+        assert "ACTIVE JOB MODE:" not in lean_prompt
+        assert len(agent._assemble_active_tools()) == 7
+
+        # 3. Reload job via load_job
+        load_res, _ = agent._dispatch_tool(ToolCall(name="load_job", arguments={"job_id": str(jobs_output_dir)}))
+        assert load_res["success"] is True
+        assert load_res["status"] == "activated"
+        assert agent.active_job is not None
+        assert agent.active_skill is not None
+        assert agent.active_skill.get("name") == "batch-runner"
+

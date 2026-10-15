@@ -9,8 +9,8 @@ models:
   
   local:
     base_url: "http://localhost:11434"
-    reasoning_model: "batiai/gemma4-26b:iq4"
-    vision_model: "batiai/gemma4-12b:q6"
+    reasoning_model: "batiai/gemma4-26b:iq4"  # If this model can see images, the vision model stays unloaded
+    vision_model: "batiai/gemma4-12b:q6"      # Loaded only when the reasoning model has no vision capability
     chat_model: "gpt-oss:20b"
     timeout_seconds: 120
 
@@ -114,7 +114,7 @@ browser:
   screenshot_dir: "~/.eidos/screenshots/browser"
 
 skills:
-  directory: "~/.eidos/skills"
+  directory: "~/EidosWorkspace/skills"
   project_directory: "~/EidosWorkspace/skills"
 
 jobs:

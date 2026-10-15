@@ -17,6 +17,7 @@ import uuid
 import requests
 import websockets
 
+from eidos.integrations.notex_paths import resolve_notex_root
 from eidos.perception.window_info import WindowDetector
 
 logger = logging.getLogger(__name__)
@@ -671,7 +672,10 @@ class OptimalXBridge:
 
     def list_notex_docs(self, subfolder_id: int) -> Dict[str, Any]:
         """
-        List all markdown documents inside a NoteX corpus project (~/OptimalX/notex/<global_id>/).
+        List markdown documents in a NoteX project.
+
+        The corpus lives at ``notex/<Parent>/<Subfolder>/``. A project that has
+        not been moved yet is still read from ``notex/<global_id>/``.
         """
         if not self.db_path.exists():
             return {"error": f"OptimalX database not found at {self.db_path}"}
@@ -690,8 +694,7 @@ class OptimalXBridge:
                 global_id = row["global_id"]
                 name = row["name"]
                 notex_enabled = bool(row["notex_enabled"])
-
-            root = self.notex_dir / global_id
+                root = resolve_notex_root(self.notex_dir, conn, global_id)
             if not root.exists() or not root.is_dir():
                 return {
                     "subfolder_id": subfolder_id,
@@ -781,8 +784,7 @@ class OptimalXBridge:
 
                 global_id = row["global_id"]
                 project_name = row["name"]
-
-            root = (self.notex_dir / global_id).resolve()
+                root = resolve_notex_root(self.notex_dir, conn, global_id).resolve()
             if not root.exists() or not root.is_dir():
                 return {"error": f"NoteX directory not found on disk at {root}"}
 

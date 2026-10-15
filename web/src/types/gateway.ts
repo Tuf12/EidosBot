@@ -102,9 +102,11 @@ export interface OutboundWSMessage {
     | 'switch_conversation'
     | 'get_conversations'
     | 'get_history'
-    | 'sync';
+    | 'sync'
+    | 'edit_retry';
   prompt?: string;
   id?: string;
+  message_index?: number;
   approved?: boolean;
   allowlist?: boolean;
   message?: string;

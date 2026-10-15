@@ -8,12 +8,13 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import textwrap
 from typing import Any, Dict, List, Optional
 import urllib.parse
 import webbrowser
 
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont
+from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QSyntaxHighlighter, QTextCharFormat
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -222,6 +223,10 @@ def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
     if not clean:
         return False
 
+    # In-chat copy-code protocol handled by MessageBubble
+    if clean.startswith("copy-code:"):
+        return True
+
     # External web URLs
     if clean.startswith(("http://", "https://")):
         return _launch_external_url(clean)
@@ -253,7 +258,8 @@ def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
 def markdown_to_chat_html(text: str) -> str:
     """
     Convert markdown formatting into clean Dracula-themed rich HTML for PyQt6 QLabel.
-    Supports code blocks, inline code, bold, italics, headings, bullet/numbered lists.
+    Supports code blocks, inline code, bold, italics, headings (# through ######),
+    and bullet lists.
     """
     if not text:
         return ""
@@ -265,18 +271,20 @@ def markdown_to_chat_html(text: str) -> str:
 
     def replace_code_block(match):
         lang = (match.group(1) or "").strip()
-        code = match.group(2)
-        escaped_code = html.escape(code.strip("\n"), quote=False)
-        lang_badge = (
-            f"<div style='color: #bd93f9; font-size: 10px; font-weight: bold; margin-bottom: 4px;'>"
-            f"{html.escape(lang.upper(), quote=False)}</div>"
-            if lang
-            else ""
+        code = textwrap.dedent(match.group(2).strip("\n"))
+        escaped_code = html.escape(code, quote=False)
+        display_lang = lang.upper() if lang else "CODE"
+        header_table = (
+            f"<table width='100%' cellpadding='0' cellspacing='0' style='margin-bottom: 4px; border-bottom: 1px solid #282a36; padding-bottom: 3px;'>"
+            f"<tr>"
+            f"<td align='left' style='color: #bd93f9; font-size: 10px; font-weight: bold; font-family: monospace;'>💻 {html.escape(display_lang, quote=False)}</td>"
+            f"<td align='right'><a href='copy-code:{len(code_blocks)}' style='color: #50fa7b; text-decoration: none; font-size: 11px; font-weight: bold; font-family: sans-serif;'>📋 Copy</a></td>"
+            f"</tr></table>"
         )
         block_html = (
             f"<div style='background-color: #14151b; border: 1px solid #44475a; "
             f"border-radius: 6px; padding: 8px 10px; margin: 6px 0;'>"
-            f"{lang_badge}"
+            f"{header_table}"
             f"<pre style='color: #50fa7b; font-family: monospace; font-size: 12px; margin: 0; "
             f"white-space: pre-wrap; line-height: 1.3;'>{escaped_code}</pre>"
             f"</div>"
@@ -285,7 +293,12 @@ def markdown_to_chat_html(text: str) -> str:
         code_blocks.append(block_html)
         return f"___CODE_BLOCK_{idx}___"
 
-    text = re.sub(r"```([a-zA-Z0-9_\-\+]*)\n?(.*?)```", replace_code_block, text, flags=re.DOTALL)
+    text = re.sub(
+        r"(?:^[ \t]*)?```([a-zA-Z0-9_\-\+]*)[ \t]*\n?(.*?)(?:^[ \t]*)?```",
+        replace_code_block,
+        text,
+        flags=re.DOTALL | re.MULTILINE,
+    )
 
     # 2. Extract inline backticks `code`
     inline_codes = []
@@ -340,21 +353,39 @@ def markdown_to_chat_html(text: str) -> str:
     # 6. Autolink raw URLs and known local file references (not inside tags or existing links)
     text = linkify_escaped_text(text)
 
-    # 7. Headings
+    # 7. Headings. Longer marks first so #### is not left as literal hashes.
     text = re.sub(
-        r"^###\s+(.*?)$",
+        r"^######[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
+        r"<h6 style='color: #8be9fd; font-size: 12px; font-weight: 600; margin: 4px 0 2px 0;'>\1</h6>",
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r"^#####[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
+        r"<h6 style='color: #8be9fd; font-size: 13px; font-weight: 600; margin: 4px 0 2px 0;'>\1</h6>",
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r"^####[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
+        r"<h5 style='color: #8be9fd; margin: 6px 0 2px 0;'>\1</h5>",
+        text,
+        flags=re.MULTILINE,
+    )
+    text = re.sub(
+        r"^###[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
         r"<h4 style='color: #8be9fd; margin: 6px 0 2px 0;'>\1</h4>",
         text,
         flags=re.MULTILINE,
     )
     text = re.sub(
-        r"^##\s+(.*?)$",
+        r"^##[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
         r"<h3 style='color: #8be9fd; margin: 8px 0 3px 0;'>\1</h3>",
         text,
         flags=re.MULTILINE,
     )
     text = re.sub(
-        r"^#\s+(.*?)$",
+        r"^#[ \t]+(.*?)(?:[ \t]+#+\s*)?$",
         r"<h2 style='color: #bd93f9; margin: 10px 0 4px 0;'>\1</h2>",
         text,
         flags=re.MULTILINE,
@@ -404,6 +435,87 @@ def markdown_to_chat_html(text: str) -> str:
         out = out.replace(f"___INLINE_{i}___", ic)
 
     return out
+
+
+_FENCE_RE = re.compile(
+    r"(?:^[ \t]*)?```([a-zA-Z0-9_\-\+]*)[ \t]*\n?(.*?)(?:^[ \t]*)?```",
+    re.DOTALL | re.MULTILINE,
+)
+_UNCLOSED_FENCE_RE = re.compile(
+    r"(?:^[ \t]*)?```([a-zA-Z0-9_\-\+]*)[ \t]*\n?([\s\S]*)$",
+    re.MULTILINE,
+)
+
+
+def markdown_to_plain_text(text: str) -> str:
+    """Readable wording of a chat message, matching what the bubble shows.
+
+    Heading marks, emphasis, and link syntax are removed. Code fences are
+    dropped and the code itself is kept. Links become ``label (url)``.
+    """
+    if not text:
+        return ""
+
+    text = text.replace("\r\n", "\n")
+    blocks: List[str] = []
+
+    def stash_fence(match: re.Match) -> str:
+        code = textwrap.dedent(match.group(2).strip("\n"))
+        blocks.append(code)
+        return f"\ue000CODE{len(blocks) - 1}\ue001"
+
+    text = _FENCE_RE.sub(stash_fence, text)
+    unclosed = _UNCLOSED_FENCE_RE.search(text)
+    if unclosed:
+        code = textwrap.dedent((unclosed.group(2) or "").strip("\n"))
+        blocks.append(code)
+        text = text[: unclosed.start()] + f"\ue000CODE{len(blocks) - 1}\ue001"
+
+    plain = "\n".join(_plain_markdown_line(line) for line in text.split("\n"))
+    for index, code in enumerate(blocks):
+        plain = plain.replace(f"\ue000CODE{index}\ue001", code)
+    return plain
+
+
+def _plain_markdown_line(line: str) -> str:
+    heading = re.match(r"^(#{1,6})[ \t]+(.*)$", line)
+    if heading:
+        title = re.sub(r"[ \t]+#+\s*$", "", heading.group(2))
+        return _plain_inline(title)
+
+    bullet = re.match(r"^(\s*)[-*]\s+(.*)$", line)
+    if bullet:
+        return f"{bullet.group(1)}• {_plain_inline(bullet.group(2))}"
+
+    ordered = re.match(r"^(\s*)(\d+)\.\s+(.*)$", line)
+    if ordered:
+        return f"{ordered.group(1)}{ordered.group(2)}. {_plain_inline(ordered.group(3))}"
+
+    return _plain_inline(line)
+
+
+def _plain_inline(text: str) -> str:
+    codes: List[str] = []
+
+    def stash_code(match: re.Match) -> str:
+        codes.append(match.group(1))
+        return f"\ue000IN{len(codes) - 1}\ue001"
+
+    text = re.sub(r"`([^`\n]+)`", stash_code, text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"\*([^*\n]+)\*", r"\1", text)
+
+    def replace_link(match: re.Match) -> str:
+        label = match.group(1).strip()
+        url = match.group(2).strip().strip("'\"")
+        if not label or label == url:
+            return url
+        return f"{label} ({url})"
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_link, text)
+    for index, code in enumerate(codes):
+        text = text.replace(f"\ue000IN{index}\ue001", code)
+    return text
 
 
 def soften_long_tokens(markup: str, limit: int = 48) -> str:
@@ -489,6 +601,239 @@ class ChatEditArea(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+class DraculaHighlighter(QSyntaxHighlighter):
+    """Clean Dracula-themed syntax highlighter for code blocks."""
+
+    def __init__(self, document, language: str = ""):
+        super().__init__(document)
+        self.rules = []
+        lang = (language or "").lower()
+
+        # Keyword format (Dracula pink #ff79c6)
+        kw_fmt = QTextCharFormat()
+        kw_fmt.setForeground(QColor("#ff79c6"))
+        kw_fmt.setFontWeight(QFont.Weight.Bold)
+
+        # Builtin/Type format (Dracula cyan #8be9fd)
+        builtin_fmt = QTextCharFormat()
+        builtin_fmt.setForeground(QColor("#8be9fd"))
+
+        # String format (Dracula yellow #f1fa8c)
+        str_fmt = QTextCharFormat()
+        str_fmt.setForeground(QColor("#f1fa8c"))
+
+        # Comment format (Dracula comment grey #6272a4)
+        comment_fmt = QTextCharFormat()
+        comment_fmt.setForeground(QColor("#6272a4"))
+        comment_fmt.setFontItalic(True)
+
+        # Number format (Dracula purple #bd93f9)
+        num_fmt = QTextCharFormat()
+        num_fmt.setForeground(QColor("#bd93f9"))
+
+        # Numbers
+        self.rules.append((re.compile(r"\b\d+(\.\d+)?\b"), num_fmt))
+
+        # Strings: double, single, backticks
+        self.rules.append((re.compile(r'"[^"\\]*(\\.[^"\\]*)*"'), str_fmt))
+        self.rules.append((re.compile(r"'[^'\\]*(\\.[^'\\]*)*'"), str_fmt))
+
+        # Comments
+        self.rules.append((re.compile(r"//[^\n]*"), comment_fmt))
+        self.rules.append((re.compile(r"#[^\n]*"), comment_fmt))
+
+        # Common keywords across languages (Python, OpenSCAD, JS/TS, Bash, C/C++)
+        keywords = [
+            "def", "class", "import", "from", "return", "if", "elif", "else",
+            "while", "for", "in", "try", "except", "finally", "with", "as",
+            "lambda", "yield", "pass", "break", "continue", "raise", "assert",
+            "True", "False", "None", "async", "await",
+            # OpenSCAD
+            "module", "function", "difference", "union", "intersection",
+            "linear_extrude", "rotate_extrude", "translate", "rotate", "scale",
+            "mirror", "multmatrix", "color", "offset", "hull", "minkowski",
+            # JS/TS
+            "const", "let", "var", "new", "typeof", "instanceof",
+            "export", "default", "null", "undefined",
+            # Bash / Shell
+            "echo", "exit", "then", "fi", "do", "done", "case", "esac",
+            "sudo", "cat", "grep", "sed", "awk", "chmod", "curl", "wget",
+        ]
+        kw_re = re.compile(r"\b(" + "|".join(re.escape(k) for k in keywords) + r")\b")
+        self.rules.append((kw_re, kw_fmt))
+
+        # Builtins & primitives
+        builtins = [
+            "print", "len", "range", "str", "int", "float", "dict", "list", "set",
+            "open", "type", "sum", "min", "max",
+            # OpenSCAD primitives & special variables
+            "cube", "cylinder", "sphere", "polyhedron", "circle", "square", "polygon", "text",
+            r"\$fn", r"\$fa", r"\$fs", r"\$t", r"\$vpr", r"\$vpt", r"\$vpd",
+            # JS / DOM
+            "console", "document", "window", "Math", "JSON", "Promise", "Array", "Object"
+        ]
+        builtin_re = re.compile(r"\b(" + "|".join(builtins) + r")\b")
+        self.rules.append((builtin_re, builtin_fmt))
+
+    def highlightBlock(self, text: str):
+        for pattern, fmt in self.rules:
+            for match in pattern.finditer(text):
+                start, end = match.span()
+                self.setFormat(start, end - start, fmt)
+
+
+def parse_markdown_segments(text: str) -> List[Dict[str, str]]:
+    """
+    Parse markdown into alternating segments of text and fenced code blocks.
+    Tolerates leading spaces on fences (e.g. from nested markdown lists/quotes)
+    and dedents code blocks cleanly.
+    """
+    if not text:
+        return []
+
+    pattern = re.compile(
+        r"(?:^[ \t]*)?```([a-zA-Z0-9_\-\+]*)[ \t]*\n([\s\S]*?)(?:^[ \t]*)?```",
+        re.MULTILINE
+    )
+
+    segments = []
+    last_idx = 0
+    for match in pattern.finditer(text):
+        start, end = match.span()
+        if start > last_idx:
+            segments.append({"type": "text", "content": text[last_idx:start]})
+
+        lang = (match.group(1) or "").strip()
+        raw_code = match.group(2)
+        clean_code = textwrap.dedent(raw_code.strip("\n"))
+        segments.append({
+            "type": "code",
+            "lang": lang,
+            "code": clean_code
+        })
+        last_idx = end
+
+    if last_idx < len(text):
+        segments.append({"type": "text", "content": text[last_idx:]})
+
+    return segments
+
+
+class CodeBlockWidget(QFrame):
+    """
+    Dedicated code block box widget for chat bubbles.
+    Features:
+    - Distinct Dracula dark box styling with rounded corners and subtle border
+    - Top header bar with language badge and a dedicated '📋 Copy' button
+    - Visual feedback on copy: changes to '✓ Copied!' for 2 seconds
+    - Clean monospace editor with syntax styling and horizontal scrolling
+    - Direct clipboard copy of clean code
+    """
+    signal_copied = pyqtSignal(str)
+
+    def __init__(self, code: str, language: str = "", parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.raw_code = code
+        self.language = (language or "").strip()
+        self._init_ui()
+
+    def _init_ui(self):
+        self.setObjectName("CodeBlockFrame")
+        self.setStyleSheet(
+            "QFrame#CodeBlockFrame { background-color: #14151b; border: 1px solid #44475a; "
+            "border-radius: 8px; margin: 4px 0px; }\n"
+            f"{GLOBAL_TOOLTIP_STYLE}"
+        )
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Header bar
+        header_widget = QWidget(self)
+        header_widget.setStyleSheet(
+            "QWidget { background-color: #181a24; border-top-left-radius: 7px; "
+            "border-top-right-radius: 7px; border-bottom: 1px solid #44475a; }"
+        )
+        header_layout = QHBoxLayout(header_widget)
+        header_layout.setContentsMargins(10, 4, 8, 4)
+        header_layout.setSpacing(8)
+
+        display_lang = self.language.upper() if self.language else "CODE"
+        lbl_lang = QLabel(
+            f"💻 <span style='color: #bd93f9; font-weight: bold; font-family: monospace; font-size: 11px;'>{display_lang}</span>",
+            header_widget
+        )
+        lbl_lang.setStyleSheet("border: none; background: transparent;")
+        header_layout.addWidget(lbl_lang)
+        header_layout.addStretch(1)
+
+        self.btn_copy = QPushButton("📋 Copy", header_widget)
+        self.btn_copy.setToolTip("Copy code snippet to clipboard")
+        self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_copy.setStyleSheet(
+            "QPushButton { background-color: #282a36; color: #f8f8f2; "
+            "border: 1px solid #44475a; border-radius: 4px; padding: 2px 8px; "
+            "font-size: 11px; font-weight: bold; font-family: sans-serif; } "
+            "QPushButton:hover { background-color: #44475a; color: #50fa7b; border-color: #50fa7b; }"
+        )
+        self.btn_copy.clicked.connect(self._copy_code)
+        header_layout.addWidget(self.btn_copy)
+        main_layout.addWidget(header_widget)
+
+        # Code text edit
+        self.text_edit = QPlainTextEdit(self)
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setPlainText(self.raw_code)
+        self.text_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.text_edit.setStyleSheet(
+            "QPlainTextEdit { background-color: #14151b; color: #50fa7b; border: none; "
+            "border-bottom-left-radius: 7px; border-bottom-right-radius: 7px; "
+            "padding: 8px 10px; font-family: 'JetBrains Mono', 'Fira Code', 'DejaVu Sans Mono', 'Consolas', monospace; "
+            "font-size: 12px; selection-background-color: #44475a; selection-color: #f8f8f2; }"
+        )
+
+        # Syntax highlighter
+        self.highlighter = DraculaHighlighter(self.text_edit.document(), self.language)
+
+        # Calculate optimal height based on line count
+        fm = self.text_edit.fontMetrics()
+        line_spacing = max(fm.lineSpacing(), 18)
+        line_count = len(self.raw_code.splitlines()) or 1
+        target_height = min(max(line_count * line_spacing + 24, 48), 380)
+        self.text_edit.setFixedHeight(target_height)
+
+        if target_height >= 380:
+            self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        else:
+            self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        main_layout.addWidget(self.text_edit)
+
+    def _copy_code(self):
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(self.raw_code)
+        self.btn_copy.setText("✓ Copied!")
+        self.btn_copy.setStyleSheet(
+            "QPushButton { background-color: #50fa7b; color: #1e1f29; "
+            "border: 1px solid #50fa7b; border-radius: 4px; padding: 2px 8px; "
+            "font-size: 11px; font-weight: bold; font-family: sans-serif; }"
+        )
+        self.signal_copied.emit(self.raw_code)
+        QTimer.singleShot(2000, self._reset_copy_btn)
+
+    def _reset_copy_btn(self):
+        self.btn_copy.setText("📋 Copy")
+        self.btn_copy.setStyleSheet(
+            "QPushButton { background-color: #282a36; color: #f8f8f2; "
+            "border: 1px solid #44475a; border-radius: 4px; padding: 2px 8px; "
+            "font-size: 11px; font-weight: bold; font-family: sans-serif; } "
+            "QPushButton:hover { background-color: #44475a; color: #50fa7b; border-color: #50fa7b; }"
+        )
+
+
 class MessageBubble(QFrame):
     """Single message bubble inside the scrollable chat container."""
 
@@ -559,7 +904,7 @@ class MessageBubble(QFrame):
             header_layout.addWidget(lbl_title)
             header_layout.addStretch(1)
 
-            self.btn_copy = self._create_action_btn("📋 Copy", "Copy message to clipboard", lambda: self._copy_to_clipboard(self.btn_copy))
+            self.btn_copy = self._create_action_btn("📋 Copy", "Copy message as shown", lambda: self._copy_to_clipboard(self.btn_copy))
             header_layout.addWidget(self.btn_copy)
 
             self.btn_edit = self._create_action_btn("✏️ Edit", "Edit message and resubmit", self.start_editing)
@@ -582,7 +927,7 @@ class MessageBubble(QFrame):
             header_layout.addWidget(lbl_title)
             header_layout.addStretch(1)
 
-            self.btn_copy = self._create_action_btn("📋 Copy", "Copy response to clipboard", lambda: self._copy_to_clipboard(self.btn_copy))
+            self.btn_copy = self._create_action_btn("📋 Copy", "Copy response as shown", lambda: self._copy_to_clipboard(self.btn_copy))
             header_layout.addWidget(self.btn_copy)
 
             self.btn_retry = self._create_action_btn("🔄 Retry", "Regenerate / retry response", self.request_retry)
@@ -607,6 +952,9 @@ class MessageBubble(QFrame):
 
             self.btn_copy = self._create_action_btn("📋 Copy", "Copy reasoning to clipboard", lambda: self._copy_to_clipboard(self.btn_copy))
             header_layout.addWidget(self.btn_copy)
+
+            self.btn_speak = self._create_action_btn("🔊 Audio", "Read reasoning aloud (TTS)", self.request_replay_tts)
+            header_layout.addWidget(self.btn_speak)
 
             self.btn_delete = self._create_action_btn("🗑️", "Delete message", self.request_delete)
             header_layout.addWidget(self.btn_delete)
@@ -651,26 +999,21 @@ class MessageBubble(QFrame):
 
         layout.addLayout(header_layout)
 
-        # Message Content Label
-        self.content_label = ChatContentLabel()
+        # Message Content Container (holds text labels and CodeBlockWidget instances)
+        self.content_container = QWidget(self)
+        self.content_layout = QVBoxLayout(self.content_container)
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_layout.setSpacing(6)
+
+        # Primary label reference (for backwards compatibility)
+        self.content_label = ChatContentLabel(self.content_container)
         self.content_label.setOpenExternalLinks(False)
         self.content_label.linkActivated.connect(self._handle_link_clicked)
         self.content_label.linkHovered.connect(self._handle_link_hovered)
 
-        if self.role == "thought":
-            self.content_label.setStyleSheet("color: #e0e0e0; font-size: 12px; font-style: italic;")
-            self._show_content(self.raw_content, rich=False)
-        elif self.role == "tool":
-            self.content_label.setStyleSheet("color: #f8f8f2; font-family: monospace; font-size: 11px;")
-            self._show_content(self._tool_markup(self.raw_content))
-        elif self.role == "error":
-            self.content_label.setStyleSheet("color: #ff5555; font-size: 12px;")
-            self._show_content(self.raw_content, rich=False)
-        else:
-            self.content_label.setStyleSheet("color: #f8f8f2; font-size: 13px; line-height: 1.4;")
-            self._show_content(markdown_to_chat_html(self.raw_content))
+        self._render_message_content(self.raw_content)
 
-        layout.addWidget(self.content_label)
+        layout.addWidget(self.content_container)
 
         # Edit Container (for in-place editing)
         self.edit_container = QWidget()
@@ -716,10 +1059,90 @@ class MessageBubble(QFrame):
         edit_layout.addLayout(edit_btn_row)
         layout.addWidget(self.edit_container)
 
+    def _render_message_content(self, text: str):
+        """Render message text into rich labels and dedicated code block widgets."""
+        while self.content_layout.count():
+            item = self.content_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+        if self.role == "thought":
+            lbl = ChatContentLabel(self.content_container)
+            lbl.setStyleSheet("color: #e0e0e0; font-size: 12px; font-style: italic;")
+            lbl.setTextFormat(Qt.TextFormat.PlainText)
+            lbl.setText(soften_long_tokens(text or ""))
+            self.content_label = lbl
+            self.content_layout.addWidget(lbl)
+            return
+
+        if self.role == "tool":
+            lbl = ChatContentLabel(self.content_container)
+            lbl.setStyleSheet("color: #f8f8f2; font-family: monospace; font-size: 11px;")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setText(soften_long_tokens(self._tool_markup(text or "")))
+            self.content_label = lbl
+            self.content_layout.addWidget(lbl)
+            return
+
+        if self.role == "error":
+            lbl = ChatContentLabel(self.content_container)
+            lbl.setStyleSheet("color: #ff5555; font-size: 12px;")
+            lbl.setTextFormat(Qt.TextFormat.PlainText)
+            lbl.setText(soften_long_tokens(text or ""))
+            self.content_label = lbl
+            self.content_layout.addWidget(lbl)
+            return
+
+        # Assistant or User message with rich markdown and code blocks
+        segments = parse_markdown_segments(text)
+        self.code_snippets = [seg["code"] for seg in segments if seg.get("type") == "code"]
+
+        first_label = None
+        has_code = False
+        for seg in segments:
+            if seg.get("type") == "text":
+                content = seg.get("content", "")
+                if not content.strip():
+                    continue
+                lbl = ChatContentLabel(self.content_container)
+                lbl.setOpenExternalLinks(False)
+                lbl.linkActivated.connect(self._handle_link_clicked)
+                lbl.linkHovered.connect(self._handle_link_hovered)
+                lbl.setStyleSheet("color: #f8f8f2; font-size: 13px; line-height: 1.4;")
+                lbl.setTextFormat(Qt.TextFormat.RichText)
+                lbl.setText(soften_long_tokens(markdown_to_chat_html(content)))
+                self.content_layout.addWidget(lbl)
+                if first_label is None:
+                    first_label = lbl
+            elif seg.get("type") == "code":
+                has_code = True
+                code_widget = CodeBlockWidget(
+                    code=seg.get("code", ""),
+                    language=seg.get("lang", ""),
+                    parent=self.content_container,
+                )
+                self.content_layout.addWidget(code_widget)
+
+        if first_label is not None:
+            self.content_label = first_label
+        else:
+            # Fallback if message is empty or consists purely of code blocks
+            lbl = ChatContentLabel(self.content_container)
+            lbl.setOpenExternalLinks(False)
+            lbl.linkActivated.connect(self._handle_link_clicked)
+            lbl.linkHovered.connect(self._handle_link_hovered)
+            lbl.setStyleSheet("color: #f8f8f2; font-size: 13px; line-height: 1.4;")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setText(soften_long_tokens(markdown_to_chat_html(text or "")))
+            self.content_label = lbl
+            if not has_code:
+                self.content_layout.addWidget(lbl)
+
     def start_editing(self):
         """Switch bubble into inline editing mode."""
         self.is_editing = True
-        self.content_label.setVisible(False)
+        self.content_container.setVisible(False)
         self.edit_text_area.setPlainText(self.raw_content)
         self.edit_container.setVisible(True)
         self.edit_text_area.setFocus()
@@ -732,21 +1155,20 @@ class MessageBubble(QFrame):
         self.is_editing = False
         self.edit_text_area.setPlainText(self.raw_content)
         self.edit_container.setVisible(False)
-        self.content_label.setVisible(True)
+        self.content_container.setVisible(True)
 
     def minimumSizeHint(self) -> QSize:
         hint = super().minimumSizeHint()
         return QSize(0, hint.height())
 
     def _show_content(self, markup: str, *, rich: bool = True) -> None:
-        text = soften_long_tokens(markup or "")
-        if rich:
-            self.content_label.setTextFormat(Qt.TextFormat.RichText)
-        else:
-            # Reasoning and failure notes often contain "<...>" from the model.
-            # Rich text would treat those as tags and the bubble would render blank.
-            self.content_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.content_label.setText(text)
+        if hasattr(self, "content_label") and self.content_label:
+            text = soften_long_tokens(markup or "")
+            if rich:
+                self.content_label.setTextFormat(Qt.TextFormat.RichText)
+            else:
+                self.content_label.setTextFormat(Qt.TextFormat.PlainText)
+            self.content_label.setText(text)
 
     def _tool_markup(self, text: str) -> str:
         escaped = html.escape(text, quote=False)
@@ -754,6 +1176,23 @@ class MessageBubble(QFrame):
 
     def _handle_link_clicked(self, url: str):
         """Handle link activation by user click, emit signal, and open in default app/browser."""
+        if url.startswith("copy-code:"):
+            try:
+                idx = int(url.split("copy-code:")[1])
+                if hasattr(self, "code_snippets") and 0 <= idx < len(self.code_snippets):
+                    code_to_copy = self.code_snippets[idx]
+                    clipboard = QApplication.clipboard()
+                    if clipboard:
+                        clipboard.setText(code_to_copy)
+                    logger.info("Copied code snippet %d (%d chars) to clipboard", idx, len(code_to_copy))
+                    if hasattr(self, "content_label") and self.content_label:
+                        self.content_label.setToolTip("✓ Code copied to clipboard!")
+                        QTimer.singleShot(2000, lambda: self.content_label.setToolTip(""))
+                    return
+            except Exception as exc:
+                logger.warning("Error copying code from link: %s", exc)
+                return
+
         logger.info("MessageBubble link clicked: %s", url)
         self.signal_link_clicked.emit(url)
         open_chat_link(url)
@@ -769,17 +1208,13 @@ class MessageBubble(QFrame):
         """Save edited content, update label, and emit edit signal."""
         new_text = self.edit_text_area.toPlainText().strip()
         if not new_text:
+            self.cancel_editing()
             return
         self.raw_content = new_text
-        if self.role in ("user", "assistant"):
-            self._show_content(markdown_to_chat_html(new_text))
-        elif self.role == "tool":
-            self._show_content(self._tool_markup(new_text))
-        else:
-            self._show_content(new_text, rich=self.role not in ("thought", "error"))
         self.is_editing = False
         self.edit_container.setVisible(False)
-        self.content_label.setVisible(True)
+        self._render_message_content(new_text)
+        self.content_container.setVisible(True)
         self.signal_edit_submitted.emit(self.message_id, new_text)
 
     def request_retry(self):
@@ -795,7 +1230,7 @@ class MessageBubble(QFrame):
 
     def _reset_speak_button(self):
         if self.btn_speak:
-            self.btn_speak.setText("🔊 Replay")
+            self.btn_speak.setText("🔊 Audio")
 
     def request_delete(self):
         """Request deletion of this message."""
@@ -804,7 +1239,10 @@ class MessageBubble(QFrame):
     def _copy_to_clipboard(self, button: Optional[QPushButton] = None):
         clipboard = QApplication.clipboard()
         if clipboard:
-            clipboard.setText(self.raw_content)
+            text = self.raw_content or ""
+            if self.role in ("user", "assistant"):
+                text = markdown_to_plain_text(text)
+            clipboard.setText(text)
             if button:
                 button.setText("✓ Copied")
                 button.setStyleSheet(
@@ -812,7 +1250,7 @@ class MessageBubble(QFrame):
                     "border-radius: 4px; padding: 2px 6px; font-size: 11px; border: none; }"
                 )
                 QTimer.singleShot(1500, lambda: self._reset_copy_button(button))
-            self.signal_copy_clicked.emit(self.raw_content)
+            self.signal_copy_clicked.emit(text)
 
     def _reset_copy_button(self, button: QPushButton):
         button.setText("📋 Copy")
@@ -833,14 +1271,14 @@ class MessageBubble(QFrame):
             "QMenu::separator { height: 1px; background-color: #44475a; margin: 4px 0; }"
         )
 
-        act_copy = menu.addAction("📋 Copy Message")
+        act_copy = menu.addAction("📋 Copy Message as Shown")
         act_copy.triggered.connect(lambda: self._copy_to_clipboard(self.btn_copy))
 
         act_copy_input = menu.addAction("📝 Copy to Prompt Input")
         act_copy_input.triggered.connect(lambda: self.signal_copy_to_input.emit(self.raw_content))
 
-        if self.role == "assistant":
-            act_speak = menu.addAction("🔊 Replay Voice (TTS)")
+        if self.role in ("assistant", "thought"):
+            act_speak = menu.addAction("🔊 Play Voice (TTS)")
             act_speak.triggered.connect(self.request_replay_tts)
 
         if self.role == "user":

@@ -20,6 +20,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from eidos.voice.clip_player import ClipPlayer
+
 logger = logging.getLogger(__name__)
 
 _PCM = Tuple[np.ndarray, int]
@@ -40,11 +42,14 @@ class WavPlayback:
         )
         self._sd = None
         self._sf = None
+        self.session = ClipPlayer()
         self._init_audio_libs()
 
     @property
     def is_playing(self) -> bool:
         """Return True if audio playback is actively playing sound."""
+        if self.session.playing:
+            return True
         if self._is_playing_audio:
             return True
         if self._sd is not None:
@@ -103,13 +108,34 @@ class WavPlayback:
         return self._play_subprocess(path, blocking)
 
     def play_pcm(self, pcm: np.ndarray, sample_rate: int, blocking: bool = True) -> bool:
+        if self.session.available:
+            self.session.begin()
+            self.session.append(pcm, sample_rate)
+            if self.session.playing:
+                self.session.mark_complete()
+                if blocking:
+                    return self._wait_session()
+                return True
+            self.session.dismiss()
         if self._try_sounddevice_pcm(pcm, sample_rate, blocking):
             return True
         return self._play_subprocess_from_pcm(pcm, sample_rate, blocking)
 
+    def _wait_session(self) -> bool:
+        import time
+
+        while True:
+            if self._stop_flag.is_set():
+                self.session.dismiss()
+                return False
+            if not self.session.playing:
+                return True
+            time.sleep(0.05)
+
     def stop(self) -> None:
         self._stop_flag.set()
         self._is_playing_audio = False
+        self.session.dismiss()
         with self._lock:
             if self._sd is not None:
                 try:

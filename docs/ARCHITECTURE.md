@@ -222,12 +222,13 @@ Every interaction cycle executes through a six-stage pipeline:
 
 ### 4.9. Skills & Collaborative Job Runner (`eidos/skills/` & `eidos/jobs/`)
 
-*(Detailed specifications in [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md))*
+*(Detailed specifications in [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md) and [PROJECT_JOBS.md](PROJECT_JOBS.md))*
 
 - **`skills/manager.py`:**
   - Manages human-and-agent editable `SKILL.md` documents containing standard operating procedures, rubrics, and templates.
 - **`jobs/runner.py`:**
   - State machine batch runner managing `queue.json` for processing large-scale projects (e.g., 300 Inventions evaluation) item by item with fresh contexts, checkpointing, and pause/resume.
+  - Batch execution is a component a project job can attach. The project brief itself lives in `job.yaml` and is specified in [PROJECT_JOBS.md](PROJECT_JOBS.md).
 
 ### 4.10. Remote Telegram Gateway (`eidos/gateway/telegram_bot.py`)
 
