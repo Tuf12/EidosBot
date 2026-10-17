@@ -144,6 +144,32 @@ def test_trajectory_logger_lifecycle():
         assert recent[0].episode_id == ep_id
         assert len(recent[0].trajectory) == 2
 
+        # Check get_episode_by_id
+        fetched = logger.get_episode_by_id(ep_id)
+        assert fetched is not None
+        assert fetched.episode_id == ep_id
+        assert fetched.metadata.critic_score == 1.0
+        assert logger.get_episode_by_id("non_existent_ep") is None
+
+        # Check in-place atomic update_episode
+        fetched.metadata.critic_score = 0.85
+        fetched.reflection.lessons_learned = "Updated reflection lesson"
+        assert logger.update_episode(fetched) is True
+        assert logger.count_episodes() == 1
+
+        updated = logger.get_episode_by_id(ep_id)
+        assert updated is not None
+        assert updated.metadata.critic_score == 0.85
+        assert updated.reflection.lessons_learned == "Updated reflection lesson"
+
+        # Updating a non-existent episode returns False
+        fake_record = EpisodeRecord(
+            episode_id="ep_fake_999",
+            task_goal="Fake goal",
+            metadata=EpisodeMetadata(outcome="success"),
+        )
+        assert logger.update_episode(fake_record) is False
+
 
 def test_agent_loop_trajectory_recording():
     with tempfile.TemporaryDirectory() as tmpdir:

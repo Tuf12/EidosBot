@@ -183,6 +183,7 @@ class StatusPill(QWidget):
 
     # Signals
     signal_set_status = pyqtSignal(str, str)  # status_key, message
+    signal_set_background_activity = pyqtSignal(bool, str, str)  # active, task, details
     signal_submit_task = pyqtSignal(str)  # user prompt
     signal_stop_task = pyqtSignal()  # stop active task / generation
     signal_retry_task = pyqtSignal(str)  # retry task prompt
@@ -229,6 +230,9 @@ class StatusPill(QWidget):
         self._unread_responses: int = 0
         self._is_task_running: bool = False
         self._auto_speak: bool = True
+        self._background_active: bool = False
+        self._background_task: str = ""
+        self._background_details: str = ""
 
         self._init_window()
         self._init_ui()
@@ -502,6 +506,7 @@ class StatusPill(QWidget):
 
     def _connect_signals(self):
         self.signal_set_status.connect(self.set_status)
+        self.signal_set_background_activity.connect(self.set_background_activity)
         self.signal_set_conversation_title.connect(self.set_conversation_title)
         self.chat_history.signal_retry.connect(self._on_retry_task)
         self.chat_history.signal_edit_message.connect(self._on_edit_message)
@@ -940,14 +945,41 @@ class StatusPill(QWidget):
         """Clear the prompt input without submitting a task."""
         self.prompt_input.clear()
 
+    @pyqtSlot(bool, str, str)
+    def set_background_activity(self, active: bool, task: str = "", details: str = ""):
+        """Update background activity indicator on status pill."""
+        self._background_active = bool(active)
+        self._background_task = task if active else ""
+        self._background_details = details if active else ""
+
+        if self._current_state == "idle":
+            if self._background_active:
+                bg_note = f"⚡ {task}" if task else "⚡ Background"
+                self.status_label.setText(f"● Ready ({bg_note})")
+                self.status_label.setStyleSheet("color: #bd93f9; font-weight: bold; font-size: 13px;")
+                if details:
+                    display_msg = details if len(details) <= 50 else details[:47] + "..."
+                    self.details_label.setText(display_msg)
+                    self.details_label.setToolTip(f"Background: {task}\n{details}")
+            else:
+                self.status_label.setText("● Ready")
+                self.status_label.setStyleSheet("color: #50fa7b; font-weight: bold; font-size: 13px;")
+                self.details_label.setText("")
+                self.details_label.setToolTip("")
+
     @pyqtSlot(str, str)
     def set_status(self, status_key: str, message: str = ""):
         """Update the status pill display."""
         self._current_state = status_key.lower()
         color_hex, label_text = STATUS_COLORS.get(self._current_state, ("#50fa7b", f"● {status_key}"))
 
-        self.status_label.setText(label_text)
-        self.status_label.setStyleSheet(f"color: {color_hex}; font-weight: bold; font-size: 13px;")
+        if self._current_state == "idle" and self._background_active:
+            bg_note = f"⚡ {self._background_task}" if self._background_task else "⚡ Background"
+            self.status_label.setText(f"● Ready ({bg_note})")
+            self.status_label.setStyleSheet("color: #bd93f9; font-weight: bold; font-size: 13px;")
+        else:
+            self.status_label.setText(label_text)
+            self.status_label.setStyleSheet(f"color: {color_hex}; font-weight: bold; font-size: 13px;")
 
         if message:
             # Truncate details if overly long for pill display

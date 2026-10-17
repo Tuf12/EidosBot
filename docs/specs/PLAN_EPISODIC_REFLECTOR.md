@@ -187,19 +187,19 @@ Write thorough, fast-running unit tests:
 
 ## 4. Rollout Strategy & Step-by-Step Task Checklist
 
-- [ ] **Step 1: Schemas (`eidos/memory/types.py`)**
+- [x] **Step 1: Schemas (`eidos/memory/types.py`)**
   - Add `ReflectionEvaluation` model.
   - Extend `EpisodeReflection` model.
-- [ ] **Step 2: Trajectory Logger Update (`eidos/memory/trajectory_logger.py`)**
+- [x] **Step 2: Trajectory Logger Update (`eidos/memory/trajectory_logger.py`)**
   - Implement `update_episode()` and `get_episode_by_id()`.
-- [ ] **Step 3: Episodic Store Updates (`eidos/memory/episodic_store.py`)**
+- [x] **Step 3: Episodic Store Updates (`eidos/memory/episodic_store.py`)**
   - Add `update_episode_reflection()` method.
-- [ ] **Step 4: Reflector Implementation (`eidos/memory/reflector.py`)**
+- [x] **Step 4: Reflector Implementation (`eidos/memory/reflector.py`)**
   - Implement `EpisodicReflector` with background queue, prompt builder, observation truncator, parser, heuristic fallback, and database persistence.
   - Export from `eidos/memory/__init__.py`.
-- [ ] **Step 5: AgentLoop & Config Integration (`eidos/core/loop.py`, `config.example.yaml`)**
+- [x] **Step 5: AgentLoop & Config Integration (`eidos/core/loop.py`, `config.example.yaml`)**
   - Wire reflector into `AgentLoop` initialization, completion hook, and shutdown.
-- [ ] **Step 6: Unit Testing (`tests/test_reflector.py`)**
+- [x] **Step 6: Unit Testing (`tests/test_reflector.py`)**
   - Write test suite; run via pytest (ensuring zero heavy back-to-back app instances).
-- [ ] **Step 7: Verification**
+- [x] **Step 7: Verification**
   - Verify all unit tests pass with zero regressions.

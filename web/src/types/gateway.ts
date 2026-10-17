@@ -82,6 +82,15 @@ export interface InboundWSEvent {
   active_id?: string;
   file?: SharedFile;
   files?: SharedFile[];
+  background_active?: boolean;
+  active?: boolean;
+  task?: string;
+}
+
+export interface BackgroundActivity {
+  active: boolean;
+  task: string;
+  details: string;
 }
 
 export interface OutboundWSMessage {

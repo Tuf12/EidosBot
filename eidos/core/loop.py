@@ -20,6 +20,7 @@ from eidos.jobs import BatchJobRunner, SkillJobProcessor
 from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.episodic_store import EpisodicStore
 from eidos.memory.recall_stream import RecallStreamInterceptor
+from eidos.memory.reflector import EpisodicReflector
 from eidos.memory.trajectory_logger import TrajectoryLogger
 from eidos.memory.types import StepRecord
 from eidos.memory.user_store import UserStore
@@ -58,6 +59,7 @@ class AgentLoop:
         trajectory_logger: Optional[TrajectoryLogger] = None,
         episodic_store: Optional[EpisodicStore] = None,
         conversation_store: Optional[ConversationStore] = None,
+        reflector: Optional[EpisodicReflector] = None,
     ):
         self.config = config or {}
         self.kill_switch = kill_switch or KillSwitch()
@@ -167,6 +169,21 @@ class AgentLoop:
             if hasattr(self.model, "on_recall_callback"):
                 self.model.on_recall_callback = self._on_recall_triggered
 
+        # Post-Task Autonomous Episodic Reflector
+        refl_cfg = mem_cfg.get("reflector", {})
+        self.reflector_enabled = refl_cfg.get("enabled", True)
+        self.reflector: Optional[EpisodicReflector] = reflector
+        if self.reflector is None and self.memory_enabled and self.reflector_enabled:
+            self.reflector = EpisodicReflector(
+                model_client=self.model,
+                episodic_store=self.episodic_store,
+                trajectory_logger=self.trajectory_logger,
+                on_background_activity=self.notify_background_activity,
+                enabled=self.reflector_enabled,
+                model_name=refl_cfg.get("model"),
+                timeout_seconds=float(refl_cfg.get("timeout_seconds", 30.0)),
+            )
+
         self.screen = ScreenCapture(
             scale_factor=self.config.get("perception", {}).get("screen_scale_factor", 1.0)
         )
@@ -257,7 +274,11 @@ class AgentLoop:
             "on_task_finish": [],
             "on_conversation_title_changed": [],
             "on_conversation_changed": [],
+            "on_background_activity": [],
         }
+        self.background_active: bool = False
+        self.background_task: str = ""
+        self.background_details: str = ""
         self.conversation_history: List[Dict[str, Any]] = []
         self.last_turn_trace: Dict[str, Any] = {}
         self.reload_conversation_history()
@@ -274,6 +295,13 @@ class AgentLoop:
                 cb(*args, **kwargs)
             except Exception as e:
                 logger.warning("Error in callback %s: %s", event_name, e)
+
+    def notify_background_activity(self, active: bool, task: str = "", details: str = ""):
+        """Notify observers (gateway, UI) about background processing."""
+        self.background_active = bool(active)
+        self.background_task = task if active else ""
+        self.background_details = details if active else ""
+        self._emit("on_background_activity", self.background_active, self.background_task, self.background_details)
 
     def reload_conversation_history(self) -> None:
         """Replace in-memory turns with the active conversation's stored messages."""
@@ -357,6 +385,14 @@ class AgentLoop:
     def is_stop_requested(self) -> bool:
         """Return True if cancellation has been requested for the running task."""
         return self._stop_requested.is_set()
+
+    def shutdown(self, timeout: float = 2.0) -> None:
+        """Shutdown background worker threads including episodic reflector."""
+        if hasattr(self, "reflector") and self.reflector:
+            try:
+                self.reflector.stop(timeout=timeout)
+            except Exception as e:
+                logger.debug("Error stopping reflector during loop shutdown: %s", e)
 
     def start_new_conversation(self, title: str = "New Chat") -> str:
         """Create a fresh conversation thread, reset context history, and set active."""
@@ -510,6 +546,27 @@ class AgentLoop:
                 conv_db_p = mem_cfg.get("conversations_db_path") or mem_cfg.get("conversation_db_path")
                 self.conversation_store = ConversationStore(db_path=conv_db_p)
                 self.active_conversation_id = self.conversation_store.get_or_create_active_conversation_id()
+            refl_cfg = mem_cfg.get("reflector", {})
+            if "enabled" in refl_cfg or "reflector" in mem_cfg:
+                self.reflector_enabled = refl_cfg.get("enabled", self.reflector_enabled)
+                if self.reflector:
+                    self.reflector.enabled = self.reflector_enabled
+                    self.reflector.episodic_store = self.episodic_store
+                    self.reflector.trajectory_logger = self.trajectory_logger
+                    if "model" in refl_cfg:
+                        self.reflector.model_name = refl_cfg["model"]
+                    if "timeout_seconds" in refl_cfg:
+                        self.reflector.timeout_seconds = float(refl_cfg["timeout_seconds"])
+                elif self.memory_enabled and self.reflector_enabled:
+                    self.reflector = EpisodicReflector(
+                        model_client=self.model,
+                        episodic_store=self.episodic_store,
+                        trajectory_logger=self.trajectory_logger,
+                        on_background_activity=self.notify_background_activity,
+                        enabled=self.reflector_enabled,
+                        model_name=refl_cfg.get("model"),
+                        timeout_seconds=float(refl_cfg.get("timeout_seconds", 30.0)),
+                    )
 
         if "integrations" in new_config and "optimalx" in new_config["integrations"]:
             opt_cfg = new_config["integrations"]["optimalx"]
@@ -831,7 +888,12 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             detail = self._format_attempt_detail(headline, thoughts, actions)
         else:
             detail = headline
-        self._finish_and_index_episode(episode_id, outcome=outcome, final_summary=headline)
+        rec = self._finish_and_index_episode(episode_id, outcome=outcome, final_summary=headline)
+        if self.reflector and self.memory_enabled and rec:
+            try:
+                self.reflector.enqueue(rec)
+            except Exception as ref_err:
+                logger.warning("Could not enqueue episode for reflection: %s", ref_err)
         if speak:
             self._speak_task_summary(headline, speak_summary=speak_summary)
         self._remember_turn(

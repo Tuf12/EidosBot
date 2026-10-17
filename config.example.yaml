@@ -91,6 +91,10 @@ memory:
   conversations_db_path: "~/.eidos/eidos.db"                     # Persistent SQLite chat conversations & message history
   embedding_model: "nomic-embed-text:latest"                     # 768-dim local embeddings on Ollama
   confirm_profile_writes: true   # HUD confirmation before agent saves profile facts
+  reflector:
+    enabled: true                # Autonomous post-task critique and calibrated critic scoring
+    timeout_seconds: 30.0        # Evaluation LLM timeout
+    model: ""                    # Optional specific evaluation model (defaults to router / reasoning model)
 
 sandbox:
   enabled: true

@@ -9,7 +9,7 @@ import sqlite3
 import struct
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -18,7 +18,14 @@ from eidos.memory.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     OllamaEmbeddingClient,
 )
-from eidos.memory.types import EpisodeRecord, EpisodicSearchResult
+from eidos.memory.entity_extractor import EntityExtractor
+from eidos.memory.graph_store import GraphStore
+from eidos.memory.types import (
+    EpisodeRecord,
+    EpisodeReflection,
+    EpisodicSearchResult,
+    ReflectionEvaluation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +46,8 @@ class EpisodicStore:
     ):
         self.db_path = Path(os.path.expanduser(str(db_path or DEFAULT_EPISODIC_DB_PATH)))
         self.dimension = dimension
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self.entity_extractor = EntityExtractor()
 
         # Initialize embedding client
         if embedding_client is not None:
@@ -65,10 +73,15 @@ class EpisodicStore:
             logger.error("Failed to create episodic vector store directory %s: %s", self.db_path.parent, e)
 
     def _init_database(self) -> None:
-        """Connect to SQLite and initialize relational and vector virtual tables."""
+        """Connect to SQLite and initialize relational, vector, and graph tables."""
         with self._lock:
             self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA foreign_keys = ON;")
+
+            # Initialize relational entity knowledge graph store
+            self.graph_store = GraphStore(self._conn, self._lock)
+            self.graph_store.init_schema()
 
             # Attempt to load sqlite-vec extension
             try:
@@ -421,6 +434,17 @@ class EpisodicStore:
                 logger.info(
                     "Indexed episode %s (outcome=%s) in episodic store", record.episode_id, outcome
                 )
+
+                # Link entities in the relational knowledge graph
+                try:
+                    entities = self.entity_extractor.extract_from_episode(record)
+                    if entities and hasattr(self, "graph_store"):
+                        self.graph_store.link_episode_entities(
+                            record.episode_id, entities, timestamp=record.timestamp
+                        )
+                except Exception as ge:
+                    logger.warning("Failed to link entities for episode %s: %s", record.episode_id, ge)
+
                 return True
             except Exception as e:
                 logger.error("Failed to save episode %s to episodic store: %s", record.episode_id, e)
@@ -432,8 +456,9 @@ class EpisodicStore:
         top_k: int = 5,
         outcome_filter: Optional[str] = None,
         min_similarity: float = 0.0,
+        entity_weight: float = 0.35,
     ) -> List[EpisodicSearchResult]:
-        """Perform semantic similarity search against indexed episodic memories."""
+        """Perform hybrid semantic & graph-augmented search against indexed episodic memories."""
         cleaned_query = query.strip()
         if not cleaned_query:
             return []
@@ -444,12 +469,20 @@ class EpisodicStore:
             logger.error("Failed to generate query embedding: %s", e)
             return []
 
+        # Extract entities from query for Graph-Augmented Retrieval
+        query_entities = self.entity_extractor.extract_from_query(cleaned_query)
+        graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None
+        if query_entities and hasattr(self, "graph_store"):
+            graph_matches = self.graph_store.find_episodes_by_entities(query_entities)
+
         if self._has_sqlite_vec:
             return self._search_sqlite_vec(
                 query_vector=query_vector,
                 top_k=top_k,
                 outcome_filter=outcome_filter,
                 min_similarity=min_similarity,
+                graph_matches=graph_matches,
+                entity_weight=entity_weight,
             )
         else:
             return self._search_numpy_fallback(
@@ -457,6 +490,8 @@ class EpisodicStore:
                 top_k=top_k,
                 outcome_filter=outcome_filter,
                 min_similarity=min_similarity,
+                graph_matches=graph_matches,
+                entity_weight=entity_weight,
             )
 
     def _search_sqlite_vec(
@@ -465,11 +500,13 @@ class EpisodicStore:
         top_k: int,
         outcome_filter: Optional[str],
         min_similarity: float,
+        graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
+        entity_weight: float = 0.35,
     ) -> List[EpisodicSearchResult]:
-        """Execute nearest-neighbor vector search via sqlite-vec extension."""
+        """Execute nearest-neighbor vector search via sqlite-vec extension with hybrid entity re-ranking."""
         query_blob = self._vector_to_blob(query_vector)
-        # Fetch larger k from vector index to allow post-filtering by outcome
-        fetch_k = max(top_k * 6, 25)
+        # Fetch larger k from vector index to allow post-filtering and re-ranking
+        fetch_k = max(top_k * 6, 30)
 
         with self._lock:
             try:
@@ -477,7 +514,7 @@ class EpisodicStore:
                     """
                     SELECT v.episode_id, v.distance, e.task_goal, e.outcome,
                            e.critic_score, e.timestamp, e.summary, e.pitfalls_avoided,
-                           e.lessons_learned, e.key_actions
+                           e.lessons_learned, e.key_actions, e.embedding_blob
                     FROM vec_episodes v
                     JOIN episodes e ON e.episode_id = v.episode_id
                     WHERE v.embedding MATCH ? AND k = ?
@@ -488,21 +525,69 @@ class EpisodicStore:
                 rows = cursor.fetchall()
             except Exception as e:
                 logger.warning("sqlite-vec query failed, falling back to numpy: %s", e)
-                return self._search_numpy_fallback(query_vector, top_k, outcome_filter, min_similarity)
+                return self._search_numpy_fallback(
+                    query_vector,
+                    top_k,
+                    outcome_filter,
+                    min_similarity,
+                    graph_matches=graph_matches,
+                    entity_weight=entity_weight,
+                )
 
-        results: List[EpisodicSearchResult] = []
-        for r in rows:
-            # sqlite-vec distance for cosine metric is 1 - cosine_similarity
-            distance = float(r["distance"])
-            similarity = max(0.0, min(1.0, 1.0 - distance))
+        seen_ids = {r["episode_id"] for r in rows}
+        extra_rows = []
 
-            if similarity < min_similarity:
+        if graph_matches:
+            missing_ids = [ep_id for ep_id in graph_matches if ep_id not in seen_ids]
+            if missing_ids:
+                placeholders = ",".join("?" for _ in missing_ids)
+                with self._lock:
+                    try:
+                        extra_cursor = self._conn.execute(
+                            f"""
+                            SELECT episode_id, 0.0 as distance, task_goal, outcome,
+                                   critic_score, timestamp, summary, pitfalls_avoided,
+                                   lessons_learned, key_actions, embedding_blob
+                            FROM episodes
+                            WHERE episode_id IN ({placeholders})
+                            """,
+                            missing_ids,
+                        )
+                        extra_rows = extra_cursor.fetchall()
+                    except Exception as extra_err:
+                        logger.warning("Error fetching extra graph-matched episodes: %s", extra_err)
+
+        all_rows = list(rows) + list(extra_rows)
+        candidates: List[Tuple[float, EpisodicSearchResult]] = []
+        q_vec = np.array(query_vector, dtype=np.float32)
+        q_norm = np.linalg.norm(q_vec)
+
+        for r in all_rows:
+            ep_id = r["episode_id"]
+            if ep_id in seen_ids and "distance" in r.keys() and r["distance"] is not None:
+                distance = float(r["distance"])
+                vec_sim = max(0.0, min(1.0, 1.0 - distance))
+            else:
+                blob = r["embedding_blob"]
+                if blob and q_norm > 0:
+                    vec = np.frombuffer(blob, dtype=np.float32)
+                    v_norm = np.linalg.norm(vec)
+                    vec_sim = max(0.0, min(1.0, float(np.dot(q_vec, vec) / (q_norm * v_norm)))) if v_norm > 0 else 0.0
+                else:
+                    vec_sim = 0.0
+
+            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches else (0.0, [])
+            if graph_matches:
+                composite_sim = (1.0 - entity_weight) * vec_sim + entity_weight * g_score
+            else:
+                composite_sim = vec_sim
+
+            if composite_sim < min_similarity:
                 continue
 
             outcome = r["outcome"]
             if outcome_filter is not None:
                 if outcome_filter == "pitfall":
-                    # Matches failed/aborted episodes OR episodes that have pitfalls avoided
                     has_pitfall = bool(r["pitfalls_avoided"] and r["pitfalls_avoided"].strip())
                     if outcome == "success" and not has_pitfall:
                         continue
@@ -516,25 +601,23 @@ class EpisodicStore:
                 except Exception:
                     pass
 
-            results.append(
-                EpisodicSearchResult(
-                    episode_id=r["episode_id"],
-                    task_goal=r["task_goal"],
-                    outcome=outcome,
-                    critic_score=r["critic_score"],
-                    similarity=round(similarity, 4),
-                    summary=r["summary"] or "",
-                    pitfalls_avoided=r["pitfalls_avoided"] or "",
-                    lessons_learned=r["lessons_learned"] or "",
-                    key_actions=key_actions,
-                    timestamp=r["timestamp"] or "",
-                )
+            item = EpisodicSearchResult(
+                episode_id=ep_id,
+                task_goal=r["task_goal"],
+                outcome=outcome,
+                critic_score=r["critic_score"],
+                similarity=round(composite_sim, 4),
+                summary=r["summary"] or "",
+                pitfalls_avoided=r["pitfalls_avoided"] or "",
+                lessons_learned=r["lessons_learned"] or "",
+                key_actions=key_actions,
+                timestamp=r["timestamp"] or "",
+                matched_entities=matched_ents,
             )
+            candidates.append((composite_sim, item))
 
-            if len(results) >= top_k:
-                break
-
-        return results
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in candidates[:top_k]]
 
     def _search_numpy_fallback(
         self,
@@ -542,8 +625,10 @@ class EpisodicStore:
         top_k: int,
         outcome_filter: Optional[str],
         min_similarity: float,
+        graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
+        entity_weight: float = 0.35,
     ) -> List[EpisodicSearchResult]:
-        """Pure-python/numpy cosine similarity calculation over stored BLOBs."""
+        """Pure-python/numpy cosine similarity calculation over stored BLOBs with hybrid entity re-ranking."""
         with self._lock:
             cursor = self._conn.execute(
                 """
@@ -575,9 +660,16 @@ class EpisodicStore:
                 continue
 
             cos_sim = float(np.dot(q_vec, vec) / (q_norm * v_norm))
-            similarity = max(0.0, min(1.0, cos_sim))
+            vec_sim = max(0.0, min(1.0, cos_sim))
 
-            if similarity < min_similarity:
+            ep_id = r["episode_id"]
+            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches else (0.0, [])
+            if graph_matches:
+                composite_sim = (1.0 - entity_weight) * vec_sim + entity_weight * g_score
+            else:
+                composite_sim = vec_sim
+
+            if composite_sim < min_similarity:
                 continue
 
             outcome = r["outcome"]
@@ -597,18 +689,19 @@ class EpisodicStore:
                     pass
 
             item = EpisodicSearchResult(
-                episode_id=r["episode_id"],
+                episode_id=ep_id,
                 task_goal=r["task_goal"],
                 outcome=outcome,
                 critic_score=r["critic_score"],
-                similarity=round(similarity, 4),
+                similarity=round(composite_sim, 4),
                 summary=r["summary"] or "",
                 pitfalls_avoided=r["pitfalls_avoided"] or "",
                 lessons_learned=r["lessons_learned"] or "",
                 key_actions=key_actions,
                 timestamp=r["timestamp"] or "",
+                matched_entities=matched_ents,
             )
-            candidates.append((similarity, item))
+            candidates.append((composite_sim, item))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in candidates[:top_k]]
@@ -744,9 +837,60 @@ class EpisodicStore:
                     pass
         return None
 
+    def update_episode_reflection(
+        self,
+        episode_id: str,
+        reflection: EpisodeReflection | ReflectionEvaluation | Dict[str, Any],
+        critic_score: Optional[float] = None,
+        goal_fulfilled: Optional[bool] = None,
+    ) -> bool:
+        """Update reflection, critic score, and outcome of an already-indexed episode."""
+        if not episode_id:
+            return False
+
+        record = self.get_episode_record(episode_id)
+        if not record:
+            logger.warning("Episode %s not found in episodic store to update reflection.", episode_id)
+            return False
+
+        # Normalize reflection
+        if isinstance(reflection, EpisodeReflection):
+            rec_reflection = reflection
+        elif hasattr(reflection, "summary"):
+            rec_reflection = EpisodeReflection(
+                summary=reflection.summary or "",
+                pitfalls_avoided=getattr(reflection, "pitfalls_avoided", "") or "",
+                lessons_learned=getattr(reflection, "lessons_learned", "") or "",
+                goal_fulfilled=getattr(reflection, "goal_fulfilled", goal_fulfilled),
+                recommended_rules=getattr(reflection, "recommended_rules", []) or [],
+            )
+        elif isinstance(reflection, dict):
+            rec_reflection = EpisodeReflection(**reflection)
+        else:
+            rec_reflection = EpisodeReflection()
+
+        record.reflection = rec_reflection
+
+        # Resolve goal fulfillment
+        resolved_goal_fulfilled = goal_fulfilled
+        if resolved_goal_fulfilled is None and hasattr(rec_reflection, "goal_fulfilled"):
+            resolved_goal_fulfilled = rec_reflection.goal_fulfilled
+
+        if resolved_goal_fulfilled is False and record.metadata.outcome == "success":
+            record.metadata.outcome = "failed_unverified"
+
+        # Resolve critic score
+        if critic_score is not None:
+            record.metadata.critic_score = max(0.0, min(1.0, float(critic_score)))
+        elif hasattr(reflection, "critic_score") and getattr(reflection, "critic_score") is not None:
+            record.metadata.critic_score = max(0.0, min(1.0, float(reflection.critic_score)))
+
+        return self.index_episode(record, overwrite=True)
+
     def delete_episode(self, episode_id: str) -> bool:
-        """Delete an episode from both relational and vector virtual tables."""
+        """Delete an episode from relational, vector, and graph tables."""
         with self._lock:
+            self._conn.execute("PRAGMA foreign_keys = ON;")
             cur = self._conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,))
             if self._has_sqlite_vec:
                 try:
@@ -756,6 +900,35 @@ class EpisodicStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def backfill_entities(self) -> int:
+        """Scan all episodes in the database and link any unlinked entities into the graph store."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT e.episode_id, e.full_record_json, e.timestamp
+                FROM episodes e
+                LEFT JOIN episode_entities ee ON e.episode_id = ee.episode_id
+                WHERE ee.episode_id IS NULL AND e.full_record_json IS NOT NULL
+                """
+            )
+            rows = cursor.fetchall()
+
+        backfilled = 0
+        for r in rows:
+            ep_id = r[0]
+            record_json = r[1]
+            ts = r[2] or ""
+            try:
+                rec = EpisodeRecord(**json.loads(record_json))
+                entities = self.entity_extractor.extract_from_episode(rec)
+                if entities and hasattr(self, "graph_store"):
+                    self.graph_store.link_episode_entities(ep_id, entities, timestamp=ts)
+                    backfilled += 1
+            except Exception as e:
+                logger.warning("Failed to backfill entities for episode %s: %s", ep_id, e)
+
+        return backfilled
+
     def count(self) -> int:
         """Return total number of indexed episodes in the store."""
         with self._lock:
@@ -763,9 +936,12 @@ class EpisodicStore:
             return row[0] if row else 0
 
     def clear(self) -> None:
-        """Purge all episodes from the vector database."""
+        """Purge all episodes from the vector database and graph store."""
         with self._lock:
+            self._conn.execute("PRAGMA foreign_keys = ON;")
             self._conn.execute("DELETE FROM episodes")
+            self._conn.execute("DELETE FROM entities")
+            self._conn.execute("DELETE FROM entity_cooccurrences")
             if self._has_sqlite_vec:
                 try:
                     self._conn.execute("DELETE FROM vec_episodes")

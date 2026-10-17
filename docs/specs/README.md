@@ -8,8 +8,8 @@ This directory contains the detailed engineering specifications for completing t
 
 | Document | Title | Component Target | Core Focus |
 |---|---|---|---|
-| [`SPEC_EPISODIC_REFLECTOR.md`](SPEC_EPISODIC_REFLECTOR.md) | **Autonomous Post-Task Reflector & Critic** | `eidos/memory/reflector.py` | Asynchronous evaluation pass to extract nuanced lessons, detect hallucinated successes, and calibrate critic scores. |
-| [`SPEC_EPISODIC_ENTITY_GRAPH.md`](SPEC_EPISODIC_ENTITY_GRAPH.md) | **Entity Linking & Relational Knowledge Graph** | `eidos/memory/graph_store.py`, `eidos/memory/entity_extractor.py` | Deterministic entity extraction (paths, binaries, projects, devices) and embedded SQLite graph linking for hybrid Graph-Augmented Retrieval. |
+| [`SPEC_EPISODIC_REFLECTOR.md`](SPEC_EPISODIC_REFLECTOR.md) ([Plan](PLAN_EPISODIC_REFLECTOR.md)) | **Autonomous Post-Task Reflector & Critic** | `eidos/memory/reflector.py` | Asynchronous evaluation pass to extract nuanced lessons, detect hallucinated successes, and calibrate critic scores. |
+| [`SPEC_EPISODIC_ENTITY_GRAPH.md`](SPEC_EPISODIC_ENTITY_GRAPH.md) ([Plan](PLAN_EPISODIC_ENTITY_GRAPH.md)) | **Entity Linking & Relational Knowledge Graph** | `eidos/memory/graph_store.py`, `eidos/memory/entity_extractor.py` | Deterministic entity extraction (paths, binaries, projects, devices) and embedded SQLite graph linking for hybrid Graph-Augmented Retrieval. |
 | [`SPEC_EPISODIC_CONSOLIDATION.md`](SPEC_EPISODIC_CONSOLIDATION.md) | **Sleep-Time Consolidation, Generalization & Pruning** | `eidos/memory/consolidator.py` | Off-peak clustering of repetitive tasks into canonical golden recipes, deduplication, and habit promotion to Tier B profile rules and skills. |
 | [`SPEC_EPISODIC_DYNAMIC_SCOPING.md`](SPEC_EPISODIC_DYNAMIC_SCOPING.md) | **Dynamic Task Scoping & Multi-Source Fusion** | `eidos/memory/scope_resolver.py` | Environmental context awareness (project boundaries, active skill, window class) and calibrated re-ranking across episodic, note, and chat stores. |
 

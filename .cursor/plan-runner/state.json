@@ -1,0 +1,14 @@
+{
+  "plan_path": "docs/plans/PLAN_EPISODIC_ENTITY_GRAPH.md",
+  "status": "complete",
+  "current_phase": 6,
+  "total_phases": 6,
+  "phase_labels": [
+    "Phase 1: Data Contracts & Entity Taxonomy (`eidos/memory/types.py`)",
+    "Phase 2: Deterministic Entity Extractor (`eidos/memory/entity_extractor.py`)",
+    "Phase 3: Relational SQLite Graph Store (`eidos/memory/graph_store.py`)",
+    "Phase 4: Hybrid Graph-Augmented Retrieval (`eidos/memory/episodic_store.py`)",
+    "Phase 5: Query Enhancement in Recall Stream (`eidos/memory/recall_stream.py`)",
+    "Phase 6: Verification & Test Suite (`tests/test_entity_graph.py`)"
+  ]
+}

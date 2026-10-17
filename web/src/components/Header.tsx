@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { AgentState } from '../types/gateway';
+import { AgentState, BackgroundActivity } from '../types/gateway';
 import { NotificationPermissionState } from '../hooks/useBackgroundKeepAlive';
 import {
   Bot,
@@ -22,6 +22,7 @@ interface HeaderProps {
   state: AgentState;
   stateDetails: string;
   isKilled: boolean;
+  backgroundWork?: BackgroundActivity;
   token: string;
   conversationTitle?: string;
   isSyncing?: boolean;
@@ -40,6 +41,7 @@ export const Header: React.FC<HeaderProps> = ({
   state,
   stateDetails,
   isKilled,
+  backgroundWork,
   token,
   conversationTitle = 'New Chat',
   isSyncing = false,
@@ -103,6 +105,19 @@ export const Header: React.FC<HeaderProps> = ({
                 <span className={`w-1.5 h-1.5 rounded-full ${getStatusColor()}`} />
                 <span className="text-[#f8f8f2]">{getStatusLabel()}</span>
               </div>
+              {backgroundWork?.active && (
+                <div
+                  className="flex items-center gap-1 bg-[#bd93f9]/20 border border-[#bd93f9]/50 text-[#bd93f9] px-2 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0 animate-pulse"
+                  title={
+                    backgroundWork.details
+                      ? `${backgroundWork.task}: ${backgroundWork.details}`
+                      : `Working in background: ${backgroundWork.task || 'Active'}`
+                  }
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#bd93f9] animate-ping" />
+                  <span>⚡ {backgroundWork.task || 'Background Task'}</span>
+                </div>
+              )}
             </div>
 
             {/* Conversation Topic / Status Details */}
@@ -119,6 +134,9 @@ export const Header: React.FC<HeaderProps> = ({
                 <span className="text-[#bd93f9] font-medium truncate max-w-[140px] sm:max-w-[200px]">
                   {conversationTitle}
                 </span>
+              )}
+              {backgroundWork?.active && backgroundWork.details && (
+                <span className="text-[#bd93f9] truncate hidden sm:inline">• ⚡ {backgroundWork.details}</span>
               )}
               {stateDetails && (
                 <span className="text-[#6272a4] truncate hidden sm:inline">• {stateDetails}</span>

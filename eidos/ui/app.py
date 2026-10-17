@@ -584,6 +584,10 @@ class UIController(QObject):
                 self.pill.signal_set_status.emit("thinking", f"Task: {goal}")
 
         agent_loop.register_callback("on_task_start", _on_remote_task_start)
+        agent_loop.register_callback(
+            "on_background_activity",
+            lambda active, task, details: self.pill.signal_set_background_activity.emit(active, task, details),
+        )
 
         # Restore persistent conversation into chat UI on startup
         if getattr(agent_loop, "conversation_store", None) and getattr(agent_loop, "active_conversation_id", None):

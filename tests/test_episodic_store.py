@@ -16,6 +16,7 @@ from eidos.memory.types import (
     EpisodeMetadata,
     EpisodeRecord,
     EpisodeReflection,
+    ReflectionEvaluation,
     StepRecord,
     UserProfile,
 )
@@ -400,3 +401,59 @@ def test_sync_from_trajectory_file_reindex():
         assert store.count() == 1
 
         store.close()
+
+
+def test_update_episode_reflection():
+    """Verify update_episode_reflection updates relational and vector storage."""
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "test_update_refl.db"
+        store = EpisodicStore(db_path=db_path)
+
+        rec = _sample_success_episode("ep_refl_test")
+        store.index_episode(rec)
+        assert store.count() == 1
+
+        # Non-existent episode returns False
+        assert store.update_episode_reflection("non_existent", EpisodeReflection(summary="none"), 0.5) is False
+
+        # Update with EpisodeReflection and score
+        new_refl = EpisodeReflection(
+            summary="Updated resolution summary",
+            pitfalls_avoided="Avoided direct moving",
+            lessons_learned="Always verify destination path",
+            goal_fulfilled=True,
+        )
+        assert store.update_episode_reflection(rec.episode_id, new_refl, critic_score=0.92) is True
+
+        updated_rec = store.get_episode_record(rec.episode_id)
+        assert updated_rec is not None
+        assert updated_rec.metadata.critic_score == 0.92
+        assert updated_rec.reflection.summary == "Updated resolution summary"
+        assert updated_rec.reflection.lessons_learned == "Always verify destination path"
+
+        # Search reflects updated summary and critic_score
+        results = store.search("screenshots", top_k=1)
+        assert len(results) == 1
+        assert results[0].summary == "Updated resolution summary"
+        assert results[0].critic_score == 0.92
+
+        # Update with ReflectionEvaluation where goal_fulfilled is False
+        eval_refl = ReflectionEvaluation(
+            goal_fulfilled=False,
+            critic_score=0.25,
+            summary="Command failed to create files",
+            pitfalls_avoided="Did not check exit code",
+            lessons_learned="Verify output before claiming success",
+            recommended_rules=["Confirm file creation with ls"],
+        )
+        assert store.update_episode_reflection(rec.episode_id, eval_refl) is True
+
+        unverified_rec = store.get_episode_record(rec.episode_id)
+        assert unverified_rec is not None
+        assert unverified_rec.metadata.outcome == "failed_unverified"
+        assert unverified_rec.metadata.critic_score == 0.25
+        assert unverified_rec.reflection.summary == "Command failed to create files"
+        assert unverified_rec.reflection.recommended_rules == ["Confirm file creation with ls"]
+
+        store.close()
+

@@ -469,6 +469,9 @@ class RemoteGatewayServer:
         # Track agent state
         self.current_state = "idle"
         self.current_task = ""
+        self.background_active = False
+        self.background_task = ""
+        self.background_details = ""
 
     def _verify_auth(self, request: web.Request) -> bool:
         """Validate Bearer token or URL token query parameter."""
@@ -610,6 +613,9 @@ class RemoteGatewayServer:
             "task": self.current_task,
             "killed": is_killed,
             "pending_confirmations": len(self._pending_confirmations),
+            "background_active": self.background_active,
+            "background_task": self.background_task,
+            "background_details": self.background_details,
         })
 
     @staticmethod
@@ -1880,6 +1886,20 @@ class RemoteGatewayServer:
             "files": self._shared_files_for(cid or conv_id),
         })
 
+    def _on_agent_background_activity(self, active: bool, task: str = "", details: str = ""):
+        self.background_active = bool(active)
+        self.background_task = task if active else ""
+        self.background_details = details if active else ""
+        self.broadcast_event("background_activity", {
+            "active": self.background_active,
+            "task": self.background_task,
+            "details": self.background_details,
+        })
+        if active:
+            self.broadcast_event("log", {"message": f"Background activity started: {task}"})
+        else:
+            self.broadcast_event("log", {"message": f"Background activity finished: {task}"})
+
     # =========================================================================
     # WebSocket Event Stream & Bidirectional Dispatch
     # =========================================================================
@@ -2209,6 +2229,7 @@ class RemoteGatewayServer:
                 self.agent_loop.register_callback("on_task_finish", self._on_agent_task_finish)
                 self.agent_loop.register_callback("on_conversation_title_changed", self._on_conversation_title_changed)
                 self.agent_loop.register_callback("on_conversation_changed", self._on_conversation_changed)
+                self.agent_loop.register_callback("on_background_activity", self._on_agent_background_activity)
             except Exception as e:
                 logger.debug("Could not register all agent callbacks: %s", e)
 

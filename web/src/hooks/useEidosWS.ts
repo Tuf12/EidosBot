@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AgentState, ChatAction, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
+import { AgentState, BackgroundActivity, ChatAction, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
 
 /** Turn gateway tool events into the action chips shown on an assistant message. */
 function normalizeActions(raw: any): ChatAction[] {
@@ -190,6 +190,11 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
+  const [backgroundWork, setBackgroundWork] = useState<BackgroundActivity>({
+    active: false,
+    task: '',
+    details: '',
+  });
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
@@ -318,6 +323,13 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
           if (data.state) setAgentState(data.state);
           if (data.task !== undefined) setStateDetails(data.task);
           if (data.killed !== undefined) setIsKilled(data.killed);
+          if (data.background_active !== undefined) {
+            setBackgroundWork({
+              active: Boolean(data.background_active),
+              task: data.background_task || '',
+              details: data.background_details || '',
+            });
+          }
         }
       }
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -661,6 +673,23 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
                 }
               );
             }
+          } else if (ev === 'background_activity') {
+            const active = Boolean(data.active);
+            const task = data.task || '';
+            const details = data.details || '';
+            setBackgroundWork({ active, task, details });
+            if (active) {
+              addLog(`Background activity: ${task}${details ? ` - ${details}` : ''}`);
+              if (optionsRef.current?.onSendNotification) {
+                optionsRef.current.onSendNotification('EidosBot: Background Task Active', {
+                  body: details ? `${task}: ${details}` : `EidosBot is working in the background on ${task}`,
+                  tag: 'eidos-background-task',
+                  data: { url: '/' },
+                });
+              }
+            } else {
+              addLog(`Background activity completed: ${task}`);
+            }
           } else if (ev === 'edit_retry_failed') {
             setRetryNotice(data.error || data.message || 'Could not retry that message.');
           } else if (ev === 'error') {
@@ -890,6 +919,7 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
     agentState,
     stateDetails,
     isKilled,
+    backgroundWork,
     confirmations,
     messages,
     sharedFiles,

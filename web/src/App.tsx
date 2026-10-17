@@ -32,6 +32,7 @@ export function App() {
     agentState,
     stateDetails,
     isKilled,
+    backgroundWork,
     confirmations,
     messages,
     sharedFiles,
@@ -158,6 +159,7 @@ export function App() {
         state={agentState}
         stateDetails={stateDetails}
         isKilled={isKilled}
+        backgroundWork={backgroundWork}
         token={token}
         conversationTitle={conversationTitle}
         isSyncing={isSyncing}

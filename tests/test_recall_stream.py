@@ -630,4 +630,42 @@ def test_execute_chat_with_optimalx_recall_streaming():
     assert "configure Kokoro with bm_george voice" in response.content
 
 
+def test_recall_stream_with_entity_graph_prefixes_and_formatting():
+    """Verify RecallStreamInterceptor lookup_memory and formatting handle entity prefix queries and matched_entities."""
+    mock_store = MagicMock()
+    mock_result = EpisodicSearchResult(
+        episode_id="ep_xrandr_001",
+        task_goal="Set display resolution with xrandr on HDMI-0",
+        outcome="success",
+        similarity=0.92,
+        summary="Adjusted xrandr mode for HDMI-0",
+        key_actions=["execute_shell(xrandr --output HDMI-0 --mode 1920x1080)"],
+        matched_entities=["cmd:xrandr", "device:hdmi-0"],
+    )
+    mock_store.search.return_value = [mock_result]
+
+    interceptor = RecallStreamInterceptor(episodic_store=mock_store)
+
+    # Test query extraction and sanitization
+    extracted = interceptor.extract_recall_query('Thinking... <recall>`cmd:xrandr display`</recall>')
+    assert extracted == "cmd:xrandr display"
+
+    # Test lookup memory passes sanitized query to episodic_store.search
+    res = interceptor.lookup_memory('"cmd:xrandr display"')
+    assert res is not None
+    assert res.episode_id == "ep_xrandr_001"
+    mock_store.search.assert_called_with(
+        query="cmd:xrandr display",
+        top_k=1,
+        min_similarity=interceptor.min_similarity,
+    )
+
+    # Test format_recalled_memory includes matched entities
+    formatted = interceptor.format_recalled_memory(res, query="cmd:xrandr display")
+    assert '<recalled_memory episode="ep_xrandr_001">' in formatted
+    assert "- Matched Entities: cmd:xrandr, device:hdmi-0" in formatted
+    assert "- Past Task: Set display resolution" in formatted
+
+
+
 

@@ -163,6 +163,88 @@ class TrajectoryLogger:
 
         return records
 
+    def get_episode_by_id(self, episode_id: str) -> Optional[EpisodeRecord]:
+        """Fetch a specific completed episode from disk by its episode_id."""
+        if not self.path.exists() or not episode_id:
+            return None
+
+        try:
+            with self._lock:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+
+            for line in reversed(lines):
+                if episode_id not in line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    if data.get("episode_id") == episode_id:
+                        return EpisodeRecord(**data)
+                except Exception as parse_err:
+                    logger.warning("Could not parse trajectory line while searching for %s: %s", episode_id, parse_err)
+        except Exception as e:
+            logger.error("Failed to read episode %s from %s: %s", episode_id, self.path, e)
+
+        return None
+
+    def update_episode(self, record: EpisodeRecord) -> bool:
+        """Thread-safe in-place update of an existing episode record in JSONL file."""
+        if not self.path.exists() or not record or not record.episode_id:
+            return False
+
+        tmp_path = None
+        try:
+            self._ensure_storage()
+            target_id = record.episode_id
+            updated_line = record.model_dump_json()
+            found = False
+
+            with self._lock:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+
+                new_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    if not found and target_id in stripped:
+                        try:
+                            data = json.loads(stripped)
+                            if data.get("episode_id") == target_id:
+                                new_lines.append(updated_line + "\n")
+                                found = True
+                                continue
+                        except Exception:
+                            pass
+                    new_lines.append(stripped + "\n")
+
+                if not found:
+                    logger.warning("Episode %s not found in %s to update.", target_id, self.path)
+                    return False
+
+                tmp_path = self.path.with_name(f"{self.path.name}.tmp.{os.getpid()}")
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f_tmp:
+                        f_tmp.writelines(new_lines)
+                    tmp_path.replace(self.path)
+                finally:
+                    if tmp_path and tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except Exception:
+                            pass
+
+            logger.info(
+                "Updated episode %s in trajectory storage %s",
+                record.episode_id,
+                self.path,
+            )
+            return True
+        except Exception as e:
+            logger.error("Failed to update episode %s in trajectory storage: %s", record.episode_id, e)
+            return False
+
     def count_episodes(self) -> int:
         """Count total completed episodes saved in storage."""
         if not self.path.exists():

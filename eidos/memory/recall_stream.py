@@ -45,10 +45,19 @@ class RecallStreamInterceptor:
         self.min_similarity = min_similarity
 
     def lookup_memory(self, query: str) -> Optional[EpisodicSearchResult]:
-        """Perform semantic search against episodic vector database for query."""
+        """Perform semantic search against episodic vector database for query.
+
+        Supports explicit entity prefixes (e.g., ``cmd:xrandr display brightness``,
+        ``project:OptimalX audio``, ``device:HDMI-0``, ``path:/etc/pulse``) which are
+        leveraged by Hybrid Graph-Augmented Retrieval (GAR) to boost relevance.
+        """
         if not self.episodic_store:
             return None
         cleaned_query = query.strip()
+        if (cleaned_query.startswith("`") and cleaned_query.endswith("`")) or (
+            cleaned_query.startswith('"') and cleaned_query.endswith('"')
+        ):
+            cleaned_query = cleaned_query[1:-1].strip()
         if not cleaned_query:
             return None
         try:
@@ -108,6 +117,8 @@ class RecallStreamInterceptor:
             if result.key_actions:
                 actions_str = " -> ".join(result.key_actions)
                 lines.append(f"- Proven Tool Pattern: {actions_str}")
+            if getattr(result, "matched_entities", None):
+                lines.append(f"- Matched Entities: {', '.join(result.matched_entities)}")
             lines.append("</recalled_memory>")
             parts.append("\n".join(lines))
 
@@ -131,7 +142,10 @@ class RecallStreamInterceptor:
         """Extract the query string from the first complete `<recall>...</recall>` block."""
         match = RECALL_TAG_PATTERN.search(text)
         if match:
-            return match.group(1).strip()
+            raw = match.group(1).strip()
+            if (raw.startswith("`") and raw.endswith("`")) or (raw.startswith('"') and raw.endswith('"')):
+                raw = raw[1:-1].strip()
+            return raw
         return None
 
     def execute_chat_with_recall(
