@@ -43,6 +43,7 @@ class EpisodicStore:
         base_url: str = "http://localhost:11434",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         dimension: int = DEFAULT_EMBEDDING_DIM,
+        embedding_num_gpu: Optional[int] = 0,
     ):
         self.db_path = Path(os.path.expanduser(str(db_path or DEFAULT_EPISODIC_DB_PATH)))
         self.dimension = dimension
@@ -58,6 +59,7 @@ class EpisodicStore:
                 model=embedding_model,
                 dimension=dimension,
                 fallback_to_dummy=True,
+                num_gpu=embedding_num_gpu,
             )
 
         self._ensure_storage()

@@ -13,6 +13,7 @@ models:
     vision_model: "batiai/gemma4-12b:q6"      # Loaded only when the reasoning model has no vision capability
     chat_model: "gpt-oss:20b"
     timeout_seconds: 120
+    num_ctx: 65536                  # Ollama context ceiling (64k); omit only to use the model default
 
   cloud:
     provider: "chutes"
@@ -90,6 +91,7 @@ memory:
   vector_store_path: "~/.eidos/memory/vector_store/episodic.db"  # Tier A local sqlite-vec store
   conversations_db_path: "~/.eidos/eidos.db"                     # Persistent SQLite chat conversations & message history
   embedding_model: "nomic-embed-text:latest"                     # 768-dim local embeddings on Ollama
+  embedding_num_gpu: 0                                           # Keep embedder on CPU; LLM keeps the GPU
   confirm_profile_writes: true   # HUD confirmation before agent saves profile facts
   reflector:
     enabled: true                # Autonomous post-task critique and calibrated critic scoring

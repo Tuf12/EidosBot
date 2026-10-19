@@ -19,8 +19,10 @@ const SEEK_SEC = 5;
 
 function cleanSpeechText(text: string): string {
   return text
-    .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
+    .replace(/<(?:thought|thinking)>[\s\S]*?<\/(?:thought|thinking)>/gi, '')
     .replace(/<recall>[\s\S]*?<\/recall>/gi, '')
+    .replace(/<(?:thought|thinking)>[\s\S]*$/gi, '')
+    .replace(/<recall>[\s\S]*$/gi, '')
     .replace(/<[^>]+>/g, ' ')
     .replace(/```[\s\S]*?```/g, ' Code snippet omitted. ')
     .replace(/`([^`]+)`/g, '$1')

@@ -158,6 +158,7 @@ class RecallStreamInterceptor:
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
         on_response: Optional[Callable[[Any], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        request_options: Optional[Dict[str, Any]] = None,
     ) -> ModelResponse:
         """Stream chat completion, intercepting `<recall>` tags and splicing memories until complete."""
         current_messages = list(messages)
@@ -168,10 +169,17 @@ class RecallStreamInterceptor:
         raw_final_data: Dict[str, Any] = {}
 
         while recall_count < self.max_recalls_per_turn:
+            options = {
+                "repeat_penalty": 1.15,
+                "temperature": 0.7,
+            }
+            if request_options:
+                options.update(request_options)
             payload: Dict[str, Any] = {
                 "model": model_name,
                 "messages": current_messages,
                 "stream": True,
+                "options": options,
             }
             if tools:
                 payload["tools"] = tools
@@ -321,6 +329,11 @@ class RecallStreamInterceptor:
             total_content = re.sub(
                 r"<(?:thought|thinking)>.*?</(?:thought|thinking)>", "", total_content, flags=re.DOTALL
             ).strip()
+        elif "<thought>" in total_content or "<thinking>" in total_content:
+            unclosed_match = re.search(r"<(?:thought|thinking)>(.*)", total_content, re.DOTALL)
+            if unclosed_match:
+                total_thinking = (total_thinking + "\n" + unclosed_match.group(1).strip()).strip()
+                total_content = re.sub(r"<(?:thought|thinking)>.*", "", total_content, flags=re.DOTALL).strip()
 
         return ModelResponse(
             content=total_content,
@@ -536,6 +549,11 @@ class RecallStreamInterceptor:
             total_content = re.sub(
                 r"<(?:thought|thinking)>.*?</(?:thought|thinking)>", "", total_content, flags=re.DOTALL
             ).strip()
+        elif "<thought>" in total_content or "<thinking>" in total_content:
+            unclosed_match = re.search(r"<(?:thought|thinking)>(.*)", total_content, re.DOTALL)
+            if unclosed_match:
+                total_thinking = (total_thinking + "\n" + unclosed_match.group(1).strip()).strip()
+                total_content = re.sub(r"<(?:thought|thinking)>.*", "", total_content, flags=re.DOTALL).strip()
 
         return ModelResponse(
             content=total_content,

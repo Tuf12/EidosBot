@@ -85,8 +85,8 @@ function parseEmbeddedThoughts(
   let clean = content || '';
   const extracted: string[] = [...existingThoughts];
 
-  // Extract <thought>...</thought>
-  clean = clean.replace(/<thought>([\s\S]*?)<\/thought>/gi, (_, thoughtText) => {
+  // Extract <thought>...</thought> or <thinking>...</thinking>
+  clean = clean.replace(/<(?:thought|thinking)>([\s\S]*?)<\/(?:thought|thinking)>/gi, (_, thoughtText) => {
     if (thoughtText.trim()) extracted.push(thoughtText.trim());
     return '';
   });
@@ -94,6 +94,12 @@ function parseEmbeddedThoughts(
   // Extract <recall>...</recall>
   clean = clean.replace(/<recall>([\s\S]*?)<\/recall>/gi, (_, recallText) => {
     if (recallText.trim()) extracted.push(`[Memory Recall] ${recallText.trim()}`);
+    return '';
+  });
+
+  // Extract unclosed <thought>... to end of string if generation cut off
+  clean = clean.replace(/<(?:thought|thinking)>([\s\S]*)$/gi, (_, thoughtText) => {
+    if (thoughtText.trim()) extracted.push(thoughtText.trim());
     return '';
   });
 

@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import requests
 
 logger = logging.getLogger(__name__)
@@ -21,12 +21,19 @@ class OllamaEmbeddingClient:
         dimension: int = DEFAULT_EMBEDDING_DIM,
         timeout: float = 15.0,
         fallback_to_dummy: bool = False,
+        num_gpu: Optional[int] = 0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.dimension = dimension
         self.timeout = timeout
         self.fallback_to_dummy = fallback_to_dummy
+        self.num_gpu = num_gpu
+
+    def _request_options(self) -> Dict[str, Any]:
+        if self.num_gpu is None:
+            return {}
+        return {"num_gpu": self.num_gpu}
 
     def is_available(self) -> bool:
         """Check if Ollama is reachable and has the requested embedding model installed."""
@@ -61,10 +68,13 @@ class OllamaEmbeddingClient:
 
         # 1. Try modern Ollama /api/embed endpoint
         try:
-            payload = {
+            payload: Dict[str, Any] = {
                 "model": self.model,
                 "input": texts,
             }
+            options = self._request_options()
+            if options:
+                payload["options"] = options
             resp = requests.post(
                 f"{self.base_url}/api/embed",
                 json=payload,
@@ -82,9 +92,13 @@ class OllamaEmbeddingClient:
         results: List[List[float]] = []
         try:
             for t in texts:
+                body: Dict[str, Any] = {"model": self.model, "prompt": t}
+                options = self._request_options()
+                if options:
+                    body["options"] = options
                 resp = requests.post(
                     f"{self.base_url}/api/embeddings",
-                    json={"model": self.model, "prompt": t},
+                    json=body,
                     timeout=self.timeout,
                 )
                 if resp.status_code == 200:

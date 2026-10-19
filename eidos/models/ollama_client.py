@@ -10,6 +10,7 @@ import requests
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
 from eidos.models.inflight import InflightRequest
+from eidos.models.ollama_options import chat_generation_options
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class OllamaClient(BaseModelClient):
         vision_model: str = "batiai/gemma4-12b:q6",
         chat_model: str = "gpt-oss:20b",
         timeout: float = 120.0,
+        num_ctx: Optional[int] = None,
         recall_interceptor: Optional[Any] = None,
     ):
         self.base_url = base_url.rstrip("/")
@@ -79,6 +81,7 @@ class OllamaClient(BaseModelClient):
         self.vision_model = vision_model
         self.chat_model = chat_model
         self.timeout = timeout
+        self.num_ctx = num_ctx
         self.recall_interceptor = recall_interceptor
         self.on_recall_callback: Optional[Callable[[str, str], None]] = None
         self._inflight = InflightRequest()
@@ -160,6 +163,10 @@ class OllamaClient(BaseModelClient):
             return primary
         return (model_override or self.vision_model or primary).strip()
 
+    def generation_options(self) -> Dict[str, Any]:
+        """Ollama ``options`` for chat (shared by streaming recall and direct chat)."""
+        return chat_generation_options(self.num_ctx)
+
     def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -190,12 +197,14 @@ class OllamaClient(BaseModelClient):
                 on_recall_callback=self.on_recall_callback,
                 on_response=self._inflight.bind,
                 should_stop=self._inflight.cancelled,
+                request_options=self.generation_options(),
             )
 
         payload = {
             "model": model_name,
             "messages": messages,
-            "stream": False
+            "stream": False,
+            "options": self.generation_options(),
         }
         if tools:
             payload["tools"] = tools
@@ -290,6 +299,11 @@ class OllamaClient(BaseModelClient):
         if thought_match:
             thinking = thought_match.group(1).strip()
             content = re.sub(r"<(?:thought|thinking)>.*?</(?:thought|thinking)>", "", content, flags=re.DOTALL).strip()
+        elif "<thought>" in content or "<thinking>" in content:
+            unclosed_match = re.search(r"<(?:thought|thinking)>(.*)", content, re.DOTALL)
+            if unclosed_match:
+                thinking = (thinking + "\n" + unclosed_match.group(1).strip()).strip()
+                content = re.sub(r"<(?:thought|thinking)>.*", "", content, flags=re.DOTALL).strip()
 
         tool_calls: List[ToolCall] = []
 

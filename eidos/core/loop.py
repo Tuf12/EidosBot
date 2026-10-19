@@ -27,6 +27,7 @@ from eidos.memory.user_store import UserStore
 from eidos.models.base import BaseModelClient, ToolCall
 from eidos.models.chutes_client import ChutesClient
 from eidos.models.ollama_client import OllamaClient
+from eidos.models.ollama_options import embedding_num_gpu, local_num_ctx
 from eidos.models.router import ModelRouter
 from eidos.perception.grounder import VisualGrounder
 from eidos.perception.screen import ScreenCapture
@@ -94,12 +95,14 @@ class AgentLoop:
         )
         base_ollama_url = local_cfg.get("base_url", "http://localhost:11434")
         emb_model = mem_cfg.get("embedding_model", "nomic-embed-text:latest")
+        emb_num_gpu = embedding_num_gpu(mem_cfg)
         vector_db_path = mem_cfg.get("vector_store_path") or mem_cfg.get("episodic_db_path")
         self.episodic_store: Optional[EpisodicStore] = episodic_store or (
             EpisodicStore(
                 db_path=vector_db_path,
                 base_url=base_ollama_url,
                 embedding_model=emb_model,
+                embedding_num_gpu=emb_num_gpu,
             )
             if self.memory_enabled
             else None
@@ -136,6 +139,7 @@ class AgentLoop:
             reasoning_model=local_cfg.get("reasoning_model", "batiai/gemma4-26b:iq4"),
             vision_model=local_cfg.get("vision_model", "batiai/gemma4-12b:q6"),
             timeout=local_cfg.get("timeout_seconds", 60.0),
+            num_ctx=local_num_ctx(local_cfg),
         )
 
         # Active Recall Interceptor (mid-stream <recall> query splicing)
@@ -452,6 +456,7 @@ class AgentLoop:
             self.ollama.base_url = local_cfg.get("base_url", self.ollama.base_url).rstrip("/")
             self.ollama.reasoning_model = local_cfg.get("reasoning_model", self.ollama.reasoning_model)
             self.ollama.vision_model = local_cfg.get("vision_model", self.ollama.vision_model)
+            self.ollama.num_ctx = local_num_ctx(local_cfg)
             self.ollama.clear_vision_capability_cache()
 
         # Update cloud Chutes settings
@@ -519,7 +524,12 @@ class AgentLoop:
                 self.user_store = UserStore(storage_path=mem_cfg["user_profile_file"])
             if "trajectories_file" in mem_cfg:
                 self.trajectory_logger = TrajectoryLogger(storage_path=mem_cfg["trajectories_file"])
-            if "vector_store_path" in mem_cfg or "episodic_db_path" in mem_cfg or "embedding_model" in mem_cfg:
+            if (
+                "vector_store_path" in mem_cfg
+                or "episodic_db_path" in mem_cfg
+                or "embedding_model" in mem_cfg
+                or "embedding_num_gpu" in mem_cfg
+            ):
                 base_ollama_url = self.config.get("models", {}).get("local", {}).get("base_url", "http://localhost:11434")
                 emb_model = mem_cfg.get("embedding_model", "nomic-embed-text:latest")
                 db_p = mem_cfg.get("vector_store_path") or mem_cfg.get("episodic_db_path")
@@ -527,6 +537,7 @@ class AgentLoop:
                     db_path=db_p,
                     base_url=base_ollama_url,
                     embedding_model=emb_model,
+                    embedding_num_gpu=embedding_num_gpu(mem_cfg),
                 )
             if self.recall_interceptor:
                 self.recall_interceptor.episodic_store = self.episodic_store

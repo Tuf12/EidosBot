@@ -188,7 +188,7 @@ sandbox:
 
   # Security & Resource limits
   network_access: true                  # Set to false for strictly offline tasks
-  max_memory_mb: 4096                   # Memory limit via cgroups / ulimit
+  max_memory_mb: 4096                   # Memory limit via cgroups / ulimit 
   max_execution_time_sec: 60.0          # Process timeout
   allow_dev_gpu: true                   # Expose /dev/dri and NVIDIA devices for local compute
 ```
