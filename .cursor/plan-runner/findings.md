@@ -84,6 +84,12 @@ None.
 - **Recall tests are mock-only and narrow:** `test_recall_stream_with_entity_graph_prefixes_and_formatting` asserts `search` is called with a sanitized `cmd:` query and formatting; it does not cover the plan’s `project:OptimalX audio` example, unquoted `<recall>…</recall>` prefix queries, or end-to-end hybrid ranking through the interceptor (Phase 6 / `test_entity_graph.py` covers store search, not recall wiring).
 - **`lookup_optimalx_notes` unchanged:** No matching quote/backtick sanitization if called with a quoted query outside the `extract_recall_query` path (streaming recall uses already-sanitized `query` from extraction, so mid-stream path is fine).
 
+### Resolution (2026-10-19)
+
+- Added shared `sanitize_recall_query()` used by `lookup_memory`, `lookup_optimalx_notes`, and `extract_recall_query`; GAR docstring updated on `lookup_memory`.
+- Plan Phase 5 updated to document sanitization, OptimalX parity, and optional `matched_entities` in `format_recalled_memory`.
+- Tests: `test_sanitize_recall_query`, `project:OptimalX` extract/lookup cases, OptimalX sanitization, `test_execute_chat_recall_with_project_prefix` (real store + interceptor).
+
 ### User checks (deferred)
 
 None.

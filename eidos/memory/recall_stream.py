@@ -16,6 +16,21 @@ logger = logging.getLogger(__name__)
 RECALL_TAG_PATTERN = re.compile(r"<recall>(.*?)</recall>", re.DOTALL | re.IGNORECASE)
 
 
+def sanitize_recall_query(query: str) -> str:
+    """Normalize a recall query string before episodic or OptimalX lookup.
+
+    Strips outer whitespace and optional wrapping quotes (``'``, ``"``) or backticks.
+    Entity prefix tags (``cmd:``, ``project:``, ``path:``, ``device:``, etc.) are left
+    intact for ``EntityExtractor.extract_from_query`` inside ``EpisodicStore.search``.
+    """
+    cleaned = (query or "").strip()
+    if len(cleaned) >= 2:
+        opener, closer = cleaned[0], cleaned[-1]
+        if opener == closer and opener in ("`", '"', "'"):
+            cleaned = cleaned[1:-1].strip()
+    return cleaned
+
+
 def _stop_requested(should_stop: Optional[Callable[[], bool]]) -> bool:
     if should_stop is None:
         return False
@@ -45,19 +60,21 @@ class RecallStreamInterceptor:
         self.min_similarity = min_similarity
 
     def lookup_memory(self, query: str) -> Optional[EpisodicSearchResult]:
-        """Perform semantic search against episodic vector database for query.
+        """Query episodic memory via Hybrid Graph-Augmented Retrieval (GAR).
 
-        Supports explicit entity prefixes (e.g., ``cmd:xrandr display brightness``,
-        ``project:OptimalX audio``, ``device:HDMI-0``, ``path:/etc/pulse``) which are
-        leveraged by Hybrid Graph-Augmented Retrieval (GAR) to boost relevance.
+        Delegates to ``EpisodicStore.search``. When the query contains entity
+        prefixes or inferred entities (e.g. ``cmd:xrandr display brightness``,
+        ``project:OptimalX audio setup``, ``device:HDMI-0``, ``path:/etc/pulse``),
+        results are ranked with blended vector and entity-overlap scores. With no
+        entities detected, behavior matches pure semantic (vector) search.
+
+        Prefix parsing and taxonomy validation happen in
+        ``EntityExtractor.extract_from_query``; this method only sanitizes the
+        query string and forwards it to the store.
         """
         if not self.episodic_store:
             return None
-        cleaned_query = query.strip()
-        if (cleaned_query.startswith("`") and cleaned_query.endswith("`")) or (
-            cleaned_query.startswith('"') and cleaned_query.endswith('"')
-        ):
-            cleaned_query = cleaned_query[1:-1].strip()
+        cleaned_query = sanitize_recall_query(query)
         if not cleaned_query:
             return None
         try:
@@ -75,7 +92,7 @@ class RecallStreamInterceptor:
         """Search personal OptimalX notes and knowledge bases for active recall context."""
         if not self.optimalx:
             return []
-        cleaned_query = query.strip()
+        cleaned_query = sanitize_recall_query(query)
         if not cleaned_query:
             return []
         try:
@@ -90,7 +107,11 @@ class RecallStreamInterceptor:
         query: str,
         optimalx_notes: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
-        """Format matching episodic memory and/or OptimalX notes into XML blocks for mid-stream splicing."""
+        """Format matching episodic memory and/or OptimalX notes into XML blocks for mid-stream splicing.
+
+        When hybrid GAR returns ``matched_entities`` on the search result, they are
+        included so the model can see which graph nodes drove the recall.
+        """
         has_episodic = result is not None
         has_notes = bool(optimalx_notes)
 
@@ -117,7 +138,7 @@ class RecallStreamInterceptor:
             if result.key_actions:
                 actions_str = " -> ".join(result.key_actions)
                 lines.append(f"- Proven Tool Pattern: {actions_str}")
-            if getattr(result, "matched_entities", None):
+            if result.matched_entities:
                 lines.append(f"- Matched Entities: {', '.join(result.matched_entities)}")
             lines.append("</recalled_memory>")
             parts.append("\n".join(lines))
@@ -142,10 +163,7 @@ class RecallStreamInterceptor:
         """Extract the query string from the first complete `<recall>...</recall>` block."""
         match = RECALL_TAG_PATTERN.search(text)
         if match:
-            raw = match.group(1).strip()
-            if (raw.startswith("`") and raw.endswith("`")) or (raw.startswith('"') and raw.endswith('"')):
-                raw = raw[1:-1].strip()
-            return raw
+            return sanitize_recall_query(match.group(1))
         return None
 
     def execute_chat_with_recall(

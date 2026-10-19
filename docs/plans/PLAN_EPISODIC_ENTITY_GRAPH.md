@@ -197,7 +197,9 @@ Implement an embedded, zero-external-daemon **Relational Entity Knowledge Graph*
 
 1. **Active Recall Integration**:
    - Because `lookup_memory(query)` delegates directly to `self.episodic_store.search(cleaned_query)`, it inherits Hybrid GAR automatically.
-   - Update `lookup_memory` documentation and query sanitization to recognize prefix filters (e.g., `<recall>project:OptimalX audio setup</recall>` or `<recall>cmd:xrandr display brightness</recall>`).
+   - Update `lookup_memory` documentation and shared `sanitize_recall_query()` so prefix filters survive sanitization (e.g., `<recall>project:OptimalX audio setup</recall>` or `<recall>cmd:xrandr display brightness</recall>`); entity parsing remains in `EntityExtractor`.
+   - Apply the same sanitization in `lookup_optimalx_notes` and `extract_recall_query`.
+   - When hybrid search populates `EpisodicSearchResult.matched_entities`, `format_recalled_memory` may surface them in the spliced `<recalled_memory>` block.
 
 ---
 

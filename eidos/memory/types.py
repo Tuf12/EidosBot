@@ -174,7 +174,14 @@ class EpisodicSearchResult(BaseModel):
     task_goal: str
     outcome: str = "unknown"
     critic_score: Optional[float] = None
-    similarity: float = 0.0
+    similarity: float = Field(
+        default=0.0,
+        description=(
+            "Ranking score for this hit. Pure vector cosine similarity when the query "
+            "has no extracted entities; otherwise hybrid composite "
+            "(1-λ)·vector + λ·entity_overlap (λ defaults to 0.35 in EpisodicStore.search)."
+        ),
+    )
     summary: str = ""
     pitfalls_avoided: str = ""
     lessons_learned: str = ""

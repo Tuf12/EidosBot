@@ -143,6 +143,8 @@ COMMON_SYSTEM_COMMANDS: Set[str] = {
     "uname",
     "ip",
     "nmcli",
+    "nvidia-settings",
+    "nvidia-smi",
     "ruff",
     "mypy",
     "black",
@@ -168,14 +170,63 @@ COMMON_SYSTEM_COMMANDS: Set[str] = {
     "bluetoothctl",
 }
 
+# Conversational tokens to skip when inferring CLI commands from recall queries
+QUERY_STOPWORDS: Set[str] = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "brightness",
+    "by",
+    "can",
+    "configure",
+    "display",
+    "do",
+    "does",
+    "for",
+    "from",
+    "get",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "lower",
+    "my",
+    "of",
+    "on",
+    "or",
+    "our",
+    "set",
+    "the",
+    "to",
+    "use",
+    "using",
+    "volume",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+    "your",
+}
+
 # Regex patterns for paths, hardware devices, projects, and domains
+# Phase 2 plan: HDMI/DP/eDP/VGA-[0-9]+, alsa_output.*, bluez_sink.*
 DEVICE_PATTERN = re.compile(
-    r"\b((?:HDMI|DP|eDP|VGA|DVI)-[0-9]+|(?:alsa_output|alsa_input|bluez_sink|bluez_source)\.[a-zA-Z0-9_\-\.]+)\b",
+    r"\b((?:HDMI|DP|eDP|VGA)-[0-9]+|alsa_output\.[a-zA-Z0-9_\-\.]+|bluez_sink\.[a-zA-Z0-9_\-\.]+)\b",
     re.IGNORECASE,
 )
 
 ABSOLUTE_PATH_PATTERN = re.compile(
-    r"(?<![:a-zA-Z0-9_\-\./])(/(?:etc|tmp|var|home|usr|opt|dev|proc|sys|root|bin|sbin)\b(?:/[a-zA-Z0-9_\-\.]+)*|/[a-zA-Z0-9_\-\.]+(?:/[a-zA-Z0-9_\-\.]+)+)"
+    r"(?<![a-zA-Z0-9_\-\./])(/[a-zA-Z0-9_\-\./]+)"
 )
 
 TILDE_PATH_PATTERN = re.compile(
@@ -312,6 +363,7 @@ class EntityExtractor:
                     self._extract_devices(comb_snippet, record_entity)
                     self._extract_domains(comb_snippet, record_entity)
                     self._extract_paths(comb_snippet, record_entity)
+                    self._extract_commands_from_observations(comb_snippet, record_entity)
 
         return list(entities_by_id.values())
 
@@ -390,12 +442,10 @@ class EntityExtractor:
         # 2. Extract implicit paths, devices, domains, and known system commands
         self._extract_from_text(stripped_query, record_entity)
 
-        # 3. Check for standalone command tokens in query
-        words = re.findall(r"\b[a-zA-Z0-9_\-]+\b", stripped_query)
-        for w in words:
-            w_lower = w.lower()
-            if w_lower in COMMON_SYSTEM_COMMANDS:
-                record_entity(ENTITY_TYPE_COMMAND, w_lower, role="inferred_command")
+        # 3. Infer commands from conversational text and shell-like query fragments
+        self._infer_query_commands(stripped_query, record_entity)
+        if re.search(r"[|;&`]|&&|\|\|", stripped_query):
+            self._extract_commands_from_shell(stripped_query, record_entity)
 
         return list(entities_by_id.values())
 
@@ -429,12 +479,15 @@ class EntityExtractor:
             # Strip leading environment variable assignments: e.g. FOO=bar BAZ=1 cmd ...
             seg_clean = re.sub(r"^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+)+", "", seg_clean).strip()
 
-            # Handle bash -c '...' or sh -c "..." recursion
-            sh_c_match = re.search(r"\b(?:bash|sh|zsh)\s+-c\s+([\"'])([\s\S]*?)\1", seg_clean)
+            # Handle bash -c '...' / sh -c "..." / zsh -c unquoted (unwrap inner script only)
+            sh_c_match = re.search(
+                r"\b(?:bash|sh|zsh)\s+-c\s+(?:([\"'])([\s\S]*?)\1|(\S+))",
+                seg_clean,
+            )
             if sh_c_match:
-                inner_cmd = sh_c_match.group(2)
-                self._extract_commands_from_shell(inner_cmd, record_entity)
-                # Remove the bash -c '...' portion so outer segment does not record shell binary
+                inner_cmd = sh_c_match.group(2) or sh_c_match.group(3) or ""
+                if inner_cmd.strip():
+                    self._extract_commands_from_shell(inner_cmd, record_entity)
                 seg_clean = (seg_clean[:sh_c_match.start()] + seg_clean[sh_c_match.end():]).strip()
                 if not seg_clean:
                     continue
@@ -509,13 +562,52 @@ class EntityExtractor:
                     break
                 idx += 1
 
+    def _extract_commands_from_observations(self, text: str, record_entity: Any) -> None:
+        """Extract shell commands from tool stdout/stderr lines that look like executable snippets."""
+        if not text:
+            return
+        shell_line = re.compile(
+            r"^(?:\s*(?:sudo|env|nice)\s+)*(?:/usr/bin/|/bin/)?[a-z][a-z0-9._-]*\s+",
+            re.IGNORECASE,
+        )
+        for line in text.splitlines()[:100]:
+            line_s = line.strip()
+            if not line_s or len(line_s) > 500:
+                continue
+            if re.search(r"[|;&]|&&|\|\|", line_s) or shell_line.match(line_s):
+                self._extract_commands_from_shell(line_s, record_entity)
+
+    def _infer_query_commands(self, text: str, record_entity: Any) -> None:
+        """Infer command entities from allowlist, hyphenated CLIs, and *ctl utilities in queries."""
+        if not text:
+            return
+        for w in re.findall(r"\b[a-zA-Z0-9_\-]+\b", text):
+            w_lower = w.lower()
+            if w_lower in COMMON_SYSTEM_COMMANDS:
+                record_entity(ENTITY_TYPE_COMMAND, w_lower, role="inferred_command")
+                continue
+            if w_lower in QUERY_STOPWORDS or w_lower in SHELL_BUILTINS or w_lower in WRAPPER_COMMANDS:
+                continue
+            if re.match(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$", w_lower):
+                record_entity(ENTITY_TYPE_COMMAND, w_lower, role="inferred_command")
+                continue
+            if re.match(r"^[a-z]{2,}[a-z0-9_-]*ctl$", w_lower):
+                record_entity(ENTITY_TYPE_COMMAND, w_lower, role="inferred_command")
+
     def _extract_paths(self, text: str, record_entity: Any) -> None:
         """Extract absolute paths, tilde paths, and filenames with extensions."""
         # Absolute paths
         for m in ABSOLUTE_PATH_PATTERN.finditer(text):
             p = m.group(1).rstrip(".,;:)'\"")
-            if p not in ("/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr") and len(p) > 2:
-                record_entity(ENTITY_TYPE_PATH, p, role="referenced_path")
+            if p in ("/dev/null", "/dev/zero", "/dev/stdin", "/dev/stdout", "/dev/stderr"):
+                continue
+            if len(p) < 2:
+                continue
+            # Avoid capturing URL path segments (e.g. github.com/foo -> /foo)
+            start = m.start(1)
+            if start >= 2 and text[start - 2 : start] == "://":
+                continue
+            record_entity(ENTITY_TYPE_PATH, p, role="referenced_path")
 
         # Tilde paths
         for m in TILDE_PATH_PATTERN.finditer(text):

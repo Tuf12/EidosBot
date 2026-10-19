@@ -21,6 +21,7 @@ from eidos.memory.embeddings import (
 from eidos.memory.entity_extractor import EntityExtractor
 from eidos.memory.graph_store import GraphStore
 from eidos.memory.types import (
+    EpisodeMetadata,
     EpisodeRecord,
     EpisodeReflection,
     EpisodicSearchResult,
@@ -81,9 +82,7 @@ class EpisodicStore:
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON;")
 
-            # Initialize relational entity knowledge graph store
             self.graph_store = GraphStore(self._conn, self._lock)
-            self.graph_store.init_schema()
 
             # Attempt to load sqlite-vec extension
             try:
@@ -124,6 +123,9 @@ class EpisodicStore:
                 "CREATE INDEX IF NOT EXISTS idx_episodes_outcome ON episodes(outcome);"
             )
 
+            self._ensure_episode_schema_migrations()
+            self.graph_store.init_schema()
+
             # If sqlite-vec is available, create virtual vector table vec0
             if self._has_sqlite_vec:
                 try:
@@ -140,6 +142,42 @@ class EpisodicStore:
                     self._has_sqlite_vec = False
 
             self._conn.commit()
+
+    def _ensure_episode_schema_migrations(self) -> None:
+        """Apply lightweight episodic-store schema migrations for existing databases."""
+        try:
+            cols = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(episodes)").fetchall()
+            }
+            if "entity_link_attempted" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN entity_link_attempted INTEGER DEFAULT 0"
+                )
+        except Exception as e:
+            logger.warning("Episode schema migration skipped: %s", e)
+
+    def _set_entity_link_attempted(self, episode_id: str) -> None:
+        """Mark that entity extraction/linking was attempted for this episode."""
+        try:
+            self._conn.execute(
+                "UPDATE episodes SET entity_link_attempted = 1 WHERE episode_id = ?",
+                (episode_id,),
+            )
+            self._conn.commit()
+        except Exception as e:
+            logger.warning(
+                "Failed to mark entity_link_attempted for episode %s: %s", episode_id, e
+            )
+
+    def _link_episode_entities_from_record(self, record: EpisodeRecord) -> None:
+        """Extract entities from a record and sync graph links for the episode."""
+        entities = self.entity_extractor.extract_from_episode(record)
+        if entities:
+            self.graph_store.link_episode_entities(
+                record.episode_id, entities, timestamp=record.timestamp
+            )
+        else:
+            self.graph_store.delete_episode_links(record.episode_id)
 
     @property
     def has_sqlite_vec(self) -> bool:
@@ -437,15 +475,12 @@ class EpisodicStore:
                     "Indexed episode %s (outcome=%s) in episodic store", record.episode_id, outcome
                 )
 
-                # Link entities in the relational knowledge graph
                 try:
-                    entities = self.entity_extractor.extract_from_episode(record)
-                    if entities and hasattr(self, "graph_store"):
-                        self.graph_store.link_episode_entities(
-                            record.episode_id, entities, timestamp=record.timestamp
-                        )
+                    self._link_episode_entities_from_record(record)
                 except Exception as ge:
                     logger.warning("Failed to link entities for episode %s: %s", record.episode_id, ge)
+                finally:
+                    self._set_entity_link_attempted(record.episode_id)
 
                 return True
             except Exception as e:
@@ -460,7 +495,13 @@ class EpisodicStore:
         min_similarity: float = 0.0,
         entity_weight: float = 0.35,
     ) -> List[EpisodicSearchResult]:
-        """Perform hybrid semantic & graph-augmented search against indexed episodic memories."""
+        """Hybrid semantic and graph-augmented search against indexed episodic memories.
+
+        When the query yields one or more entities, ranking uses composite similarity
+        ``(1 - entity_weight) * vector + entity_weight * graph_overlap`` even if no
+        episodes match on the graph (graph overlap treated as 0). ``EpisodicSearchResult.similarity``
+        reflects that composite score in hybrid mode, otherwise raw vector similarity.
+        """
         cleaned_query = query.strip()
         if not cleaned_query:
             return []
@@ -471,11 +512,17 @@ class EpisodicStore:
             logger.error("Failed to generate query embedding: %s", e)
             return []
 
-        # Extract entities from query for Graph-Augmented Retrieval
         query_entities = self.entity_extractor.extract_from_query(cleaned_query)
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None
-        if query_entities and hasattr(self, "graph_store"):
-            graph_matches = self.graph_store.find_episodes_by_entities(query_entities)
+        if query_entities:
+            graph_scores = self.graph_store.find_episodes_by_entities(query_entities)
+            graph_matches = {
+                ep_id: (
+                    score,
+                    self.graph_store.matched_query_entity_ids(ep_id, query_entities),
+                )
+                for ep_id, score in graph_scores.items()
+            }
 
         if self._has_sqlite_vec:
             return self._search_sqlite_vec(
@@ -578,8 +625,8 @@ class EpisodicStore:
                 else:
                     vec_sim = 0.0
 
-            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches else (0.0, [])
-            if graph_matches:
+            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches is not None else (0.0, [])
+            if graph_matches is not None:
                 composite_sim = (1.0 - entity_weight) * vec_sim + entity_weight * g_score
             else:
                 composite_sim = vec_sim
@@ -650,23 +697,41 @@ class EpisodicStore:
         if q_norm == 0:
             return []
 
+        row_by_id = {r["episode_id"]: r for r in rows}
+        if graph_matches:
+            missing_ids = [ep_id for ep_id in graph_matches if ep_id not in row_by_id]
+            if missing_ids:
+                placeholders = ",".join("?" for _ in missing_ids)
+                with self._lock:
+                    extra_cursor = self._conn.execute(
+                        f"""
+                        SELECT episode_id, task_goal, outcome, critic_score, timestamp,
+                               summary, pitfalls_avoided, lessons_learned, key_actions,
+                               embedding_blob
+                        FROM episodes
+                        WHERE episode_id IN ({placeholders})
+                        """,
+                        missing_ids,
+                    )
+                    for extra in extra_cursor.fetchall():
+                        row_by_id[extra["episode_id"]] = extra
+
         candidates: List[tuple] = []
-        for r in rows:
+        for ep_id, r in row_by_id.items():
             blob = r["embedding_blob"]
-            if not blob:
-                continue
+            if blob and q_norm > 0:
+                vec = np.frombuffer(blob, dtype=np.float32)
+                v_norm = np.linalg.norm(vec)
+                if v_norm == 0:
+                    vec_sim = 0.0
+                else:
+                    cos_sim = float(np.dot(q_vec, vec) / (q_norm * v_norm))
+                    vec_sim = max(0.0, min(1.0, cos_sim))
+            else:
+                vec_sim = 0.0
 
-            vec = np.frombuffer(blob, dtype=np.float32)
-            v_norm = np.linalg.norm(vec)
-            if v_norm == 0:
-                continue
-
-            cos_sim = float(np.dot(q_vec, vec) / (q_norm * v_norm))
-            vec_sim = max(0.0, min(1.0, cos_sim))
-
-            ep_id = r["episode_id"]
-            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches else (0.0, [])
-            if graph_matches:
+            g_score, matched_ents = graph_matches.get(ep_id, (0.0, [])) if graph_matches is not None else (0.0, [])
+            if graph_matches is not None:
                 composite_sim = (1.0 - entity_weight) * vec_sim + entity_weight * g_score
             else:
                 composite_sim = vec_sim
@@ -890,7 +955,7 @@ class EpisodicStore:
         return self.index_episode(record, overwrite=True)
 
     def delete_episode(self, episode_id: str) -> bool:
-        """Delete an episode from relational, vector, and graph tables."""
+        """Delete an episode; episode_entities rows cascade, then prune orphan graph nodes."""
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON;")
             cur = self._conn.execute("DELETE FROM episodes WHERE episode_id = ?", (episode_id,))
@@ -900,17 +965,35 @@ class EpisodicStore:
                 except Exception:
                     pass
             self._conn.commit()
-            return cur.rowcount > 0
+            deleted = cur.rowcount > 0
+        if deleted:
+            try:
+                self.graph_store.prune_orphan_entities()
+            except Exception as e:
+                logger.warning("Graph prune after delete_episode failed: %s", e)
+        return deleted
 
     def backfill_entities(self) -> int:
-        """Scan all episodes in the database and link any unlinked entities into the graph store."""
+        """Link entities for episodes that have not yet had an entity-index pass.
+
+        Uses ``full_record_json`` when present; otherwise builds a minimal ``EpisodeRecord``
+        from stored episode columns (trajectory may be empty). Episodes with zero extracted
+        entities are still marked attempted so backfill does not loop forever.
+        """
         with self._lock:
             cursor = self._conn.execute(
                 """
-                SELECT e.episode_id, e.full_record_json, e.timestamp
-                FROM episodes e
-                LEFT JOIN episode_entities ee ON e.episode_id = ee.episode_id
-                WHERE ee.episode_id IS NULL AND e.full_record_json IS NOT NULL
+                SELECT episode_id, full_record_json, timestamp, task_goal, outcome, critic_score,
+                       COALESCE(entity_link_attempted, 0) AS link_attempted
+                FROM episodes
+                WHERE COALESCE(entity_link_attempted, 0) = 0
+                   OR (
+                        COALESCE(entity_link_attempted, 0) = 1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM episode_entities ee
+                            WHERE ee.episode_id = episodes.episode_id
+                        )
+                   )
                 """
             )
             rows = cursor.fetchall()
@@ -920,12 +1003,29 @@ class EpisodicStore:
             ep_id = r[0]
             record_json = r[1]
             ts = r[2] or ""
+            link_attempted = int(r[6] or 0)
             try:
-                rec = EpisodeRecord(**json.loads(record_json))
+                if record_json:
+                    rec = EpisodeRecord(**json.loads(record_json))
+                else:
+                    rec = EpisodeRecord(
+                        episode_id=ep_id,
+                        task_goal=r[3] or "",
+                        timestamp=ts,
+                        metadata=EpisodeMetadata(
+                            outcome=r[4] or "unknown",
+                            critic_score=r[5],
+                        ),
+                    )
                 entities = self.entity_extractor.extract_from_episode(rec)
-                if entities and hasattr(self, "graph_store"):
-                    self.graph_store.link_episode_entities(ep_id, entities, timestamp=ts)
-                    backfilled += 1
+                if not entities:
+                    if link_attempted == 0:
+                        self.graph_store.delete_episode_links(ep_id)
+                        self._set_entity_link_attempted(ep_id)
+                    continue
+                self._link_episode_entities_from_record(rec)
+                self._set_entity_link_attempted(ep_id)
+                backfilled += 1
             except Exception as e:
                 logger.warning("Failed to backfill entities for episode %s: %s", ep_id, e)
 
@@ -938,7 +1038,7 @@ class EpisodicStore:
             return row[0] if row else 0
 
     def clear(self) -> None:
-        """Purge all episodes from the vector database and graph store."""
+        """Purge episodes, vectors, entity catalog, and co-occurrence edges."""
         with self._lock:
             self._conn.execute("PRAGMA foreign_keys = ON;")
             self._conn.execute("DELETE FROM episodes")
