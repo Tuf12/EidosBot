@@ -5,6 +5,10 @@ This guide provides an end-to-end blueprint for engineering, testing, and rollin
 1. **Kernel-Level Filesystem Sandboxing (`bwrap`)**
 2. **Headless Browser Automation (Playwright / CDP)**
 3. **Skills & Collaborative Batch Job Queue Runner (`SKILL.md` + `queue.json`)**
+
+**Old system (item 3).** The job system this guide builds is the batch queue plus skills.
+
+**Updated job concept.** The steps below still build that queue and those skills. A job, in the current model, is the project in [PROJECT_JOBS.md](PROJECT_JOBS.md). The queue is a component of that project. Outside apps attach as integrations and bring their tools from an MCP server. This guide does not build the MCP client.
 4. **Remote Telegram Gateway (Human-in-the-Loop Approvals & Progress Streaming)**
 
 ---

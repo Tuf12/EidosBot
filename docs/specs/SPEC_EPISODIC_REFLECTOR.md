@@ -25,7 +25,7 @@ Currently in EidosBot, when an agent cycle finishes in `AgentLoop.run_task()`:
 
 ### 1.2. Proposed Solution
 Introduce `EpisodicReflector` (`eidos/memory/reflector.py`), an asynchronous post-task critique and reflection engine:
-- Runs immediately after task completion as a low-priority background worker (or during idle cycles) so it **never delays voice/chat response to the user**.
+- Runs after task completion on a **background queue** so it **never delays voice/chat response**. Local Ollama critique runs only when [`SPEC_COMPUTE_RESOURCE_POLICY.md`](SPEC_COMPUTE_RESOURCE_POLICY.md) allows; otherwise **Chutes** or heuristic fallback.
 - Feeds the user goal, execution trajectory, tool calls, tool observations, and final summary to a specialized evaluation prompt.
 - Produces a structured critique:
   1. **Goal Verification:** Did the actions actually satisfy the true intent of the task?
@@ -197,8 +197,8 @@ class EpisodicReflector:
 ### 5.2. Asynchronous Queue & Resource Isolation
 - **Non-blocking Execution:** The reflector utilizes a bounded `queue.Queue(maxsize=16)` processed by a single background daemon thread.
 - **Resource Protection:** To respect local PC limits (preventing thermal saturation and system slowdown):
-  - Reflection runs with a 500ms sleep delay between tasks.
-  - If a foreground agent task starts, background reflection pauses or yields GPU compute.
+  - Reflection runs with a **500ms** sleep delay after a **local** LLM evaluation.
+  - If foreground is busy or the GPU inference slot is held, reflection uses **Chutes** (`prefer_cloud_when_busy`) or waits; see `SPEC_COMPUTE_RESOURCE_POLICY.md`.
   - If the queue exceeds capacity, older low-priority evaluations drop to heuristic evaluation.
 
 ---

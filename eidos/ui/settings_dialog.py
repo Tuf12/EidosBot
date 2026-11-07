@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QDoubleSpinBox,
     QTabWidget,
@@ -30,6 +31,14 @@ from PyQt6.QtWidgets import (
 from eidos.memory.types import INTERACTION_STYLE_CHOICES
 from eidos.memory.user_store import UserStore
 from eidos.models.chutes_client import ChutesClient
+from eidos.models.meta_client import (
+    DEFAULT_META_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    META_BASE_URL,
+    META_CHAT_MODELS,
+    META_REASONING_EFFORTS,
+    MetaClient,
+)
 from eidos.models.ollama_client import OllamaClient
 from eidos.ui.profile_onboarding_dialog import ProfileOnboardingDialog
 from eidos.voice.tts import KokoroTTS
@@ -58,7 +67,7 @@ class SettingsDialog(QDialog):
     Comprehensive settings configuration window for EidosBot:
     - Provider preference (Local, Auto, Cloud)
     - Ollama models and connection testing
-    - Chutes AI API Key, models, and connection testing
+    - Chutes AI and Meta Muse API keys, models, and connection testing
     - Safety policies and confirmation toggles
     - Display and HUD preferences
     """
@@ -83,6 +92,7 @@ class SettingsDialog(QDialog):
         # Query installed local models asynchronously or on init
         self._refresh_ollama_models(silent=True)
         self._refresh_chutes_models(silent=True)
+        self._refresh_meta_models(silent=True)
 
     def _init_ui(self):
         self.setWindowTitle("EidosBot Settings")
@@ -170,22 +180,40 @@ class SettingsDialog(QDialog):
     # TAB 1: MODELS & CLOUD
     # -------------------------------------------------------------
     def _build_models_tab(self):
-        layout = QVBoxLayout(self.tab_models)
+        outer = QVBoxLayout(self.tab_models)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(inner)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(12)
 
         # Provider Preference
         pref_group = QGroupBox("Execution Mode (Provider Preference)")
-        pref_layout = QHBoxLayout(pref_group)
-        pref_layout.addWidget(QLabel("Default Mode:"))
+        pref_form = QFormLayout(pref_group)
+        pref_form.setSpacing(8)
 
         self.combo_preference = QComboBox()
         self.combo_preference.addItems([
             "local - 100% Local GPU (Ollama, Zero API Cost)",
-            "auto - Smart Escalation (Local-first, Chutes fallback)",
-            "cloud - Force Cloud (Chutes AI Only)"
+            "auto - Smart Escalation (Local-first, cloud fallback)",
+            "cloud - Force Cloud (selected cloud provider)"
         ])
-        pref_layout.addWidget(self.combo_preference, stretch=1)
+        pref_form.addRow("Default Mode:", self.combo_preference)
+
+        self.combo_cloud_provider = QComboBox()
+        self.combo_cloud_provider.addItems([
+            "chutes - Chutes AI",
+            "meta - Meta Muse (Model API)",
+        ])
+        self.combo_cloud_provider.setToolTip(
+            "Cloud mode, auto fallback, and busy-GPU routing call this API."
+        )
+        pref_form.addRow("Cloud Provider:", self.combo_cloud_provider)
         layout.addWidget(pref_group)
 
         # Local Ollama Group
@@ -271,7 +299,67 @@ class SettingsDialog(QDialog):
         cloud_form.addRow("", chutes_btn_box)
 
         layout.addWidget(cloud_group)
+
+        meta_group = QGroupBox("Meta Muse (Model API)")
+        meta_form = QFormLayout(meta_group)
+        meta_form.setSpacing(8)
+
+        meta_key_box = QHBoxLayout()
+        self.edit_meta_key = QLineEdit()
+        self.edit_meta_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_meta_key.setPlaceholderText("Model API key, or leave empty to use MODEL_API_KEY")
+        meta_key_box.addWidget(self.edit_meta_key, stretch=1)
+        self.btn_toggle_meta_key = QPushButton("👁️")
+        self.btn_toggle_meta_key.setToolTip("Show / Hide API Key")
+        self.btn_toggle_meta_key.setStyleSheet(
+            "background-color: #282a36; border: 1px solid #44475a; border-radius: 4px; padding: 5px 8px;"
+        )
+        self.btn_toggle_meta_key.clicked.connect(self._toggle_meta_key_visibility)
+        meta_key_box.addWidget(self.btn_toggle_meta_key)
+        meta_form.addRow("Model API Key:", meta_key_box)
+
+        self.edit_meta_url = QLineEdit(META_BASE_URL)
+        meta_form.addRow("Base URL:", self.edit_meta_url)
+
+        self.combo_meta_reasoning = QComboBox()
+        self.combo_meta_reasoning.setEditable(True)
+        self.combo_meta_reasoning.addItems(META_CHAT_MODELS)
+        self.combo_meta_reasoning.setToolTip(
+            "muse-spark-1.3 is the default for tool use. muse-wonder-1.0 is the stronger, "
+            "more expensive model for long desktop tasks. IDs ending in -contributor are "
+            "cheaper and may be used by Meta to train future models."
+        )
+        meta_form.addRow("Reasoning Model:", self.combo_meta_reasoning)
+
+        self.combo_meta_vision = QComboBox()
+        self.combo_meta_vision.setEditable(True)
+        self.combo_meta_vision.addItems(META_CHAT_MODELS)
+        meta_form.addRow("Vision Model:", self.combo_meta_vision)
+
+        self.combo_meta_effort = QComboBox()
+        self.combo_meta_effort.addItems(META_REASONING_EFFORTS)
+        self.combo_meta_effort.setToolTip(
+            "How long Muse thinks before it answers. high is a solid default. "
+            "max is only available on muse-wonder-1.0 and muse-spark-1.3."
+        )
+        meta_form.addRow("Reasoning Effort:", self.combo_meta_effort)
+
+        meta_btn_box = QHBoxLayout()
+        self.btn_test_meta = QPushButton("⚡ Test Meta Connection")
+        self.btn_test_meta.setStyleSheet(
+            "background-color: #8be9fd; color: #282a36; font-weight: bold; padding: 5px 12px; border-radius: 4px;"
+        )
+        self.btn_test_meta.clicked.connect(self._test_meta_connection)
+        self.lbl_meta_status = QLabel("")
+        self.lbl_meta_status.setStyleSheet("font-size: 11px;")
+        meta_btn_box.addWidget(self.btn_test_meta)
+        meta_btn_box.addWidget(self.lbl_meta_status, stretch=1)
+        meta_form.addRow("", meta_btn_box)
+
+        layout.addWidget(meta_group)
         layout.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
 
     # -------------------------------------------------------------
     # TAB 2: SAFETY & CONFIRMATIONS
@@ -648,7 +736,9 @@ class SettingsDialog(QDialog):
         self.chk_tg_remote_kill.setStyleSheet("color: #f8f8f2; font-size: 12px;")
         ctrl_layout.addWidget(self.chk_tg_remote_kill)
 
-        self.chk_tg_risk_approval = QCheckBox("Push interactive cards with [Approve] / [Reject] buttons for Level 2 & 3 commands")
+        self.chk_tg_risk_approval = QCheckBox(
+            "Also mirror safety confirmations to Telegram (optional; web app and desktop pill are primary)"
+        )
         self.chk_tg_risk_approval.setStyleSheet("color: #f8f8f2; font-size: 12px;")
         ctrl_layout.addWidget(self.chk_tg_risk_approval)
 
@@ -677,6 +767,9 @@ class SettingsDialog(QDialog):
         elif pref == "cloud":
             self.combo_preference.setCurrentIndex(2)
 
+        cloud_provider = (models_cfg.get("cloud", {}) or {}).get("provider", "chutes")
+        self.combo_cloud_provider.setCurrentIndex(1 if str(cloud_provider).lower() == "meta" else 0)
+
         # Local Ollama
         local_cfg = models_cfg.get("local", {})
         self.edit_ollama_url.setText(local_cfg.get("base_url", "http://localhost:11434"))
@@ -693,6 +786,15 @@ class SettingsDialog(QDialog):
         chutes_reasoning = cloud_cfg.get("reasoning_model", "moonshotai/Kimi-K2.6-TEE")
         self.combo_chutes_vision.setEditText(chutes_vision)
         self.combo_chutes_reasoning.setEditText(chutes_reasoning)
+
+        meta_cfg = models_cfg.get("meta", {}) or {}
+        self.edit_meta_key.setText(meta_cfg.get("api_key", ""))
+        self.edit_meta_url.setText(meta_cfg.get("base_url", META_BASE_URL))
+        self.combo_meta_reasoning.setEditText(meta_cfg.get("reasoning_model", DEFAULT_META_MODEL))
+        self.combo_meta_vision.setEditText(meta_cfg.get("vision_model", DEFAULT_META_MODEL))
+        effort = str(meta_cfg.get("reasoning_effort", DEFAULT_REASONING_EFFORT)).strip().lower()
+        effort_idx = self.combo_meta_effort.findText(effort)
+        self.combo_meta_effort.setCurrentIndex(effort_idx if effort_idx >= 0 else META_REASONING_EFFORTS.index(DEFAULT_REASONING_EFFORT))
 
         # Safety
         safety_cfg = self.config.get("safety", {})
@@ -733,7 +835,7 @@ class SettingsDialog(QDialog):
         self.chk_tg_remote_kill.setChecked(bool(tg_cfg.get("remote_kill_switch_enabled", True)))
 
         notifs = tg_cfg.get("notifications", {})
-        self.chk_tg_risk_approval.setChecked(bool(notifs.get("on_risk_approval", True)))
+        self.chk_tg_risk_approval.setChecked(bool(notifs.get("on_risk_approval", False)))
         self.chk_tg_job_milestones.setChecked(bool(notifs.get("on_job_milestones", True)))
         self.chk_tg_task_completed.setChecked(bool(notifs.get("on_task_completed", True)))
 
@@ -761,10 +863,21 @@ class SettingsDialog(QDialog):
         # Cloud Chutes
         if "cloud" not in cfg["models"]:
             cfg["models"]["cloud"] = {}
+        cfg["models"]["cloud"]["provider"] = (
+            "meta" if self.combo_cloud_provider.currentIndex() == 1 else "chutes"
+        )
         cfg["models"]["cloud"]["api_key"] = self.edit_chutes_key.text().strip()
         cfg["models"]["cloud"]["base_url"] = self.edit_chutes_url.text().strip()
         cfg["models"]["cloud"]["vision_model"] = self.combo_chutes_vision.currentText().strip()
         cfg["models"]["cloud"]["reasoning_model"] = self.combo_chutes_reasoning.currentText().strip()
+
+        if "meta" not in cfg["models"]:
+            cfg["models"]["meta"] = {}
+        cfg["models"]["meta"]["api_key"] = self.edit_meta_key.text().strip()
+        cfg["models"]["meta"]["base_url"] = self.edit_meta_url.text().strip() or META_BASE_URL
+        cfg["models"]["meta"]["reasoning_model"] = self.combo_meta_reasoning.currentText().strip() or DEFAULT_META_MODEL
+        cfg["models"]["meta"]["vision_model"] = self.combo_meta_vision.currentText().strip() or DEFAULT_META_MODEL
+        cfg["models"]["meta"]["reasoning_effort"] = self.combo_meta_effort.currentText().strip() or DEFAULT_REASONING_EFFORT
 
         # Safety
         if "safety" not in cfg:
@@ -850,6 +963,33 @@ class SettingsDialog(QDialog):
         else:
             self.edit_chutes_key.setEchoMode(QLineEdit.EchoMode.Password)
             self.btn_toggle_key.setText("👁️")
+
+    def _toggle_meta_key_visibility(self):
+        if self.edit_meta_key.echoMode() == QLineEdit.EchoMode.Password:
+            self.edit_meta_key.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.btn_toggle_meta_key.setText("🔒")
+        else:
+            self.edit_meta_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self.btn_toggle_meta_key.setText("👁️")
+
+    def _meta_api_key(self) -> str:
+        return self.edit_meta_key.text().strip() or os.environ.get("MODEL_API_KEY", "")
+
+    def _fill_meta_model_combos(self, models: List[str]) -> None:
+        merged: List[str] = []
+        for name in list(META_CHAT_MODELS) + list(models):
+            if name and name not in merged:
+                merged.append(name)
+        curr_reasoning = self.combo_meta_reasoning.currentText().strip()
+        curr_vision = self.combo_meta_vision.currentText().strip()
+        self.combo_meta_reasoning.clear()
+        self.combo_meta_vision.clear()
+        self.combo_meta_reasoning.addItems(merged)
+        self.combo_meta_vision.addItems(merged)
+        if curr_reasoning:
+            self.combo_meta_reasoning.setEditText(curr_reasoning)
+        if curr_vision:
+            self.combo_meta_vision.setEditText(curr_vision)
 
     def _refresh_ollama_models(self, silent: bool = False):
         """Fetch model names from local Ollama and populate dropdowns."""
@@ -940,6 +1080,47 @@ class SettingsDialog(QDialog):
         else:
             self.lbl_chutes_status.setText("❌ Authentication failed or invalid key")
             self.lbl_chutes_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+
+    def _refresh_meta_models(self, silent: bool = False):
+        """Fetch Muse chat models and keep the known presets in the dropdowns."""
+        api_key = self._meta_api_key()
+        base_url = self.edit_meta_url.text().strip() or META_BASE_URL
+        if not api_key:
+            return
+        try:
+            client = MetaClient(api_key=api_key, base_url=base_url)
+            fetched = client.list_models()
+            chat_models = [m for m in fetched if m.startswith(("muse-spark", "muse-wonder"))]
+            self._fill_meta_model_combos(chat_models or fetched)
+            if fetched:
+                shown = len(chat_models or fetched)
+                self.lbl_meta_status.setText(f"✅ Loaded {shown} Muse models")
+                self.lbl_meta_status.setStyleSheet("color: #50fa7b; font-size: 11px;")
+            elif not silent:
+                self.lbl_meta_status.setText("❌ Failed to fetch Muse models")
+                self.lbl_meta_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+        except Exception as exc:
+            logger.debug("Meta model refresh failed: %s", exc)
+            if not silent:
+                self.lbl_meta_status.setText("❌ Failed to fetch Muse models")
+                self.lbl_meta_status.setStyleSheet("color: #ff5555; font-size: 11px;")
+
+    def _test_meta_connection(self):
+        """Test Meta Model API authentication and refresh the Muse model list."""
+        api_key = self._meta_api_key()
+        base_url = self.edit_meta_url.text().strip() or META_BASE_URL
+        if not api_key:
+            self.lbl_meta_status.setText("⚠️ Enter a Model API key or set MODEL_API_KEY")
+            self.lbl_meta_status.setStyleSheet("color: #ffb86c; font-size: 11px;")
+            return
+        client = MetaClient(api_key=api_key, base_url=base_url)
+        if client.check_connection():
+            self._refresh_meta_models(silent=True)
+            self.lbl_meta_status.setText("✅ Meta API key verified")
+            self.lbl_meta_status.setStyleSheet("color: #50fa7b; font-size: 11px;")
+        else:
+            self.lbl_meta_status.setText("❌ Authentication failed or invalid key")
+            self.lbl_meta_status.setStyleSheet("color: #ff5555; font-size: 11px;")
 
     def _test_tts(self):
         """Test Kokoro TTS playback with current voice settings."""

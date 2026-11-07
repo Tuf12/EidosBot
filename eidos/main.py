@@ -235,12 +235,15 @@ def run_cli_mode(
         )
         telegram_gw.start()
 
-    if gateway or telegram_gw:
+    if gateway:
+        if telegram_gw:
+            gateway.set_confirmation_peers(telegram_gw=telegram_gw)
+        agent.gatekeeper.custom_prompt_callback = gateway.create_unified_confirmation_callback()
+    elif telegram_gw:
         from eidos.gateway import TelegramGateway
-        agent.gatekeeper.custom_prompt_callback = TelegramGateway.combine_callbacks(
-            gateway.create_confirmation_callback() if gateway else None,
-            telegram_gw.create_confirmation_callback() if telegram_gw else None,
-        )
+        tg_cb = telegram_gw.create_confirmation_callback()
+        if tg_cb:
+            agent.gatekeeper.custom_prompt_callback = tg_cb
 
     try:
         # One-shot task mode

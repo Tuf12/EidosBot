@@ -230,6 +230,10 @@ Every interaction cycle executes through a six-stage pipeline:
   - State machine batch runner managing `queue.json` for processing large-scale projects (e.g., 300 Inventions evaluation) item by item with fresh contexts, checkpointing, and pause/resume.
   - Batch execution is a component a project job can attach. The project brief itself lives in `job.yaml` and is specified in [PROJECT_JOBS.md](PROJECT_JOBS.md).
 
+**Old system.** `eidos/jobs/` is the batch runner plus the project brief. Outside apps are reached by skills compiled into this repo.
+
+**Updated job concept.** `eidos/jobs/` still owns the project brief, focus, and the batch-queue component. The job directory `~/EidosWorkspace/jobs/<project>/` keeps `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). An outside app is an integration under `~/.eidos/integrations/<name>/`. Its tools come from that app's MCP server, loaded only while the integration is attached to the primary job or is the focus by itself. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
+
 ### 4.10. Remote Telegram Gateway (`eidos/gateway/telegram_bot.py`)
 
 *(Detailed specifications in [TELEGRAM_GATEWAY.md](TELEGRAM_GATEWAY.md))*
@@ -274,6 +278,10 @@ Because **OptimalX Desktop** and **OptimalX Mobile** are personally developed by
 
 *(See full specification in [`docs/OPTIMALX_INTEGRATION.md`](OPTIMALX_INTEGRATION.md))*
 
+**Old system.** OptimalX is wired as an in-repo bridge (`eidos/integrations/optimalx.py`) with hand-written tool schemas.
+
+**Updated job concept.** That bridge stays for OptimalX, because OptimalX does not ship an MCP server. A new app is a separate process that exposes an MCP server. EidosBot keeps the project job, the skill for how to use the app, and the memory tags. The server supplies the tools. Gmail is the reference case: Google's remote server at `https://gmailmcp.googleapis.com/mcp/v1`, attached to a project job such as a lease. It is not opened as a job named Gmail. Files that arrive through Gmail are saved into that project job's `artifacts/`.
+
 
 
 
@@ -295,6 +303,7 @@ EidosBot/
 │   ├── OPTIMALX_INTEGRATION.md     # OptimalX bi-directional note & knowledge bridge spec
 │   ├── EPISODIC_MEMORY.md          # Episodic memory, recall & LoRA training spec
 │   ├── SKILLS_AND_JOBS.md          # Skills, rubrics & batch job runner spec
+│   ├── PROJECT_JOBS.md             # Project jobs, integrations & MCP attachment
 │   ├── INVENTION_RESEARCH_PIPELINE.md # Inventions research & evaluation pipeline spec
 │   ├── SANDBOXING.md               # Kernel filesystem isolation (bwrap) spec
 │   ├── PLAYWRIGHT_AUTOMATION.md    # Headless browser automation spec

@@ -25,6 +25,7 @@ class VoiceManager:
         default_voice: str = DEFAULT_VOICE_ID,
         default_speed: float = 1.0,
         device: str = "cpu",  # noqa: ARG002 — live Kokoro always uses CPU
+        stt_device: str = "cpu",
         hotkey_str: Optional[str] = None,
     ):
         self.tts = KokoroTTS(
@@ -40,6 +41,7 @@ class VoiceManager:
         self.stt = ParakeetSTT(
             python_path=python_path,
             voice_dir=voice_dir,
+            device=stt_device,
         )
         self.recorder = AudioRecorder()
 

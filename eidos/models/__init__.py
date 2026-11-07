@@ -2,6 +2,7 @@
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
 from eidos.models.chutes_client import ChutesClient
+from eidos.models.meta_client import MetaClient
 from eidos.models.ollama_client import OllamaClient
 from eidos.models.router import ModelRouter, ProviderPreference
 
@@ -11,6 +12,7 @@ __all__ = [
     "ToolCall",
     "OllamaClient",
     "ChutesClient",
+    "MetaClient",
     "ModelRouter",
     "ProviderPreference",
 ]

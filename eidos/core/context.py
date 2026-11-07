@@ -27,6 +27,50 @@ def ensure_workspace_directories(workspace_dir: Optional[str] = None) -> Dict[st
     return dirs
 
 
+def _sandbox_execution_policy_section(
+    sandbox_cfg: Optional[Dict[str, Any]],
+    workspace_dir: str,
+    writable_roots: Optional[List[str]] = None,
+) -> str:
+    """Explain nest vs host shell behavior for the active configuration."""
+    cfg = sandbox_cfg or {}
+    enabled = bool(cfg.get("enabled", False))
+    mode = str(cfg.get("default_shell_mode", "auto")).strip().lower()
+    roots = writable_roots or [workspace_dir]
+    roots_text = ", ".join(roots[:6])
+    if len(roots) > 6:
+        roots_text += ", …"
+
+    if not enabled:
+        return (
+            "10. SHELL EXECUTION (HOST): Kernel sandbox is disabled. Every `execute_shell` runs on the "
+            "real desktop with Gatekeeper policy (Level 2 shell / Level 3 destructive confirmations)."
+        )
+
+    if mode in ("host", "false"):
+        return (
+            "10. SHELL EXECUTION (HOST-FIRST): `execute_shell` runs on the real desktop by default. "
+            f"Optional nest (bwrap) is available only when you pass `sandboxed: true` for work confined to: {roots_text}. "
+            "Use host mode for Blender, apt, editing files outside the nest, and normal desktop co-pilot tasks."
+        )
+
+    if mode in ("sandboxed", "sandbox", "true"):
+        return (
+            "10. SHELL EXECUTION (NEST-FIRST): `execute_shell` uses the kernel sandbox (bwrap) by default — "
+            f"auto-allowed writes only under: {roots_text}. Pass `sandboxed: false` for host desktop work "
+            "(installs, paths outside the nest, system tools); Gatekeeper will prompt when required."
+        )
+
+    return (
+        "10. SHELL EXECUTION (AUTO): You are a desktop co-pilot — default `execute_shell` to the **host** "
+        "(omit `sandboxed` or use `sandboxed: false`). The kernel nest (bwrap) is only for batch churn "
+        f"fully inside these writable roots: {roots_text}. Use the nest by setting `cwd` to a path under those "
+        "roots and passing `sandboxed: true`, or when auto can prove the command stays inside the nest. "
+        "Never tell the user to fix the environment when host execution is available — run the command with "
+        "`sandboxed: false` and accept Gatekeeper approval when prompted."
+    )
+
+
 def build_system_prompt(
     active_window_info: Dict[str, Any],
     current_dir: str,
@@ -34,6 +78,8 @@ def build_system_prompt(
     user_profile_context: Optional[str] = None,
     episodic_context: Optional[str] = None,
     workspace_dir: Optional[str] = None,
+    sandbox_cfg: Optional[Dict[str, Any]] = None,
+    sandbox_writable_roots: Optional[List[str]] = None,
 ) -> str:
     """Construct dynamic lean system prompt with real desktop context."""
     win_title = active_window_info.get("title", "Unknown")
@@ -54,6 +100,7 @@ def build_system_prompt(
     episodic_section = f"\n{episodic_context.strip()}\n" if episodic_context else ""
 
     return f"""You are EidosBot, an OS-level autonomous desktop co-pilot running locally on Linux Mint (X11).
+    User is the developer of EidosBot.
 
 SYSTEM CONTEXT:
 - OS: Linux Mint (Cinnamon / X11)
@@ -74,7 +121,8 @@ BEHAVIORAL PRINCIPLES:
 4. TIME & INTERNAL CLOCK: You have an internal clock. The current date and time are in SYSTEM CONTEXT above and update on each step. Use `get_current_time` if you need a timestamp object; do not run shell `date` for this.
 5. EPISODIC LEARNING: If `<episodic_context>` is provided above, leverage proven tool patterns and heed cautionary pitfalls from past sessions before taking high-risk or multi-step actions.
 6. CONSCIOUS ACTIVE RECALL: If you are uncertain about a command, flag, tool pattern, or past solution during your thought process, you can emit `<recall>search keywords</recall>` (supports prefixes like `cmd:xrandr`, `project:OptimalX`, `path:/etc/pulse`). The system will intercept your query in mid-thought, search your episodic memory with entity graph matching, and inject `<recalled_memory>...</recalled_memory>` so you can continue your reasoning with verified experience.
-7. WEB APP FILE DELIVERY: `share_file` is always available. The web app cannot open a raw disk path, including when the user is on a phone. After you create or locate a file the user should view or download, call `share_file` with that path before `finish_task`.
+7. WEB APP FILE DELIVERY: `share_file` is always available. After you create or locate a file the user should view or download, call `share_file` with that path before `finish_task`.
 8. COMPLETION: Once the user's goal has been met, call `finish_task` with a concise summary. The summary is displayed in chat and spoken aloud automatically.
 9. CODE PRESENTATION & FORMATTING: When providing code, scripts, configs, or terminal commands in chat, always place them in standard Markdown fenced code blocks with the exact language specifier (e.g. ```openscad, ```python, ```bash, ```json, ```html, ```javascript). Write 100% complete, syntactically correct, properly indented, copy-paste ready code without truncations or placeholders. Never indent the code fence backticks (```) with leading spaces. Keep all explanations and narrative strictly OUTSIDE the code block so the code block contains exclusively clean, executable code.
+{_sandbox_execution_policy_section(sandbox_cfg, ws_dir, sandbox_writable_roots)}
 """

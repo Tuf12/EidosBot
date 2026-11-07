@@ -26,7 +26,9 @@ from eidos.memory.types import StepRecord
 from eidos.memory.user_store import UserStore
 from eidos.models.base import BaseModelClient, ToolCall
 from eidos.models.chutes_client import ChutesClient
+from eidos.models.meta_client import DEFAULT_META_MODEL, DEFAULT_REASONING_EFFORT, META_BASE_URL, MetaClient
 from eidos.models.ollama_client import OllamaClient
+from eidos.models.compute_policy import ComputePolicy, compute_settings_from_config
 from eidos.models.ollama_options import embedding_num_gpu, local_num_ctx
 from eidos.models.router import ModelRouter
 from eidos.perception.grounder import VisualGrounder
@@ -63,6 +65,11 @@ class AgentLoop:
         reflector: Optional[EpisodicReflector] = None,
     ):
         self.config = config or {}
+        self._task_active = False
+        self.compute_policy = ComputePolicy.from_config(
+            self.config,
+            is_task_active=lambda: self._task_active,
+        )
         self.kill_switch = kill_switch or KillSwitch()
         self.allowlist = AllowlistManager(
             storage_path=self.config.get("safety", {}).get("storage", {}).get("allowlist_file")
@@ -165,7 +172,27 @@ class AgentLoop:
             on_recall_callback=self._on_recall_triggered if self.recall_interceptor else None,
         )
 
-        self.router = ModelRouter(ollama_client=self.ollama, chutes_client=self.chutes, preference=pref)
+        meta_cfg = self.config.get("models", {}).get("meta") or {}
+        self.meta = MetaClient(
+            api_key=meta_cfg.get("api_key") or None,
+            base_url=meta_cfg.get("base_url", META_BASE_URL),
+            vision_model=meta_cfg.get("vision_model", DEFAULT_META_MODEL),
+            reasoning_model=meta_cfg.get("reasoning_model", DEFAULT_META_MODEL),
+            reasoning_effort=meta_cfg.get("reasoning_effort", DEFAULT_REASONING_EFFORT),
+            timeout=float(meta_cfg.get("timeout_seconds", 300.0)),
+            stream=meta_cfg.get("stream", True),
+            recall_interceptor=self.recall_interceptor,
+            on_recall_callback=self._on_recall_triggered if self.recall_interceptor else None,
+        )
+
+        self.router = ModelRouter(
+            ollama_client=self.ollama,
+            chutes_client=self.chutes,
+            meta_client=self.meta,
+            preference=pref,
+            cloud_provider=cloud_cfg.get("provider", "chutes"),
+            compute_policy=self.compute_policy,
+        )
         self.model = model_client or self.router
         if self.recall_interceptor:
             if hasattr(self.model, "recall_interceptor") and getattr(self.model, "recall_interceptor", None) is None:
@@ -186,6 +213,9 @@ class AgentLoop:
                 enabled=self.reflector_enabled,
                 model_name=refl_cfg.get("model"),
                 timeout_seconds=float(refl_cfg.get("timeout_seconds", 30.0)),
+                compute_policy=self.compute_policy,
+                prefer_cloud_when_busy=bool(refl_cfg.get("prefer_cloud_when_busy", True)),
+                idle_seconds=float(refl_cfg.get("idle_seconds", self.compute_policy.idle_seconds)),
             )
 
         self.screen = ScreenCapture(
@@ -258,7 +288,11 @@ class AgentLoop:
             default_voice=voice_cfg.get("tts_voice", "bm_george"),
             default_speed=float(voice_cfg.get("tts_speed", 1.0)),
             device=voice_cfg.get("device", "cpu"),
+            stt_device=voice_cfg.get("stt_device", "cpu"),
             hotkey_str=voice_cfg.get("push_to_talk_hotkey"),
+        )
+        self.voice.register_on_transcribed(
+            lambda _text: self.compute_policy.touch_user_activity()
         )
         try:
             self.kill_switch.register_callback(self._on_kill_stop_voice)
@@ -299,6 +333,10 @@ class AgentLoop:
                 cb(*args, **kwargs)
             except Exception as e:
                 logger.warning("Error in callback %s: %s", event_name, e)
+
+    def is_foreground_busy(self) -> bool:
+        """True when agent, user activity, or GPU inference should block background local LLM."""
+        return self.compute_policy.is_foreground_busy()
 
     def notify_background_activity(self, active: bool, task: str = "", details: str = ""):
         """Notify observers (gateway, UI) about background processing."""
@@ -466,11 +504,45 @@ class AgentLoop:
             self.chutes.base_url = cloud_cfg.get("base_url", self.chutes.base_url).rstrip("/")
             self.chutes.vision_model = cloud_cfg.get("vision_model", self.chutes.vision_model)
             self.chutes.reasoning_model = cloud_cfg.get("reasoning_model", self.chutes.reasoning_model)
+            provider = cloud_cfg.get("provider")
+            if provider and hasattr(self.router, "set_cloud_provider"):
+                self.router.set_cloud_provider(provider)
+
+        # Update Meta Muse settings
+        meta_cfg = new_config.get("models", {}).get("meta")
+        if isinstance(meta_cfg, dict) and hasattr(self, "meta"):
+            self.meta.api_key = (meta_cfg.get("api_key") or "") or os.environ.get("MODEL_API_KEY", "")
+            self.meta.base_url = (meta_cfg.get("base_url") or self.meta.base_url).rstrip("/")
+            self.meta.vision_model = meta_cfg.get("vision_model", self.meta.vision_model)
+            self.meta.reasoning_model = meta_cfg.get("reasoning_model", self.meta.reasoning_model)
+            effort = meta_cfg.get("reasoning_effort")
+            if effort:
+                self.meta.reasoning_effort = str(effort).strip().lower()
+            if "timeout_seconds" in meta_cfg:
+                try:
+                    self.meta.timeout = float(meta_cfg["timeout_seconds"])
+                except (TypeError, ValueError):
+                    pass
 
         # Update Router preference
         pref = new_config.get("models", {}).get("provider_preference")
         if pref:
             self.router.set_preference(pref)
+
+        compute_cfg = new_config.get("models", {}).get("compute")
+        if compute_cfg is not None or new_config.get("memory", {}).get("reflector"):
+            self.compute_policy.apply_settings(compute_settings_from_config(new_config))
+            if hasattr(self.router, "compute_policy"):
+                self.router.compute_policy = self.compute_policy
+            if self.reflector:
+                refl_cfg = new_config.get("memory", {}).get("reflector", {})
+                if "idle_seconds" in refl_cfg:
+                    try:
+                        self.reflector.idle_seconds = float(refl_cfg["idle_seconds"])
+                    except (TypeError, ValueError):
+                        pass
+                if "prefer_cloud_when_busy" in refl_cfg:
+                    self.reflector.prefer_cloud_when_busy = bool(refl_cfg["prefer_cloud_when_busy"])
 
         # Update Safety policy
         safety_cfg = new_config.get("safety", {})
@@ -515,6 +587,8 @@ class AgentLoop:
                 self.voice.tts.default_voice = normalize_voice_id(voice_cfg["tts_voice"])
             if "tts_speed" in voice_cfg:
                 self.voice.tts.default_speed = resolve_speed(float(voice_cfg["tts_speed"]))
+            if "stt_device" in voice_cfg and hasattr(self.voice, "stt"):
+                self.voice.stt.device = str(voice_cfg["stt_device"]).strip().lower()
 
         # Update Memory settings
         mem_cfg = new_config.get("memory", {})
@@ -577,6 +651,9 @@ class AgentLoop:
                         enabled=self.reflector_enabled,
                         model_name=refl_cfg.get("model"),
                         timeout_seconds=float(refl_cfg.get("timeout_seconds", 30.0)),
+                        compute_policy=self.compute_policy,
+                        prefer_cloud_when_busy=bool(refl_cfg.get("prefer_cloud_when_busy", True)),
+                        idle_seconds=float(refl_cfg.get("idle_seconds", self.compute_policy.idle_seconds)),
                     )
 
         if "integrations" in new_config and "optimalx" in new_config["integrations"]:
@@ -698,6 +775,8 @@ class AgentLoop:
             user_profile_context=user_profile_ctx,
             episodic_context=episodic_ctx,
             workspace_dir=self.workspace_dir,
+            sandbox_cfg=self.config.get("sandbox"),
+            sandbox_writable_roots=self.shell.writable_roots(),
         )
         if self.active_job:
             job_id = self.active_job.get("job_id", "")
@@ -935,6 +1014,7 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         """Run autonomous agent loop until goal achieved or max_steps reached."""
         max_steps = self._resolve_max_steps(max_steps)
         logger.info("Starting EidosBot task: %s", user_goal)
+        self.compute_policy.touch_user_activity()
         self._stop_requested.clear()
         self._reset_model_abort()
         self.active_skill = None
@@ -945,6 +1025,23 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         except Exception:
             pass
 
+        self._task_active = True
+        try:
+            return self._run_task_body(
+                user_goal,
+                max_steps=max_steps,
+                speak_summary=speak_summary,
+            )
+        finally:
+            self._task_active = False
+
+    def _run_task_body(
+        self,
+        user_goal: str,
+        *,
+        max_steps: int,
+        speak_summary: bool,
+    ) -> Dict[str, Any]:
         # Start trajectory logging
         episode_id: Optional[str] = None
         if self.memory_enabled:
@@ -1138,9 +1235,14 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                     logger.warning("Model communication error encountered on step %d: %s", step, response.content)
                     # Attempt recovery: aggressively compact context and retry with Chutes if available
                     self._compact_context_if_needed(messages, max_chars=24000)
-                    chutes_client = getattr(getattr(self, "router", None), "chutes", None)
+                    router = getattr(self, "router", None)
+                    if router is not None and hasattr(router, "configured_cloud_client"):
+                        chutes_client = router.configured_cloud_client()
+                    else:
+                        chutes_client = getattr(router, "chutes", None)
                     if chutes_client and chutes_client.is_configured:
-                        logger.info("Retrying step %d with cloud model Chutes AI...", step)
+                        cloud_label = getattr(chutes_client, "service_name", "cloud")
+                        logger.info("Retrying step %d with %s...", step, cloud_label)
                         # Pop the error assistant message from messages so we don't pollute context
                         if messages and messages[-1].get("role") == "assistant":
                             messages.pop()
@@ -1170,7 +1272,7 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                                     self._emit("on_thought", response.thinking)
                                     turn_thoughts.append(response.thinking)
                         except Exception as retry_exc:
-                            logger.error("Step %d retry with Chutes also encountered error: %s", step, retry_exc)
+                            logger.error("Step %d cloud retry also encountered error: %s", step, retry_exc)
 
                 if not response.has_tool_calls:
                     if response.content:
@@ -1391,9 +1493,12 @@ ACTIVE JOB MODE: {job_name} ({job_id})
 
         if name == "execute_shell":
             cmd = args.get("command", "")
-            sandboxed = args.get("sandboxed", True)
-            cwd = args.get("cwd") or self.workspace_dir
+            cwd_arg = args.get("cwd")
+            sandboxed = self.shell.resolve_sandboxed(args.get("sandboxed"), cmd, cwd_arg)
+            cwd = cwd_arg or self.workspace_dir
             res = self.shell.execute(cmd, cwd=cwd, sandboxed=sandboxed)
+            if isinstance(res, dict):
+                res["sandboxed_resolved"] = sandboxed
             return res, False
 
         if name == "get_active_window":

@@ -494,6 +494,7 @@ class EpisodicStore:
         outcome_filter: Optional[str] = None,
         min_similarity: float = 0.0,
         entity_weight: float = 0.35,
+        query_vector: Optional[List[float]] = None,
     ) -> List[EpisodicSearchResult]:
         """Hybrid semantic and graph-augmented search against indexed episodic memories.
 
@@ -506,11 +507,12 @@ class EpisodicStore:
         if not cleaned_query:
             return []
 
-        try:
-            query_vector = self.embedding_client.embed_text(cleaned_query)
-        except Exception as e:
-            logger.error("Failed to generate query embedding: %s", e)
-            return []
+        if query_vector is None:
+            try:
+                query_vector = self.embedding_client.embed_text(cleaned_query)
+            except Exception as e:
+                logger.error("Failed to generate query embedding: %s", e)
+                return []
 
         query_entities = self.entity_extractor.extract_from_query(cleaned_query)
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None
@@ -784,11 +786,18 @@ class EpisodicStore:
         if not task_goal.strip():
             return ""
 
+        try:
+            shared_vector = self.embedding_client.embed_text(task_goal.strip())
+        except Exception as e:
+            logger.error("Failed to generate macro context embedding: %s", e)
+            return ""
+
         successes = self.search(
             query=task_goal,
             top_k=top_k_success,
             outcome_filter="success",
             min_similarity=min_similarity,
+            query_vector=shared_vector,
         )
         success_ids = {s.episode_id for s in successes}
 
@@ -797,6 +806,7 @@ class EpisodicStore:
             top_k=top_k_pitfall + len(success_ids) * 2,
             outcome_filter="pitfall",
             min_similarity=min_similarity,
+            query_vector=shared_vector,
         )
 
         # Avoid showing the same episode in both sections

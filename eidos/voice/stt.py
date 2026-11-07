@@ -8,11 +8,13 @@ Recordings longer than the model's 240s decode cap are sliced inside transcribe.
 import json
 import logging
 import os
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 from typing import Any, Dict, Optional
 import wave
 
+from eidos.models.inference_slot import gpu_inference_slot
 from eidos.voice.helpers import resolve_voice_runtime
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,7 @@ class ParakeetSTT:
         python_path: Optional[str] = None,
         voice_dir: Optional[str] = None,
         model_name: str = "parakeet-tdt-0.6b-v2-int8",
+        device: str = "cuda",
     ):
         runtime = resolve_voice_runtime(
             configured_python=python_path,
@@ -34,6 +37,10 @@ class ParakeetSTT:
         self.python_path = runtime.python_path
         self.voice_dir = runtime.scripts_dir
         self.model_name = model_name
+        self.device = (device or "cuda").strip().lower()
+
+    def _uses_gpu(self) -> bool:
+        return self.device == "cuda"
 
     @property
     def is_available(self) -> bool:
@@ -59,18 +66,26 @@ class ParakeetSTT:
             transcribe_script,
             "--wav",
             wav_path,
+            "--device",
+            self.device,
         ]
 
         timeout = _transcribe_timeout_seconds(wav_path)
         logger.debug("Running Parakeet transcription (timeout %ss): %s", timeout, cmd)
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            cwd=self.voice_dir,
+        slot = (
+            gpu_inference_slot("parakeet-stt")
+            if self._uses_gpu()
+            else nullcontext()
         )
+        with slot:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                cwd=self.voice_dir,
+            )
 
         if proc.returncode != 0:
             err = proc.stderr.strip() or proc.stdout.strip()

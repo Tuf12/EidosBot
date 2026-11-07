@@ -25,6 +25,14 @@ Implement `EpisodicConsolidator` (`eidos/memory/consolidator.py`), a background 
   - **Living Skills:** Generated as template `SKILL.md` procedures in `~/.eidos/skills/`.
 - **Soft Pruning & Archival:** Marks redundant, low-quality, or superseded episodes as `archived = 1` in SQLite, excluding them from prompt retrieval while preserving raw trajectory logs for offline LoRA dataset training.
 
+### GPU resource contract (required)
+
+Any consolidator implementation must follow [`SPEC_COMPUTE_RESOURCE_POLICY.md`](SPEC_COMPUTE_RESOURCE_POLICY.md):
+
+- Clustering and SQLite updates are **CPU-only** (precomputed embeddings).
+- Optional LLM synthesis must call `ModelRouter.chat_background()` and respect `ComputePolicy.allow_background_local_llm()`.
+- **No local LLM** during active agent tasks or while the inference slot is held.
+
 ---
 
 ## 2. Architecture & Consolidation Lifecycle

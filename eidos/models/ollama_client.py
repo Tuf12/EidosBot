@@ -3,19 +3,16 @@
 import json
 import logging
 import re
-import threading
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
+from eidos.models.inference_slot import gpu_inference_slot
 from eidos.models.inflight import InflightRequest
 from eidos.models.ollama_options import chat_generation_options
 
 logger = logging.getLogger(__name__)
-
-# One GPU-resident generator at a time for every client in this process.
-_GPU_LOCK = threading.Lock()
 
 _VISION_NAME_MARKERS = (
     "vision",
@@ -174,7 +171,8 @@ class OllamaClient(BaseModelClient):
         model_override: Optional[str] = None
     ) -> ModelResponse:
         """Send chat completion request with optional tool definitions."""
-        with _GPU_LOCK:
+        model_name = model_override or self.reasoning_model
+        with gpu_inference_slot(f"ollama:{model_name}"):
             self._release_extra_vision_model()
             return self._chat_unlocked(messages, tools, model_override)
 
@@ -258,8 +256,8 @@ class OllamaClient(BaseModelClient):
         model_override: Optional[str] = None
     ) -> ModelResponse:
         """Send multimodal vision query to Ollama."""
-        with _GPU_LOCK:
-            model_name = self.resolve_vision_model(model_override)
+        model_name = self.resolve_vision_model(model_override)
+        with gpu_inference_slot(f"ollama-vision:{model_name}"):
             self._release_extra_vision_model()
             return self._vision_chat_unlocked(prompt, image_base64, system_prompt, model_name)
 

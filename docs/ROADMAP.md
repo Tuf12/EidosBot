@@ -433,12 +433,35 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
    - Batch tools stay on the `batch-runner` skill.
 4. [ ] **Scoped recall (`eidos/memory/episodic_store.py`, `eidos/memory/recall_stream.py`):**
    - Tag episodes with `job_id`. Search this job first. Do not backfill with another project's content.
+
+   **Old system.** A miss inside this job returns nothing from any other job.
+
+   **Updated job concept.** Vector search still does not backfill with another project's nearest hit. A shared entity in the graph may return that other episode without loading its brief or tools. Episodes are also tagged with the integration used on that turn. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 5. [ ] **Workers receive the brief (`eidos/jobs/processor.py`):**
    - Identity and boundary precede skill text and prior-art hits. Similar results are comparison material.
 6. [ ] **Scope tags (`eidos/ui/pill.py`, `web/src/components/Header.tsx`, `eidos/gateway/server.py`):**
    - Primary job tag on the floating pill and the web header.
    - Secondary tags for additional jobs that are running.
 7. [ ] **Regression:** job, context, scoping, and recall tests, plus loading an older `queue.json` that has no brief yet.
+
+**Old system.** Phase 13 is the last word on jobs: the brief, focus, and job-scoped recall.
+
+**Updated job concept.** Phase 13 still builds the project job. Phase 14 attaches outside apps to that job.
+
+---
+
+### Phase 14: Integrations and MCP Servers
+**Goal:** Keep the project job as the scope of the work. Attach an outside app (Gmail, Calendar, Schwab, OptimalX) as an integration. The app's MCP server supplies the tools. EidosBot keeps the brief, the skill, the job folder, and the memory tags.
+
+*(See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.)*
+
+#### Deliverables & Tasks:
+1. [ ] **Integration records (`~/.eidos/integrations/<name>/`):** `integration.yaml` plus `SKILL.md`. `~/.eidos/mcp.json` lists servers. The model cannot edit the server list or read tokens.
+2. [ ] **MCP client:** a daemon thread with its own event loop. Synchronous `list_tools()` / `call_tool()` for `AgentLoop`. Namespaced tools `mcp__<server>__<tool>`. Servers with more than about 20 tools expose a catalog plus `call_mcp_tool`.
+3. [ ] **Focus:** a primary job loads the integrations named on its brief. `focus_integration` loads one integration when no project job is open. Job folders keep `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). Attachments are saved into the project job, not into the integration directory.
+4. [ ] **Gatekeeper:** `readOnlyHint` is Level 0, `destructiveHint` is Level 3, every other MCP call is Level 2 and allowlisted by server plus tool name.
+5. [ ] **Memory:** episodes store `job_id` and `integration`. Vector recall stays inside the job. The entity graph may cross jobs on a shared entity without loading the other brief.
+6. [ ] **OptimalX:** the existing in-repo bridge stays until OptimalX ships an MCP server. New apps are built outside this repo.
 
 ---
 

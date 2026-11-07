@@ -3,7 +3,8 @@
 **Document:** `docs/specs/SPEC_EPISODIC_ENTITY_GRAPH.md`  
 **Status:** Draft / Specification  
 **Component:** `eidos/memory/graph_store.py`, `eidos/memory/entity_extractor.py`  
-**Related Systems:** `eidos/memory/episodic_store.py`, `eidos/memory/recall_stream.py`, `eidos/integrations/optimalx.py`
+**Related Systems:** `eidos/memory/episodic_store.py`, `eidos/memory/recall_stream.py`, `eidos/integrations/optimalx.py`  
+**Resource policy:** [`SPEC_COMPUTE_RESOURCE_POLICY.md`](SPEC_COMPUTE_RESOURCE_POLICY.md) — no `embed_text` during an open Ollama chat stream; macro context uses one embed per task.
 
 ---
 
@@ -159,6 +160,10 @@ When `EpisodicStore.search()` is executed (or `<recall>` is intercepted):
 3. **Composite Score:**
    $$S_{composite} = (1 - \lambda) \cdot S_{vec} + \lambda \cdot S_{graph}$$
    *(Default $\lambda = 0.35$ when entity matches exist, $\lambda = 0.0$ when no entities are mentioned).*
+
+**Old system.** Hybrid ranking is global. A shared entity returns the episode no matter which project it belongs to, and nothing in this spec stops that episode from standing in for the current project.
+
+**Updated job concept.** Entity types gain `job:<job_id>` and `integration:<name>` so an episode records where it happened. The cross-job walk uses a shared real-world entity (an email address, a path, a device), not the job id itself. When the active scope has a `job_id`, a graph hit from another job is returned labeled with that other job and its integration. The caller does not load the other job's brief, notes, artifacts, or MCP tools. Vector-only matches from another job stay excluded, as in [SPEC_EPISODIC_DYNAMIC_SCOPING.md](SPEC_EPISODIC_DYNAMIC_SCOPING.md) and [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.4.
 
 ### 5.2. Relational Query APIs (`eidos/memory/graph_store.py`)
 ```python

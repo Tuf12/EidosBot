@@ -30,10 +30,21 @@ class ToolRegistry:
                             "description": "The exact shell command to run (e.g. 'ls -la', 'df -h', 'curl -sI https://example.com').",
                         },
                         "sandboxed": {
-                            "type": "boolean",
                             "description": (
-                                "Whether to execute inside the kernel sandbox (root & home read-only, workspace read-write). "
-                                "Defaults to true. Set to false only when host system changes or installs are explicitly required."
+                                "Execution surface: omit or 'auto' (config policy), true = kernel nest (bwrap, "
+                                "auto-allowed writes only in configured workspace paths), false = host desktop shell "
+                                "(Gatekeeper may prompt). Desktop co-pilot tasks outside the nest should use false."
+                            ),
+                            "oneOf": [
+                                {"type": "boolean"},
+                                {"type": "string", "enum": ["auto"]},
+                            ],
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": (
+                                "Working directory for the command. For auto nest mode, set this to a path inside "
+                                "the writable workspace when you intentionally want sandboxed execution."
                             ),
                         },
                     },

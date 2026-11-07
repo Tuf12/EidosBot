@@ -9,12 +9,18 @@ interface SharedFilesProps {
   readAloud?: Omit<ReadAloudControl, 'playbackPrefix'>;
 }
 
-type PreviewKind = 'image' | 'pdf' | 'text' | 'binary';
+type PreviewKind = 'image' | 'pdf' | 'text' | 'html' | 'binary';
 
 const TEXT_EXT = new Set([
   'md', 'txt', 'json', 'csv', 'py', 'ts', 'tsx', 'js', 'jsx', 'yaml', 'yml',
-  'log', 'css', 'xml', 'toml', 'rst', 'sh', 'html', 'htm', 'svg',
+  'log', 'css', 'xml', 'toml', 'rst', 'sh',
 ]);
+
+function isHtmlPreview(file: SharedFile): boolean {
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  const mime = (file.mime || '').toLowerCase();
+  return ext === 'html' || ext === 'htm' || mime === 'text/html';
+}
 
 function fileUrl(token: string, id: string, download = false): string {
   const query = new URLSearchParams({ token });
@@ -32,7 +38,8 @@ function formatSize(bytes: number): string {
 function previewKind(file: SharedFile): PreviewKind {
   const ext = file.name.split('.').pop()?.toLowerCase() || '';
   const mime = (file.mime || '').toLowerCase();
-  if (ext === 'svg' || mime.includes('svg')) return 'text';
+  if (isHtmlPreview(file)) return 'html';
+  if (ext === 'svg' || mime.includes('svg')) return 'html';
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext) || mime.startsWith('image/')) return 'image';
   if (ext === 'pdf' || mime === 'application/pdf') return 'pdf';
   if (mime.startsWith('text/') || mime.includes('json') || TEXT_EXT.has(ext)) return 'text';
@@ -134,13 +141,16 @@ function FileViewer({
 }) {
   const kind = previewKind(file);
   const [text, setText] = useState('');
-  const [loading, setLoading] = useState(kind === 'text');
+  const [showHtmlSource, setShowHtmlSource] = useState(false);
+  const [loading, setLoading] = useState(kind === 'text' || (kind === 'html' && showHtmlSource));
   const [error, setError] = useState<string | null>(file.missing ? 'This file is no longer on disk.' : null);
   const url = fileUrl(token, file.id, false);
   const isMarkdown = file.name.toLowerCase().endsWith('.md') || (file.mime || '').includes('markdown');
+  const htmlPreview = kind === 'html';
 
   useEffect(() => {
-    if (kind !== 'text' || file.missing) return;
+    const needsText = kind === 'text' || (kind === 'html' && showHtmlSource);
+    if (!needsText || file.missing) return;
     if (file.size > 1_500_000) {
       setLoading(false);
       setError('This file is too large to preview here. Download it instead.');
@@ -166,11 +176,20 @@ function FileViewer({
     return () => {
       cancelled = true;
     };
-  }, [file.id, file.missing, file.size, kind, url]);
+  }, [file.id, file.missing, file.size, kind, showHtmlSource, url]);
+
+  useEffect(() => {
+    setShowHtmlSource(false);
+    setText('');
+  }, [file.id]);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/70 flex items-end sm:items-center justify-center p-3">
-      <div className="w-full max-w-2xl max-h-[85dvh] bg-[#1e1f29] border border-[#44475a] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+      <div
+        className={`w-full max-h-[85dvh] bg-[#1e1f29] border border-[#44475a] rounded-2xl shadow-2xl flex flex-col overflow-hidden ${
+          htmlPreview ? 'max-w-5xl' : 'max-w-2xl'
+        }`}
+      >
         <div className="flex items-center gap-2 px-3 py-2 border-b border-[#44475a]">
           <div className="min-w-0 flex-1">
             <div className="text-sm font-semibold text-[#f8f8f2] truncate">{file.name}</div>
@@ -179,6 +198,38 @@ function FileViewer({
               {file.path ? ` · ${file.path}` : ''}
             </div>
           </div>
+          {htmlPreview && !file.missing && (
+            <div className="flex rounded-lg border border-[#44475a] overflow-hidden shrink-0">
+              <button
+                type="button"
+                onClick={() => setShowHtmlSource(false)}
+                className={`px-2 py-1 text-[10px] font-semibold ${
+                  !showHtmlSource ? 'bg-[#44475a] text-[#f8f8f2]' : 'text-[#6272a4] hover:text-[#f8f8f2]'
+                }`}
+              >
+                Live
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowHtmlSource(true)}
+                className={`px-2 py-1 text-[10px] font-semibold ${
+                  showHtmlSource ? 'bg-[#44475a] text-[#f8f8f2]' : 'text-[#6272a4] hover:text-[#f8f8f2]'
+                }`}
+              >
+                Source
+              </button>
+            </div>
+          )}
+          {!file.missing && htmlPreview && (
+            <a
+              href={url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="px-2.5 py-1.5 rounded-lg text-[11px] font-semibold text-[#bd93f9] border border-[#44475a] hover:border-[#bd93f9] hidden sm:inline"
+            >
+              New tab
+            </a>
+          )}
           <a
             href={file.missing ? undefined : fileUrl(token, file.id, true)}
             download={file.name}
@@ -212,6 +263,19 @@ function FileViewer({
           )}
           {!loading && !error && kind === 'pdf' && (
             <iframe title={file.name} src={url} className="w-full h-[70dvh] rounded-lg bg-white" />
+          )}
+          {!loading && !error && kind === 'html' && !showHtmlSource && (
+            <iframe
+              title={file.name}
+              src={url}
+              sandbox="allow-scripts allow-forms allow-popups allow-modals"
+              className="w-full h-[70dvh] rounded-lg bg-white border-0"
+            />
+          )}
+          {!loading && !error && kind === 'html' && showHtmlSource && (
+            <pre className="text-[11px] leading-relaxed whitespace-pre-wrap break-words text-[#f8f8f2] font-mono">
+              {text}
+            </pre>
           )}
           {!loading && !error && kind === 'text' && isMarkdown && (
             <MarkdownRenderer

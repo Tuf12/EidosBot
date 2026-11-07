@@ -3,6 +3,10 @@
 
 This document defines the architectural design, dynamic capability scoping, generic data schemas, lifecycle, and execution engine for **EidosBot Skills, Tool Scoping, and Batch Job Queues**.
 
+**Old system.** In this document, a job is the batch queue (`queue.json`), and every specialized tool, including OptimalX, is a skill packaged inside EidosBot.
+
+**Updated job concept.** A job is the project specified in [PROJECT_JOBS.md](PROJECT_JOBS.md): the brief, the `notes/` and `artifacts/` files (images, text, PDFs, spreadsheets, generated reports), and the focus that survives the turn. The batch queue is a component that project can attach. An outside app is an integration attached to that same job. The skill still says how to do the procedure. Tools for a new outside app come from that app's MCP server, and only while the integration is attached. OptimalX stays a built-in skill because OptimalX does not ship an MCP server.
+
 ---
 
 ## ⚠️ ARCHITECTURAL MANDATES
@@ -19,6 +23,10 @@ This document defines the architectural design, dynamic capability scoping, gene
 > - The base agent loop loads only **5 minimal kernel tools**.
 > - All specialized capabilities (GUI navigation, browser automation, OptimalX notes, batch runners) are packaged into **Skills**.
 > - Tools are unlocked dynamically on-demand when a skill is activated via `load_skill`, and dropped when closed with `close_skill` or task completion.
+
+**Old system (mandate 2, last two bullets).** Every specialized capability is a skill whose tool schemas live in `ToolRegistry`, unlocked by `load_skill`.
+
+**Updated job concept.** In-repo capabilities stay skills: desktop GUI, browser, web research, batch runner, user memory, skill authoring. An outside app's tools are not added to `SPECIALIZED_TOOLS`. They are discovered from that app's MCP server when the project job attaches the integration, or when that integration is the focus and no project job is open. The integration's `SKILL.md` is still the procedure. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
 ---
 
@@ -41,6 +49,10 @@ In the monolithic implementation (`eidos/core/context.py` and `eidos/core/loop.p
 1. **Living Skill Documents (`SKILL.md`) as Capability Gates:** Standard operating procedures, evaluation rubrics, and frontmatter tool declarations (`tools_required: [...]`) that dynamically scope the LLM's active tools on demand.
 2. **Lean Base Kernel:** A tight ~120-line system prompt and 7 base tools (including always-on `share_file` and `list_skills`) that protect attention heads, eliminate token bloat by ~90%, and save the 15-hop budget.
 3. **Generic State-Machine Batch Job Engine (`eidos/jobs/`):** A resilient item-by-item runner that decouples large projects (1 to 1,000+ items) into discrete, checkpointed steps with persistent state, progress tracking, and pause/resume capabilities.
+
+**Old system (item 3).** The batch engine is what "job" means.
+
+**Updated job concept.** Item 3 is the batch-queue component. Project identity, the job folder, focus, and integrations are specified in [PROJECT_JOBS.md](PROJECT_JOBS.md).
 
 ---
 
@@ -68,6 +80,10 @@ To maintain clean system boundaries and prevent prompt contamination, EidosBot s
 - **User Profile:** *"Alex prefers concise markdown summaries without conversational fluff."*
 - **Episodic Memory:** *"In episode #42, web scraping timed out after 30 requests; wait 2s between queries."*
 - **Skill / Rubric:** *"Here are the step-by-step instructions, evaluation rubric, and required tools for this specific procedure."*
+
+**Old system.** The triad above is the whole cognitive split: profile, episodic memory, and skills.
+
+**Updated job concept.** [PROJECT_JOBS.md](PROJECT_JOBS.md) section 2 adds the project brief (`job.yaml`) and the integration record (`~/.eidos/integrations/<name>/`). The brief says what this project is. The integration says how to use one outside app and which MCP server supplies its tools. Skills remain the procedures.
 
 ---
 
@@ -112,6 +128,10 @@ The base prompt contains no domain-specific rules, no Playwright recipes, and no
 3. **Core Behavioral Principles (Only 5):**
    - **Principle 1 (Deterministic Tier First):** Prefer direct, deterministic shell commands and scripts via `execute_shell`. Never guess mouse clicks or UI paths when bash/python can execute reliably in 1 step.
    - **Principle 2 (Skill-Driven Capability Expansion):** You have a minimal default toolset. For specialized tasks (GUI automation, browsing, notes, batch queues), use `load_skill` to activate the appropriate procedure and unlock its dedicated tools. Call `close_skill` when done.
+
+**Old system (principle 2).** Specialized work is entered by `load_skill`, and that skill's compiled tools are the only expansion of the kernel.
+
+**Updated job concept.** `load_skill` still opens in-repo procedures. A project job that is already focused also loads the MCP tools of the integrations named on its brief. `focus_integration` opens one outside app when no project job should be focused. Both still leave every other server's tools out of the prompt.
    - **Principle 3 (Concise Reasoning):** Explain your plan concisely in `<thought>` before dispatching tools.
    - **Principle 4 (Active Recall):** If uncertain about a command or past lesson, emit `<recall>query</recall>` to query memory.
    - **Principle 5 (Completion):** Call `finish_task` with a clear summary when the user's goal has been met.
@@ -127,6 +147,10 @@ The base prompt contains no domain-specific rules, no Playwright recipes, and no
 | `finish_task` | Signal completion of the user's task and return the spoken/chat summary. | `summary: str` |
 | `share_file` | Send a local file to the web app for viewing and download, including on a phone. Always available, even while another skill is active. | `path: str`, `note: str = ""` |
 | `list_skills` | List available skills (name, description, tools unlocked) so the agent can choose one before `load_skill`. Always available. | *(none)* |
+
+**Old system.** The table above is the complete base tool set.
+
+**Updated job concept.** [PROJECT_JOBS.md](PROJECT_JOBS.md) adds project-focus tools to the base set: `create_job`, `focus_job`, `list_jobs`, `update_job_brief`, `close_job`, `read_job_document`, `list_integrations`, and `focus_integration`. Batch tools stay on the `batch-runner` skill. MCP tool schemas are not base tools. They appear only while the named integration is loaded.
 
 ---
 
@@ -176,6 +200,10 @@ All specialized tools are mapped to dedicated skills and are only available when
   - `optimalx_reject_pending_review` (Human review action only in desktop app)
   - `optimalx_accept_pending_review` (Human review action only in desktop app)
   - `optimalx_list_pending_reviews` (Exposed only via HUD/UI or CLI)
+
+**Old system.** OptimalX is a built-in skill whose tools are hand-written in this repo and unlocked by `load_skill`.
+
+**Updated job concept.** That skill stays, because OptimalX does not provide an MCP server. A project job lists it as an integration. New apps are not added as further built-in skills with schemas in `ToolRegistry`. They are external MCP servers, attached the way section 13 of [PROJECT_JOBS.md](PROJECT_JOBS.md) attaches Gmail.
 
 #### 4. `batch-runner`
 - **Purpose:** Large-scale repetitive workflows (10 to 1,000+ items) using state-machine queues.

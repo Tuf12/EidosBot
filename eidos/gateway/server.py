@@ -459,6 +459,8 @@ class RemoteGatewayServer:
         self._ws_clients: Set[web.WebSocketResponse] = set()
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._confirm_lock = threading.Lock()
+        self._desktop_ui: Any = None
+        self._telegram_gw: Any = None
         self.files = SharedFileRegistry(on_shared=self._on_file_shared)
         self.live_tts = LiveTtsHub()
         try:
@@ -2082,6 +2084,13 @@ class RemoteGatewayServer:
 
         asyncio.run_coroutine_threadsafe(_send(), self._loop)
 
+    def set_confirmation_peers(self, desktop_ui: Any = None, telegram_gw: Any = None) -> None:
+        """Attach desktop UI and Telegram for unified confirmation fan-out and dismissal."""
+        self._desktop_ui = desktop_ui
+        self._telegram_gw = telegram_gw
+        if telegram_gw is not None and hasattr(telegram_gw, "set_confirmation_resolver"):
+            telegram_gw.set_confirmation_resolver(self.resolve_confirmation)
+
     def request_confirmation(
         self,
         action_type: str,
@@ -2090,6 +2099,7 @@ class RemoteGatewayServer:
         reason: str,
         timeout_seconds: float = 120.0,
         cancel_event: Optional[threading.Event] = None,
+        on_registered: Optional[Callable[[str], None]] = None,
     ) -> Optional[Tuple[bool, bool]]:
         """
         Register a confirmation request and wait for remote resolution.
@@ -2119,6 +2129,12 @@ class RemoteGatewayServer:
             "reason": reason,
         })
 
+        if on_registered:
+            try:
+                on_registered(cid)
+            except Exception as e:
+                logger.error("Confirmation on_registered hook failed: %s", e)
+
         logger.info("Registered remote confirmation request %s (waiting up to %.1fs)", cid, timeout_seconds)
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
@@ -2130,7 +2146,8 @@ class RemoteGatewayServer:
             res = record.get("result")
             self._pending_confirmations.pop(cid, None)
 
-        self.broadcast_event("confirmation_resolved", {"id": cid, "result": res})
+        if res is None:
+            self.broadcast_event("confirmation_resolved", {"id": cid, "result": res})
         return res if event.is_set() and res is not None else None
 
     def resolve_confirmation(self, request_id: str, approved: bool, allowlist: bool = False) -> bool:
@@ -2140,9 +2157,32 @@ class RemoteGatewayServer:
             if not record:
                 return False
 
+            if record.get("result") is not None:
+                return True
+
             record["result"] = (approved, allowlist)
             record["event"].set()
-            return True
+
+        self.broadcast_event(
+            "confirmation_resolved",
+            {"id": request_id, "result": (approved, allowlist)},
+        )
+
+        tg = self._telegram_gw
+        if tg is not None and hasattr(tg, "finalize_confirmation_card"):
+            try:
+                tg.finalize_confirmation_card(request_id, approved, allowlist)
+            except Exception as e:
+                logger.debug("Telegram confirmation finalize failed: %s", e)
+
+        ui = self._desktop_ui
+        if ui is not None and hasattr(ui, "dismiss_gateway_confirmation"):
+            try:
+                ui.dismiss_gateway_confirmation(request_id)
+            except Exception as e:
+                logger.debug("Desktop confirmation dismiss failed: %s", e)
+
+        return True
 
     def is_running(self) -> bool:
         """Return True if background server thread is active."""
@@ -2153,12 +2193,48 @@ class RemoteGatewayServer:
         if not self.is_running():
             return None
 
-        def web_gateway_callback(
-            action_type: str, details: Dict[str, Any], risk_level: RiskLevel, reason: str
-        ) -> Optional[Tuple[bool, bool]]:
-            return self.request_confirmation(action_type, details, int(risk_level), reason)
+        return self.create_unified_confirmation_callback()
 
-        return web_gateway_callback
+    def create_unified_confirmation_callback(
+        self,
+    ) -> Callable[..., Tuple[bool, bool]]:
+        """Single confirmation id shared across web, desktop UI, and optional Telegram."""
+
+        def unified_callback(
+            action_type: str, details: Dict[str, Any], risk_level: RiskLevel, reason: str
+        ) -> Tuple[bool, bool]:
+            if not self.is_running():
+                return False, False
+
+            safety_cfg = {}
+            if hasattr(self.agent_loop, "config") and isinstance(self.agent_loop.config, dict):
+                safety_cfg = self.agent_loop.config.get("safety", {}) or {}
+            timeout_seconds = float(safety_cfg.get("confirmation_timeout_seconds", 120))
+
+            def on_registered(cid: str) -> None:
+                ui = self._desktop_ui
+                if ui is not None and hasattr(ui, "request_gateway_confirmation"):
+                    ui.request_gateway_confirmation(
+                        cid, action_type, details, int(risk_level), reason
+                    )
+                tg = self._telegram_gw
+                if tg is not None and hasattr(tg, "attach_confirmation_card"):
+                    if getattr(tg, "should_notify_risk_approval", lambda: False)():
+                        tg.attach_confirmation_card(
+                            cid, action_type, details, int(risk_level), reason
+                        )
+
+            res = self.request_confirmation(
+                action_type,
+                details,
+                int(risk_level),
+                reason,
+                timeout_seconds=timeout_seconds,
+                on_registered=on_registered,
+            )
+            return res if res is not None else (False, False)
+
+        return unified_callback
 
     def create_composite_confirmation_callback(
         self, desktop_callback: Optional[Callable[..., Tuple[bool, bool]]] = None

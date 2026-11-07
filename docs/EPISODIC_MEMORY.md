@@ -347,6 +347,10 @@ eidos/
 
 ---
 
+## Resource isolation (GPU / Ollama)
+
+Background memory work (reflector, future consolidator) must not stack a second local reasoning model on the GPU while the user or agent is active. See [`docs/specs/SPEC_COMPUTE_RESOURCE_POLICY.md`](specs/SPEC_COMPUTE_RESOURCE_POLICY.md).
+
 ## 7. Storage Specifications & Technical Metrics
 
 | Component | Technology | Storage Location | Latency / Footprint |
@@ -372,4 +376,8 @@ To complete the full episodic memory lifecycle, four modular engineering specifi
    *Off-peak clustering of repetitive tasks into canonical golden recipes, deduplication, and habit promotion to Tier B profile rules and skills.*
 4. **Context-Aware Dynamic Task Scoping & Multi-Source Fusion:** [`docs/specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md`](specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md)  
    *Dynamic environmental scope resolution (project, active skill, window) and soft-boost re-ranking across episodic, note, and chat stores.*
+
+**Old system (item 4).** Scope is the git project, the active skill, and the focused window.
+
+**Updated job concept.** Scope also carries the primary project job (`job_id`) and the integration used on that turn (`gmail`). Vector recall stays inside the job. The entity graph may return an episode from another job when they share an entity, without loading that job's brief or tools. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 

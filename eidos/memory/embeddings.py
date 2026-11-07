@@ -71,6 +71,8 @@ class OllamaEmbeddingClient:
             payload: Dict[str, Any] = {
                 "model": self.model,
                 "input": texts,
+                # Drop weights after CPU embed so the chat LLM is not competing in Ollama.
+                "keep_alive": 0,
             }
             options = self._request_options()
             if options:
@@ -92,7 +94,11 @@ class OllamaEmbeddingClient:
         results: List[List[float]] = []
         try:
             for t in texts:
-                body: Dict[str, Any] = {"model": self.model, "prompt": t}
+                body: Dict[str, Any] = {
+                    "model": self.model,
+                    "prompt": t,
+                    "keep_alive": 0,
+                }
                 options = self._request_options()
                 if options:
                     body["options"] = options

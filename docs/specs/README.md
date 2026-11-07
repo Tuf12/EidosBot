@@ -23,3 +23,7 @@ These 4 modules systematically complete the four cognitive capabilities required
 2. **Associative Structure (`Entity Graph`):** Linking episodes to real-world objects, system tools, and workspace projects.
 3. **Abstraction & Long-Term Consolidation (`Consolidator`):** Compacting memory during idle periods to prevent vector bloat and promote recurring patterns to instinctual procedural habits.
 4. **Situated Relevance (`Dynamic Scoping`):** Filtering and boosting memories based on the agent's immediate physical and digital surroundings.
+
+**Old system (item 4).** Surroundings mean the git project, working directory, skill, and window.
+
+**Updated job concept.** Surroundings also mean the primary project job and any attached integration. Vector hits from another job are dropped. A shared entity may still surface that other job's episode. The other job's files and tools stay unloaded. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.

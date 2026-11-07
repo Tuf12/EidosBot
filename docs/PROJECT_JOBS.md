@@ -5,6 +5,8 @@ This document defines how a **job** becomes the project EidosBot is working insi
 
 The batch runner, queue schema, and per-item processor stay as specified in [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md). This document changes what `job.yaml` is for, how the agent sees it, and how depth documents are read.
 
+Outside apps (Gmail, Calendar, Schwab, OptimalX) are integrations attached to a job. They are specified in [section 13](#13-integrations-and-mcp-servers). An integration is not a job.
+
 ---
 
 ## Architectural mandates
@@ -23,6 +25,14 @@ The batch runner, queue schema, and per-item processor stay as specified in [SKI
 >
 > **5. Focus survives the turn.**  
 > Finishing a chat task does not close the job. The user and the agent close or switch focus on purpose.
+
+**Old system (mandate 2).** Longer explanation belongs only in `.md` or `.txt` files inside the job directory.
+
+**Updated job concept.** `notes/` stays the long writing, in `.md` or `.txt`, read by path when a step needs it. `artifacts/` holds the other files that pertain to the project: images, PDFs, spreadsheets, and generated reports. A file that arrives through an integration is saved into the project job it belongs to. A lease PDF fetched through Gmail goes in `jobs/lease/artifacts/`. The prompt still receives the brief and the document index. The file is read by path for that step, then dropped.
+
+**Old system (mandate 4).** The attachable components are skills, a batch queue, ad-variant runs, invention evaluation, and a later job-local index.
+
+**Updated job concept.** An integration is also a component. It names an outside app and the skill that says how Eidos uses that app. The app's tools come from that app's MCP server and are loaded only while the integration is attached to the primary job, or while that integration is the focus because no project job is open.
 
 ---
 
@@ -46,7 +56,15 @@ A project needs a small file that states what this thing is, what it is not, whi
 | **Job brief (`job.yaml`)** | **What this project is right now** | **Every turn while it is the primary focus** |
 | Depth files (`.md`, `.txt`) | The long explanation | Read when the brief says this step needs that file |
 
-The brief is not a fifth copy of the profile, and it is not a dump of embeddings. It is the boundary of the current project.
+**Old system.** The table above ends at the job brief and its depth files. Outside apps are reached by skills that ship their tools inside EidosBot.
+
+**Updated job concept.** Add this row to the split:
+
+| Store | Question it answers | When it is used |
+| :--- | :--- | :--- |
+| **Integration** (`~/.eidos/integrations/<name>/`) | How to use this outside app, and which MCP server supplies its tools | While the primary job lists it, or while it is the focus and no project job is open |
+
+The brief is not a fifth copy of the profile, and it is not a dump of embeddings. It is the boundary of the current project. The integration record is not a second brief. It does not say what the lease or the lantern is.
 
 ---
 
@@ -63,7 +81,11 @@ The brief is not a fifth copy of the profile, and it is not a dump of embeddings
 └── artifacts/               # generated output (portfolios, variants, reports)
 ```
 
-`queue.json` remains the checkpointed item list from [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md). Saving the queue must not rewrite the brief. The runner may refresh the `progress` block inside `job.yaml`. It must leave identity, boundary, decisions, skills, and document pointers untouched.
+**Old system.** `artifacts/` is generated output only: portfolios, variants, and reports.
+
+**Updated job concept.** `artifacts/` also holds files that pertain to the project and were not produced by the batch runner. That includes images, PDFs, spreadsheets, and attachments saved out of an integration. `notes/` stays the long text. `documents` in `job.yaml` is the index for both. Integration config does not live in this folder. A Gmail connection is shared by every project that sends mail, so it lives under `~/.eidos/integrations/gmail/` as specified in [section 13](#13-integrations-and-mcp-servers).
+
+`queue.json` remains the checkpointed item list from [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md). Saving the queue must not rewrite the brief. The runner may refresh the `progress` block inside `job.yaml`. It must leave identity, boundary, decisions, skills, document pointers, and integration attachments untouched.
 
 ---
 
@@ -138,6 +160,10 @@ Rules for the brief:
 - `skills` is the set this project uses. Entering primary focus unlocks those skills' tools. The agent does not re-discover them from the global catalog on every turn.
 - `documents` is the retrieval index. Each entry names a path, a one-line summary, and when to read it.
 
+**Old system.** The brief lists skills, documents, and an optional batch queue. It has no field for an outside app.
+
+**Updated job concept.** The brief also has `integrations:`, a list of `{name, use_when}` entries. Each name matches a directory under `~/.eidos/integrations/`. Focusing the job loads those integrations. The schema is in [section 13](#13-integrations-and-mcp-servers).
+
 ---
 
 ## 5. How depth files are used
@@ -151,6 +177,10 @@ Use the files like this:
 3. When the current step matches a document's `read_when`, the agent or the item worker reads that file by path. If the brief names a heading, read that section.
 4. The worker uses the file as source material for this step, then returns to the brief. It does not keep the whole file in context for later items.
 5. Episodic recall answers "what went wrong last time we tried this," and only inside this job's tagged episodes. It does not answer "what is this project."
+
+**Old system (item 5).** A recall that misses inside this job stops. No episode from another job is returned.
+
+**Updated job concept.** Vector similarity still searches this job's tagged episodes and does not backfill with another project's nearest hit. The entity graph may return an episode from another job when the two share an entity, such as an email address or a file path. That hit is labeled with its `job_id` and its integration. The other job's brief, notes, artifacts, and tool list stay unloaded. The graph walk is specified in [SPEC_EPISODIC_ENTITY_GRAPH.md](specs/SPEC_EPISODIC_ENTITY_GRAPH.md).
 
 A job-local search index may be added later as a component, the same way a batch queue is added. It searches only that job's directory, and only after the index is not enough. It stays off until a project actually outgrows headings. It never writes into the global vector database.
 
@@ -168,6 +198,16 @@ A component is an ability attached to a job. The core job does not know what an 
 | Batch queue | Item-by-item checkpointed work | `queue.json`, run by `BatchJobRunner` |
 | Depth notes | Long project memory | `notes/*.md`, listed under `documents` |
 | Job-local index | Search across this job's notes only | Future component; off by default |
+
+**Old system.** The table above is the full component set. Reaching an outside app means a skill whose tools are compiled into EidosBot, as OptimalX is today.
+
+**Updated job concept.** Add this component:
+
+| Component | What it adds | Where it lives |
+| :--- | :--- | :--- |
+| Integration | Which outside app is in use, the skill for how to use it, and the MCP server that supplies its tools | `integrations:` on the brief, record in `~/.eidos/integrations/<name>/` |
+
+Gmail on the lease job is this component. The lease brief stays the project. The Gmail skill says to search first, create a draft, and leave sending to the user. Google's Gmail MCP server supplies search, read, label, and draft. Those tools are in the prompt only while `gmail` is attached, or while Gmail is the focus because no project job is open.
 
 Examples, all on the same engine:
 
@@ -188,6 +228,10 @@ The agent has one primary job. While it is set:
 - The full brief is appended to the system prompt on every step.
 - The job's skills are the tools in scope, on top of the base kernel.
 - New episodes are tagged with this `job_id`.
+
+**Old system.** Tool scope is the base kernel plus the skills named on the brief. Episode tags carry `job_id` only.
+
+**Updated job concept.** Tool scope also includes the MCP tools of each integration named on the brief. A new episode is tagged with `job_id` and with the integration used on that turn (`gmail`, or empty when the turn did not use one). Skill bodies for those integrations are injected with the brief. Integrations the brief does not name stay unloaded.
 - `retrieve_macro_context` searches episodes with that tag first. Generic pitfalls from outside the job are included only when they are about the tool or the environment, not about a different project.
 - The floating pill and the web app show the job name as the scope tag.
 
@@ -204,6 +248,10 @@ Additional jobs are allowed. They are attached, not co-equal.
 - If the user starts talking about a different project, the agent says so and offers to switch. It does not silently load a second full brief.
 
 The default is one job. Several running queues are a real case (a long invention batch in the background while the user talks through the primary project). Several full briefs in one prompt is not.
+
+**Old system.** Anything else open beside the primary job is another job, represented by a status line.
+
+**Updated job concept.** An outside app is not an attached job. It is an integration named by the primary job. Attached jobs remain other projects, and their briefs stay out of the prompt. When the user asks to check mail and no project is open, Gmail can be the focus by itself. That loads the Gmail skill and the Gmail tools. It does not invent a job named Gmail, and it does not load the lease brief or the lantern brief.
 
 ### 7.3. Where focus is stored
 
@@ -230,6 +278,10 @@ Base tools gain project focus, separate from the batch-runner skill:
 - `close_job` clears primary focus. Running workers are left running and stay visible as secondary tags until they finish or are paused.
 - `read_job_document` reads one depth file, or one heading, from the primary job.
 
+**Old system.** The base job tools are `create_job`, `focus_job`, `list_jobs`, `update_job_brief`, `close_job`, and `read_job_document`.
+
+**Updated job concept.** Add `list_integrations` and `focus_integration` to that base set. `list_integrations` returns the configured integrations (name, server, one-line use). `focus_integration` makes one integration the focus when no project job should open. `update_job_brief` is how a project job gains or drops an `integrations:` entry. The model cannot add an MCP server, change a server command, or read stored tokens.
+
 `init_batch_job`, `run_batch_job`, `step_batch_job`, `pause_batch_job`, `resume_batch_job`, and `generate_batch_summary` stay on the `batch-runner` skill. A job lists that skill when it has a queue.
 
 Prompt block for the primary job, rebuilt from `job.yaml` each step:
@@ -255,6 +307,19 @@ Attached jobs (status only):
 If a similar memory or search result conflicts with this brief, follow the brief.
 ```
 
+**Old system.** The prompt block above is the whole project scope: brief, skills, documents, and attached-job status lines.
+
+**Updated job concept.** When the brief lists an integration, append this block under the skills list. The example is the lease job with Gmail attached:
+
+```
+Attached integration: gmail
+Server: gmail (tools loaded for this step)
+Use when: Reading or drafting mail about this lease.
+Skill: gmail — search first, create a draft, leave sending to the user.
+```
+
+The Gmail tool schemas for this step come from the connected MCP server. They are namespaced `mcp__gmail__<tool>`. They leave the prompt when the lease job is no longer primary and Gmail is not the standalone focus. Item workers that need the integration receive the same block.
+
 Item workers receive the same identity and boundary block at the top of their system prompt, ahead of skill text and ahead of search results. Prior art and similar examples are labeled as comparison material.
 
 ---
@@ -271,7 +336,11 @@ When an episode is indexed, store `job_id` of the primary job at that time (empt
 
 `<recall>` uses the same filter while a primary job is set. A recall that finds nothing inside the job says so, and does not backfill with the nearest other project.
 
-OptimalX notes stay a skill the job can list. They are not searched automatically just because a project is open.
+**Old system.** Recall is a hard wall at `job_id`. OptimalX is a skill the job can list, and its tools are the hand-written bridge in `eidos/integrations/optimalx.py`.
+
+**Updated job concept.** The hard wall stays for vector similarity: another project's nearest episode is not used as this project's experience. The entity graph is the exception. A shared entity may surface an episode tagged with a different `job_id`. The result names that job and the integration on the episode. `<recall>` does not open that job's brief to get the hit. Episodes written from now on also store the integration name, empty when the turn used none.
+
+OptimalX stays the in-repo bridge, because OptimalX does not ship an MCP server. A job lists the `optimalx` integration the same way it lists `gmail`. New apps are separate processes with their own MCP servers. Their tool schemas are not added to `ToolRegistry.SPECIALIZED_TOOLS`. See [section 13](#13-integrations-and-mcp-servers).
 
 ---
 
@@ -280,6 +349,10 @@ OptimalX notes stay a skill the job can list. They are not searched automaticall
 The user should be able to see the scope without opening a file.
 
 **Floating pill** (`eidos/ui/pill.py`): under the status line, a compact tag with the primary job name. Example: `Job · Coil lantern`. While other jobs are running, a second quieter line lists them, truncated, such as `Running · Variant sweep 40/120`. No primary job means no tag.
+
+**Old system.** The visible tag is the primary job, plus running attached jobs. No tag means no project is focused.
+
+**Updated job concept.** When an integration is attached, the primary tag gains it: `Job · Coil lantern · gmail`. When no project job is open and an integration is the focus, the tag is the integration alone: `Gmail`. Running attached jobs stay on the quieter line.
 
 **Web app** (`web/src/components/Header.tsx`): a chip beside the conversation title for the primary job. Running or pinned attached jobs are smaller chips. The chip is a label, not a second conversation switcher. A later click target may open job details; the first version only displays state.
 
@@ -295,6 +368,23 @@ Payload:
   ]
 }
 ```
+
+**Old system.** `job_focus` carries the primary job and running jobs only.
+
+**Updated job concept.** Add the attached or focused integrations:
+
+```json
+{
+  "primary": {"job_id": "job_20261010_083000_a1b2", "name": "Coil lantern", "phase": "concept"},
+  "integrations": [{"name": "gmail"}],
+  "integration_focus": null,
+  "running": [
+    {"job_id": "job_20261009_120000_cc11", "name": "Variant sweep", "status": "in_progress", "completed_items": 40, "total_items": 120}
+  ]
+}
+```
+
+`integration_focus` is the integration name when no project job is primary. It is null while a project job is focused.
 
 ---
 
@@ -331,6 +421,10 @@ Work in this order. Each phase is usable before the later ones.
 - Filter `retrieve_macro_context` and `<recall>` as described in section 9.
 - Tests in `tests/test_recall_stream.py`: a hit from another job is not returned as this project's experience.
 
+**Old system.** The recall test above treats any hit from another job as a failure.
+
+**Updated job concept.** A vector hit from another job is still a failure. A graph hit that shares an entity with this job is returned and labeled with that other `job_id` and its integration. The test gains that second case. See [section 13](#13-integrations-and-mcp-servers).
+
 ### Phase 13.5 — Workers receive the brief
 
 - Pass identity and boundary into `SkillJobProcessor.process_item` ahead of skill text and search results.
@@ -350,6 +444,10 @@ Work in this order. Each phase is usable before the later ones.
 - Run the job, context, scoping, and recall tests. Do not boot the full app repeatedly.
 - Confirm an existing `queue.json` from before this change still loads. Missing brief fields mean "no boundary yet," not a hard failure.
 
+**Old system.** Phases 13.1–13.7 finish the job system: a durable brief, focus, prompt tools, job-scoped recall, workers, and tags.
+
+**Updated job concept.** Those phases still build the project job. Integrations and MCP servers are the following pass, specified in [section 13](#13-integrations-and-mcp-servers). They are not folded into 13.1–13.7.
+
 ---
 
 ## 12. Out of scope for this pass
@@ -358,3 +456,101 @@ Work in this order. Each phase is usable before the later ones.
 - Embedding depth files, globally or per job.
 - Automatic creation of a job for every chat. The agent creates or switches a job when the user is actually working a project.
 - Changing the batch item state machine, pacing, or ranking summary format.
+
+**Old system.** The list above is everything this document leaves for later.
+
+**Updated job concept.** Building Gmail, Calendar, or Schwab clients inside `eidos/integrations/` is also out of scope. Those apps stay outside this repo and expose an MCP server. The EidosBot work is the client, the integration record, and the memory tags in section 13. OptimalX stays the existing in-repo bridge.
+
+---
+
+## 13. Integrations and MCP servers
+
+An integration is the connection to one outside app. A job is the project that uses it.
+
+| | Project job | Integration |
+| :--- | :--- | :--- |
+| Question it answers | What this project is | How to operate this app |
+| Example | The lease, the coil lantern, the IRA | Gmail, Calendar, Schwab, OptimalX |
+| Prompt contents while focused | Full brief | Skill body and that server's tools |
+| Files | `~/EidosWorkspace/jobs/<project>/` | None. Attachments are saved into the project job |
+| Memory tag | `job_id` | `integration` on the same episode |
+
+Opening a job named Gmail would put the lease threads and the lantern threads in one brief and one memory pile. The lease job stays primary. Gmail is attached to it.
+
+### 13.1. Where an integration lives
+
+```
+~/.eidos/integrations/gmail/
+├── integration.yaml     # server binding, skill name, when to use it
+└── SKILL.md             # how this user wants Gmail used
+```
+
+```yaml
+name: gmail
+server: gmail            # key in ~/.eidos/mcp.json
+description: Search mail, read a thread, and create a draft.
+use_when: The user asks to read, find, or draft email.
+```
+
+The job brief attaches it by name:
+
+```yaml
+integrations:
+  - name: gmail
+    use_when: Reading or drafting mail about this lease.
+```
+
+`~/.eidos/mcp.json` is the server list. The model cannot edit it. A remote server is a URL. A local server is a command, args, and env. Tokens stay in that env or in a secret file. They are not copied into `integration.yaml`, `job.yaml`, the prompt, or `documents`.
+
+Gmail's server is Google's, at `https://gmailmcp.googleapis.com/mcp/v1`, over streamable HTTP, with Google OAuth. Calendar is a different server and a different integration. Schwab has no server to point at. A Schwab integration exists only after an API bridge or an MCP server is written in front of Schwab's API, outside this repo, the same way OptimalX was bridged inside the repo because OptimalX ships no MCP server.
+
+Project files stay in the job directory from [section 3](#3-directory-layout):
+
+```
+~/EidosWorkspace/jobs/lease/
+├── job.yaml
+├── notes/            # long text
+└── artifacts/        # images, PDFs, spreadsheets, generated reports
+```
+
+### 13.2. What is loaded
+
+Focusing a project job loads the integrations named on its brief.
+
+- The integration `SKILL.md` is appended with the brief.
+- The client connects to that server, calls `tools/list`, and adds those schemas to the tool payload for subsequent steps.
+- Tool names are `mcp__<server>__<tool>`, so `search` on Gmail cannot collide with `execute_shell` or with another server.
+- A server that publishes more than about 20 tools does not put every schema in the prompt. The skill body gets a name-and-one-line catalog, and the model calls them through `call_mcp_tool`.
+
+`focus_integration` is the path for "check my inbox" when no project job should open. It loads that one skill and that one server. `focus.yaml` gains an `integration_focus` field for this case. It stays empty while a project job is primary.
+
+`close_job` clears the primary job and unloads the integrations that job had attached. It does not delete the integration records.
+
+The MCP session lives on a daemon thread with its own event loop. `AgentLoop` stays synchronous and calls `list_tools()` and `call_tool()` through that thread. A new event loop per call would drop the server process.
+
+### 13.3. Safety
+
+Every MCP call goes through the existing gatekeeper.
+
+| MCP annotation | Eidos risk |
+| :--- | :--- |
+| `readOnlyHint` | Level 0, auto-allow |
+| `destructiveHint` | Level 3, hard confirm |
+| anything else | Level 2, prompt, allowlist by server plus tool name |
+
+The server entry in `mcp.json` is trusted, because the user wrote it. The arguments the model fills in are checked like any other action. Calls are audited with the tool name and arguments.
+
+### 13.4. Memory tags
+
+An episode stores both ids:
+
+- `job_id` of the primary job, empty when only an integration was focused.
+- `integration` of the app used on that turn, empty when the turn used none.
+
+Vector recall prefers the active `job_id` and does not replace a miss with another project's nearest episode. The entity graph may still return an episode from another job when they share an entity. From the lease job, the landlord's address can pull the Gmail episode that touched it. The lantern brief stays out.
+
+### 13.5. Where new apps are built
+
+**Old system.** An outside app is a Python bridge and a list of tool schemas inside this repo. OptimalX is that pattern: `eidos/integrations/optimalx.py` plus the `optimalx` skill.
+
+**Updated job concept.** OptimalX keeps that bridge until it has an MCP server. The next app is its own process, with its own MCP server. EidosBot adds the client, the integration record, the skill, and the `job_id` / `integration` tags. It does not gain a Gmail client, a Calendar client, or a Schwab client in `eidos/integrations/`.

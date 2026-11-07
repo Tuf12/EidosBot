@@ -21,6 +21,7 @@ import soundfile as sf
 from device_resolve import cuda_mem_info, resolve_stt_provider
 from stt_chunk import SAFE_SINGLE_PASS_SECONDS, plan_slices, stitch_transcripts
 from stt_model import DEFAULT_MODEL, ensure_model, model_paths, model_ready, normalize_model_id
+from ctx_trace import wrap as ctx_wrap, flush as ctx_flush  # CTX-TRACKER
 
 _RECOGNIZER = None
 _RECOGNIZER_KEY = None
@@ -145,13 +146,15 @@ def transcribe(wav_path: str, model_name: str, device: str | None) -> dict:
     if len(slices) > 1:
         duration = audio.shape[0] / float(rate) if rate else 0.0
         print(
-            f"STT chunking {duration:.1f}s audio into {len(slices)} slices (240s model cap)",
+            f"STT chunking {duration:.1f}s audio into {len(slices)} slices (~60s target, 240s model cap)",
             file=sys.stderr,
             flush=True,
         )
 
     parts = [_decode_slice(recognizer, audio[start:end], rate) for start, end in slices]
+    parts = ctx_wrap(parts, section="history")  # CTX-TRACKER
     text = stitch_transcripts(parts)
+    ctx_flush()  # CTX-TRACKER
 
     return {
         "ok": True,

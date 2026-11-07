@@ -101,6 +101,10 @@ Tapping a button or typing a quick voice/text reply immediately unpauses the job
 | `/kill` | **Global Remote Kill Switch:** Instantly terminates active child processes, stops the loop, and halts all tasks. |
 | `/clear` | Clears active conversation memory context for a fresh session. |
 
+**Old system.** `/jobs` lists batch queues. A job on Telegram means a running `queue.json`.
+
+**Updated job concept.** `/jobs` still lists batch queues, because those are the long-running component. The project job and any attached integration are part of `/status`, using the `job_focus` payload in [PROJECT_JOBS.md](PROJECT_JOBS.md) section 10: primary job name, attached integrations, and `integration_focus` when no project is open.
+
 ---
 
 ## 5. Security & Authentication Safeguards

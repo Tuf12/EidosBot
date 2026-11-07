@@ -268,10 +268,10 @@ class RecallStreamInterceptor:
                             logger.info("Active Recall tag intercepted during streaming: '%s'", query)
                             interception_triggered = True
 
-                            # Close HTTP stream immediately
+                            # Close HTTP stream before Ollama embed lookup (avoid concurrent requests).
                             resp.close()
+                            resp = None
 
-                            # Perform vector & notes lookup
                             mem_result = self.lookup_memory(query)
                             notes_result = self.lookup_optimalx_notes(query, limit=2)
                             splice_text = self.format_recalled_memory(mem_result, query, optimalx_notes=notes_result)
@@ -373,6 +373,8 @@ class RecallStreamInterceptor:
         on_recall_callback: Optional[Callable[[str, str], None]] = None,
         on_response: Optional[Callable[[Any], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        service_name: str = "Chutes AI",
     ) -> ModelResponse:
         """Stream OpenAI-compatible SSE chat completion, intercepting `<recall>` tags and splicing memories."""
         current_messages = list(messages)
@@ -395,6 +397,8 @@ class RecallStreamInterceptor:
                 "messages": current_messages,
                 "stream": True,
             }
+            if extra_payload:
+                payload.update(extra_payload)
             if tools:
                 payload["tools"] = tools
                 payload["tool_choice"] = "auto"
@@ -481,6 +485,7 @@ class RecallStreamInterceptor:
                             interception_triggered = True
 
                             resp.close()
+                            resp = None
 
                             mem_result = self.lookup_memory(query)
                             notes_result = self.lookup_optimalx_notes(query, limit=2)
@@ -521,9 +526,13 @@ class RecallStreamInterceptor:
                         pass
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
                 if status_code == 429 or "429" in str(exc):
-                    err_text = "Error communicating with Chutes AI: 429 Client Error (Rate limit or concurrency quota exceeded on Chutes AI). Please wait a moment or switch provider preference to 'local' in Settings."
+                    err_text = (
+                        f"Error communicating with {service_name}: 429 Client Error "
+                        "(Rate limit or concurrency quota exceeded). Please wait a moment "
+                        "or switch provider preference to 'local' in Settings."
+                    )
                 else:
-                    err_text = f"Error communicating with Chutes AI: {str(exc)}"
+                    err_text = f"Error communicating with {service_name}: {exc}"
                 return ModelResponse(
                     content=err_text,
                     model=model_name,

@@ -104,6 +104,10 @@ The dialog displays a distinct red banner:
 To eliminate "prompt fatigue" from endless allowlist confirmation popups while maintaining absolute security, EidosBot integrates Linux **Bubblewrap (`bwrap`)**:
 - **Kernel-Level Read-Only Mounts:** Root (`/`), system directories (`/etc`, `/usr`), and the user home directory (`~`) are mounted strictly read-only.
 - **Dedicated Writeable Workspace:** Only designated task folders (e.g., `~/EidosWorkspace` or active batch job folders) are mounted read-write (`--bind`).
+
+**Old system.** The writable example is the workspace or a batch-job folder.
+
+**Updated job concept.** The writable project directory is `~/EidosWorkspace/jobs/<project>/`, including `notes/` and `artifacts/`. Integration records and tokens under `~/.eidos/` stay outside that mount. The model does not get a writable path to `mcp.json`.
 - **Elimination of Allowlist Fatigue:** Shell commands executed inside the sandbox are **auto-allowed** without interrupting the user, because even a rogue `rm -rf /` or recursive deletion physically fails at the kernel VFS layer with `Read-only file system`.
 - **Targeted Host Mode:** Only actions requiring actual host system changes (e.g., system package installs or root configuration) trigger the Gatekeeper confirmation dialog or Telegram approval card.
 
@@ -275,6 +279,10 @@ For full design specifications, see [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md) and
 - **Context Isolation:** Runs each item in a clean context window injecting the skill rubric, preventing token saturation or quality degradation over long runs.
 - Supports pause, resume, milestone notifications, and ranking summary aggregation.
 
+**Old system.** Section 7 treats the batch queue as the job, and skills inside this repo as the way to reach specialized tools.
+
+**Updated job concept.** The batch queue is a component of a project job. The project lives in `~/EidosWorkspace/jobs/<project>/` with `job.yaml`, `notes/`, and `artifacts/` for images, text, PDFs, spreadsheets, and generated reports. An outside app is an integration attached to that job. Its tools come from its MCP server. See [PROJECT_JOBS.md](PROJECT_JOBS.md).
+
 ---
 
 ## 8. Headless Browser Automation (Playwright & CDP)
@@ -333,6 +341,10 @@ For full design specifications, see [MOBILE_PWA_GATEWAY.md](MOBILE_PWA_GATEWAY.m
 ## 11. OptimalX Bi-Directional Note & Knowledge Integration
 
 For full design specifications, see [OPTIMALX_INTEGRATION.md](OPTIMALX_INTEGRATION.md).
+
+**Old system.** OptimalX is a first-party bridge compiled into EidosBot, with its own tool schemas.
+
+**Updated job concept.** This section stays the spec for that bridge, because OptimalX does not ship an MCP server. A project job lists OptimalX as an integration. New apps are separate processes with MCP servers, attached the same way, and are not added as further sections of in-repo tool schemas. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
 ### 11.1. Synchronized Single Source of Truth
 - **Universal Mobile & Desktop Sync:** Notes created on the go in OptimalX Mobile sync over Tailscale WireGuard to OptimalX Desktop.

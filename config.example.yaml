@@ -15,13 +15,29 @@ models:
     timeout_seconds: 120
     num_ctx: 65536                  # Ollama context ceiling (64k); omit only to use the model default
 
+  compute:
+    idle_seconds: 900               # Background local LLM after 15m idle (300 = 5m)
+    background_prefer_cloud: true   # Reflector/consolidator use Chutes when foreground busy
+    defer_local_when_slot_held: true  # Route to Chutes if GPU inference slot is taken
+
   cloud:
-    provider: "chutes"
+    provider: "chutes"                # Cloud/auto backend: "chutes" or "meta"
     base_url: "https://llm.chutes.ai/v1"
     api_key: "YOUR_CHUTES_API_KEY_HERE"
     vision_model: "Qwen/Qwen3.5-397B-A17B-TEE"        # Flagship 397B GUI/vision MoE (17B active)
     reasoning_model: "moonshotai/Kimi-K2.6-TEE"       # 1T MoE agentic reasoning & planning
     timeout_seconds: 180
+
+  # Meta Muse via Model API (https://api.meta.ai/v1). Key can also come from MODEL_API_KEY.
+  # Standard IDs are not used to train Meta models. *-contributor IDs are cheaper and may be.
+  # muse-wonder-1.0 is the stronger model for long desktop tasks; muse-spark-1.3 is the default.
+  meta:
+    base_url: "https://api.meta.ai/v1"
+    api_key: ""                       # Leave empty to use the MODEL_API_KEY environment variable
+    reasoning_model: "muse-spark-1.3" # muse-spark-1.3 | muse-wonder-1.0 | muse-spark-1.2 | muse-spark-1.1 | *-contributor
+    vision_model: "muse-spark-1.3"    # Same Muse models accept images
+    reasoning_effort: "high"          # minimal | low | medium | high | xhigh | max (max: wonder 1.0 and spark 1.3 only)
+    timeout_seconds: 300
 
 safety:
   kill_switch_hotkey: "<ctrl>+<alt>+<esc>"
@@ -61,7 +77,8 @@ voice:
   optimalx_voice_dir: null        # Auto: repo OptimalX_Voice/voice/python, then ~/OptimalX/electron/voice/python
   tts_voice: "bm_george"          # Kokoro voice (54 voices: bm_george, af_bella, am_adam, etc.)
   tts_speed: 1.0
-  device: "cpu"                  # CPU preserves GPU VRAM for Ollama LLM
+  device: "cpu"                  # Kokoro TTS on CPU (GPU for Ollama LLM)
+  stt_device: "cpu"              # Parakeet INT8 on CPU (use cuda only with inference_slot; long audio chunked at 60s)
   push_to_talk_hotkey: "<ctrl>+<alt>+<space>"
   auto_speak_responses: true     # Speak every chat reply aloud (OptimalX growing windows: 80-140, 160-220, 380)
   auto_submit_transcription: true  # Send push-to-talk transcripts as the next chat turn
@@ -80,7 +97,7 @@ gateway:
     allowed_user_ids: []         # Numerical Telegram User IDs permitted to interact (strict whitelist)
     remote_kill_switch_enabled: true  # Allow authorized users to trigger global emergency stop via /kill or card
     notifications:
-      on_risk_approval: true     # Send interactive inline button cards when Risk Classifier blocks a command
+      on_risk_approval: false    # Mirror safety prompts to Telegram (web + desktop pill are primary)
       on_job_milestones: true    # Push progress updates for batch runner tasks (e.g. every N items or completion)
       on_task_completed: true    # Send final summary message when an agent task finishes
 
@@ -96,11 +113,14 @@ memory:
   reflector:
     enabled: true                # Autonomous post-task critique and calibrated critic scoring
     timeout_seconds: 30.0        # Evaluation LLM timeout
-    model: ""                    # Optional specific evaluation model (defaults to router / reasoning model)
+    idle_seconds: 900              # Local Ollama critique only after this idle (Chutes when busy)
+    prefer_cloud_when_busy: true
+    model: ""                    # Optional Chutes model id for critique; empty = router default
 
 sandbox:
   enabled: true
   engine: "bwrap"                       # "bwrap" on Linux; "none" fallback
+  default_shell_mode: auto              # auto | host | sandboxed — auto = desktop host unless nest is explicit/confined
   default_workspace: "~/EidosWorkspace" # Default writeable directory
   
   # Paths that are mounted read-write inside the sandbox

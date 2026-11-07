@@ -122,6 +122,9 @@ class TelegramGateway:
         # Confirmation records: cid -> dict
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._confirm_lock = threading.Lock()
+        # Cards keyed by shared gateway confirmation id (no separate wait loop)
+        self._attached_confirmation_cards: Dict[str, List[Tuple[int, int]]] = {}
+        self._confirmation_resolver: Optional[Callable[..., bool]] = None
 
     @property
     def _pending_approvals(self) -> Dict[str, Dict[str, Any]]:
@@ -147,6 +150,14 @@ class TelegramGateway:
     def is_running(self) -> bool:
         """Return True if background bot thread and application are active."""
         return self._running and self._thread is not None and self._thread.is_alive()
+
+    def set_confirmation_resolver(self, resolver: Callable[..., bool]) -> None:
+        """Resolve approvals through the web gateway's shared confirmation id."""
+        self._confirmation_resolver = resolver
+
+    def should_notify_risk_approval(self) -> bool:
+        """Whether to mirror safety prompts to Telegram (opt-in; web/desktop are primary)."""
+        return bool(self.notifications.get("on_risk_approval", False))
 
     # =========================================================================
     # Lifecycle Management
@@ -561,6 +572,120 @@ class TelegramGateway:
     # Interactive Approvals & Gatekeeper Integration
     # =========================================================================
 
+    def _build_approval_card(
+        self, cid: str, action_type: str, details: Dict[str, Any], risk_level: int, reason: str
+    ) -> Tuple[str, Any]:
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"confirm:{cid}:approve"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"confirm:{cid}:reject"),
+            ]
+        ]
+        row_2 = []
+        if risk_level == int(RiskLevel.LEVEL_2_SHELL):
+            row_2.append(InlineKeyboardButton("💾 Always Allow", callback_data=f"confirm:{cid}:always"))
+        row_2.append(InlineKeyboardButton("🛑 Kill Switch", callback_data=f"confirm:{cid}:kill"))
+        keyboard.append(row_2)
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        risk_label = "Destructive" if risk_level == 3 else ("Shell Execution" if risk_level == 2 else "UI Action")
+        cmd_text = details.get("command") or details.get("rule") or str(details)
+        card_text = (
+            "⚠️ *EidosBot Safety Confirmation Needed*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Action:* `{action_type}`\n"
+            f"• *Risk Level:* Level {risk_level} ({risk_label})\n"
+            f"• *Reason:* {reason}\n"
+            f"• *Target / Command:*\n`{cmd_text[:200]}`\n"
+        )
+        return card_text, reply_markup
+
+    def _dispatch_approval_card(
+        self,
+        cid: str,
+        card_text: str,
+        reply_markup: Any,
+        store: Dict[str, List[Tuple[int, int]]],
+    ) -> None:
+        if not self.is_running() or not self.allowed_user_ids or not self._loop:
+            return
+
+        targets = set(self.allowed_user_ids) | set(self._known_chat_ids)
+
+        async def _dispatch_card():
+            bot = self.app.bot
+            for chat_id in targets:
+                try:
+                    sent = await bot.send_message(
+                        chat_id=chat_id,
+                        text=card_text,
+                        reply_markup=reply_markup,
+                        parse_mode="Markdown",
+                    )
+                    with self._confirm_lock:
+                        store.setdefault(cid, []).append((chat_id, sent.message_id))
+                except Exception as e:
+                    logger.debug("Failed sending approval card to %s: %s", chat_id, e)
+
+        asyncio.run_coroutine_threadsafe(_dispatch_card(), self._loop)
+
+    def attach_confirmation_card(
+        self,
+        cid: str,
+        action_type: str,
+        details: Dict[str, Any],
+        risk_level: int,
+        reason: str,
+    ) -> None:
+        """Send a Telegram approval card tied to the gateway's shared confirmation id."""
+        if not self.should_notify_risk_approval():
+            return
+        card_text, reply_markup = self._build_approval_card(cid, action_type, details, risk_level, reason)
+        with self._confirm_lock:
+            self._attached_confirmation_cards[cid] = []
+        self._dispatch_approval_card(cid, card_text, reply_markup, self._attached_confirmation_cards)
+
+    def finalize_confirmation_card(self, cid: str, approved: bool, allowlist: bool = False) -> None:
+        """Update or clear Telegram cards after any channel resolves the prompt."""
+        action_type = "action"
+        with self._confirm_lock:
+            sent_msgs = list(self._attached_confirmation_cards.pop(cid, []))
+            record = self._pending_confirmations.get(cid)
+            if record:
+                sent_msgs.extend(record.get("sent_messages", []))
+                action_type = record.get("action_type", action_type)
+
+        if not sent_msgs or not self._loop or not self.app:
+            return
+
+        outcome_text = (
+            "✅ *Approved by user*"
+            if approved and not allowlist
+            else ("💾 *Approved & Always Allowed*" if approved and allowlist else "❌ *Denied by user*")
+        )
+        card_update = (
+            f"⚠️ *EidosBot Confirmation Resolved*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Action:* `{action_type}`\n"
+            f"• *Decision:* {outcome_text}\n"
+        )
+
+        async def _edit():
+            bot = self.app.bot
+            for chat_id, msg_id in sent_msgs:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=msg_id,
+                        text=card_update,
+                        reply_markup=None,
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+
+        asyncio.run_coroutine_threadsafe(_edit(), self._loop)
+
     def request_confirmation(
         self,
         action_type: str,
@@ -591,50 +716,8 @@ class TelegramGateway:
         with self._confirm_lock:
             self._pending_confirmations[cid] = record
 
-        # Build inline keyboard buttons
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Approve", callback_data=f"confirm:{cid}:approve"),
-                InlineKeyboardButton("❌ Reject", callback_data=f"confirm:{cid}:reject"),
-            ]
-        ]
-        row_2 = []
-        if risk_level == int(RiskLevel.LEVEL_2_SHELL):
-            row_2.append(InlineKeyboardButton("💾 Always Allow", callback_data=f"confirm:{cid}:always"))
-        row_2.append(InlineKeyboardButton("🛑 Kill Switch", callback_data=f"confirm:{cid}:kill"))
-        keyboard.append(row_2)
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        risk_label = "Destructive" if risk_level == 3 else ("Shell Execution" if risk_level == 2 else "UI Action")
-        cmd_text = details.get("command") or details.get("rule") or str(details)
-        card_text = (
-            "⚠️ *EidosBot Safety Confirmation Needed*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"• *Action:* `{action_type}`\n"
-            f"• *Risk Level:* Level {risk_level} ({risk_label})\n"
-            f"• *Reason:* {reason}\n"
-            f"• *Target / Command:*\n`{cmd_text[:200]}`\n"
-        )
-
-        targets = set(self.allowed_user_ids) | set(self._known_chat_ids)
-
-        async def _dispatch_card():
-            bot = self.app.bot
-            for chat_id in targets:
-                try:
-                    sent = await bot.send_message(
-                        chat_id=chat_id,
-                        text=card_text,
-                        reply_markup=reply_markup,
-                        parse_mode="Markdown",
-                    )
-                    with self._confirm_lock:
-                        if cid in self._pending_confirmations:
-                            self._pending_confirmations[cid]["sent_messages"].append((chat_id, sent.message_id))
-                except Exception as e:
-                    logger.debug("Failed sending approval card to %s: %s", chat_id, e)
-
-        asyncio.run_coroutine_threadsafe(_dispatch_card(), self._loop)
+        card_text, reply_markup = self._build_approval_card(cid, action_type, details, risk_level, reason)
+        self._dispatch_approval_card(cid, card_text, reply_markup, {cid: record["sent_messages"]})
 
         # Wait for user button tap or timeout
         start_time = time.time()
@@ -657,45 +740,21 @@ class TelegramGateway:
         actor_user_id: Optional[int] = None,
     ) -> bool:
         """Resolve pending confirmation request and update inline card on Telegram."""
+        if self._confirmation_resolver is not None:
+            return self._confirmation_resolver(request_id, approved, allowlist)
+
         with self._confirm_lock:
             record = self._pending_confirmations.get(request_id)
             if not record:
                 return False
 
+            if record.get("result") is not None:
+                return True
+
             record["result"] = (approved, allowlist)
             record["event"].set()
-            sent_msgs = list(record.get("sent_messages", []))
 
-        # Update message card text
-        if self._loop and self.app and sent_msgs:
-            outcome_text = (
-                "✅ *Approved by user*"
-                if approved and not allowlist
-                else ("💾 *Approved & Always Allowed*" if approved and allowlist else "❌ *Denied by user*")
-            )
-            card_update = (
-                f"⚠️ *EidosBot Confirmation Resolved*\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"• *Action:* `{record['action_type']}`\n"
-                f"• *Decision:* {outcome_text}\n"
-            )
-
-            async def _edit():
-                bot = self.app.bot
-                for chat_id, msg_id in sent_msgs:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=chat_id,
-                            message_id=msg_id,
-                            text=card_update,
-                            reply_markup=None,
-                            parse_mode="Markdown",
-                        )
-                    except Exception:
-                        pass
-
-            asyncio.run_coroutine_threadsafe(_edit(), self._loop)
-
+        self.finalize_confirmation_card(request_id, approved, allowlist)
         return True
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -755,13 +814,17 @@ class TelegramGateway:
     _handle_approval_callback = _handle_callback_query
 
     def create_confirmation_callback(self) -> Optional[Callable[..., Optional[Tuple[bool, bool]]]]:
-        """Create callback suitable for Gatekeeper.custom_prompt_callback."""
+        """Create callback suitable for Gatekeeper.custom_prompt_callback (Telegram-only mode)."""
         if not self.is_running() or not self.allowed_user_ids:
+            return None
+        if self._confirmation_resolver is not None:
             return None
 
         def telegram_callback(
             action_type: str, details: Dict[str, Any], risk_level: RiskLevel, reason: str
         ) -> Optional[Tuple[bool, bool]]:
+            if not self.should_notify_risk_approval():
+                return None
             return self.request_confirmation(action_type, details, int(risk_level), reason)
 
         return telegram_callback

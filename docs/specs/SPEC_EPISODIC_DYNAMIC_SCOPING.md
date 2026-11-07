@@ -98,6 +98,17 @@ class TaskScope(BaseModel):
     window_title: Optional[str] = None       # e.g., "main.py - EidosBot"
 ```
 
+**Old system.** Scope is the git project, working directory, active skill, and the focused window. There is no project-job id and no integration id.
+
+**Updated job concept.** Add two fields to `TaskScope` and two columns on `episodes`:
+
+```python
+job_id: Optional[str] = None            # primary project job, empty when none
+integration: Optional[str] = None       # attached or focused app, e.g. "gmail"
+```
+
+`job_id` is the project in `~/EidosWorkspace/jobs/<project>/`. `integration` is the outside app used on that turn. The git `project_name` stays the code repository under the working directory. It is not a substitute for the job. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.
+
 ---
 
 ## 4. Scope Resolver Specification (`eidos/memory/scope_resolver.py`)
@@ -135,6 +146,10 @@ When querying `EpisodicStore.search(query, scope=task_scope)`:
    - $\Delta_{cwd} = 0.15$ if `candidate.workspace_path == scope.workspace_path`.
    - $\Delta_{skill} = 0.10$ if `candidate.active_skill == scope.active_skill`.
 3. Sort by $S_{final}$ descending and return the top $K$.
+
+**Old system.** Re-ranking only soft-boosts git project, directory, and skill. Any similar episode from another project can still win on vector score alone.
+
+**Updated job concept.** Add $\Delta_{job} = 0.25$ when `job_id` matches, and $\Delta_{integration} = 0.10$ when `integration` matches. Vector candidates whose `job_id` is a different project are dropped. A candidate from another job is kept when the entity graph reports a shared entity, and the result is labeled with that `job_id` and integration. The other job's brief and tool list are not loaded. Environment pitfalls with an empty `job_id` may still be included, one at a time, as [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 9 describes.
 
 ### 5.2. Multi-Source Active Recall Disambiguation
 When `<recall>query</recall>` executes in `RecallStreamInterceptor`:

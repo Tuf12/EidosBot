@@ -179,6 +179,7 @@ Sandboxing settings are defined under the `sandbox` block in `config.yaml`:
 sandbox:
   enabled: true
   engine: "bwrap"                       # "bwrap" on Linux; "none" fallback
+  default_shell_mode: auto              # auto | host | sandboxed
   default_workspace: "~/EidosWorkspace" # Default writeable directory
   
   # Paths that are mounted read-write inside the sandbox
@@ -240,9 +241,10 @@ class BubblewrapSandbox:
 ```
 
 ### 6.2. Integration with `ShellExecutor` (`eidos/actions/shell.py`)
-`ShellExecutor` is updated to check if `sandbox.enabled` is active:
-- If `sandboxed=True` (default), the command is dispatched directly through `BubblewrapSandbox.run()`.
-- The Gatekeeper logs this execution as `auto_allowed (sandboxed)`.
+`ShellExecutor` checks `sandbox.enabled` and `sandbox.default_shell_mode`:
+- **`default_shell_mode: auto` (recommended):** Omitted `sandboxed` on `execute_shell` runs on the **host** so EidosBot stays a desktop co-pilot. The nest is used when the model passes `sandboxed: true`, or when `cwd` and command paths stay inside `writable_paths`.
+- **`sandboxed=true`:** Command is dispatched through `BubblewrapSandbox.run()` and Gatekeeper logs `auto_allowed (sandboxed)`.
+- **`sandboxed=false`:** Host execution with Level 2/3 Gatekeeper policy.
 - If the command requires host execution, it reverts to the standard Gatekeeper prompt flow.
 
 ---

@@ -16,6 +16,7 @@ from eidos.memory.types import (
     ReflectionEvaluation,
 )
 from eidos.models.base import BaseModelClient, ModelResponse
+from eidos.models.compute_policy import ComputePolicy, DEFAULT_IDLE_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,9 @@ class EpisodicReflector:
         max_queue_size: int = 16,
         model_name: Optional[str] = None,
         timeout_seconds: float = 30.0,
+        compute_policy: Optional[ComputePolicy] = None,
+        prefer_cloud_when_busy: bool = True,
+        idle_seconds: float = DEFAULT_IDLE_SECONDS,
     ):
         self.model_client = model_client
         self.episodic_store = episodic_store
@@ -69,6 +73,9 @@ class EpisodicReflector:
         self.max_queue_size = max_queue_size
         self.model_name = model_name
         self.timeout_seconds = timeout_seconds
+        self.compute_policy = compute_policy or ComputePolicy(idle_seconds=idle_seconds)
+        self.prefer_cloud_when_busy = prefer_cloud_when_busy
+        self.idle_seconds = idle_seconds
 
         self._queue: queue.Queue[EpisodeRecord] = queue.Queue(maxsize=self.max_queue_size)
         self._stop_event = threading.Event()
@@ -137,7 +144,7 @@ class EpisodicReflector:
             return None
 
         if sync or not self.enabled:
-            evaluation = self._evaluate_record(record)
+            evaluation, _ = self._evaluate_record(record)
             self._apply_reflection(record, evaluation)
             return evaluation
 
@@ -147,14 +154,19 @@ class EpisodicReflector:
     def _worker_loop(self) -> None:
         """Continuous background worker processing enqueued episodes."""
         while not self._stop_event.is_set():
+            if not self._may_run_background_llm() and not self._queue.empty():
+                time.sleep(0.5)
             try:
                 record = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
+            while not self._stop_event.is_set() and not self._may_run_background_llm():
+                time.sleep(0.5)
+
             self._is_evaluating.set()
-            task_desc = f"Episode {record.episode_id}"
             details_desc = f"Analyzing: {record.task_goal[:35]}"
+            used_local_llm = False
 
             if self.on_background_activity:
                 try:
@@ -163,7 +175,7 @@ class EpisodicReflector:
                     logger.debug("Error notifying background activity start: %s", cb_err)
 
             try:
-                evaluation = self._evaluate_record(record)
+                evaluation, used_local_llm = self._evaluate_record(record)
                 self._apply_reflection(record, evaluation)
             except Exception as exc:
                 logger.error("Unhandled error evaluating episode %s: %s", record.episode_id, exc, exc_info=True)
@@ -178,16 +190,24 @@ class EpisodicReflector:
                     except Exception as cb_err:
                         logger.debug("Error notifying background activity stop: %s", cb_err)
 
-            # Polite sleep between background tasks to prevent thermal and CPU saturation
-            time.sleep(0.1)
+            if used_local_llm:
+                time.sleep(0.5)
+            else:
+                time.sleep(0.1)
 
-    def _evaluate_record(self, record: EpisodeRecord) -> ReflectionEvaluation:
+    def _may_run_background_llm(self) -> bool:
+        if self.prefer_cloud_when_busy and self.compute_policy.should_use_cloud_for_background():
+            return True
+        return self.compute_policy.allow_background_local_llm()
+
+    def _evaluate_record(self, record: EpisodeRecord) -> tuple[ReflectionEvaluation, bool]:
         """Evaluate a single record, trying LLM first, falling back to heuristic."""
+        used_local = False
         if self.model_client is not None:
             try:
-                llm_eval = self._evaluate_with_llm(record)
+                llm_eval, used_local = self._evaluate_with_llm(record)
                 if llm_eval is not None:
-                    return llm_eval
+                    return llm_eval, used_local
             except Exception as e:
                 logger.warning(
                     "LLM reflection failed for episode %s: %s; falling back to heuristic.",
@@ -195,7 +215,7 @@ class EpisodicReflector:
                     e,
                 )
 
-        return self._fallback_heuristic_eval(record)
+        return self._fallback_heuristic_eval(record), False
 
     def _format_trajectory_for_eval(
         self,
@@ -253,10 +273,10 @@ class EpisodicReflector:
             formatted = formatted[:max_total_chars] + "\n... [Remaining steps truncated for length]"
         return formatted
 
-    def _evaluate_with_llm(self, record: EpisodeRecord) -> Optional[ReflectionEvaluation]:
+    def _evaluate_with_llm(self, record: EpisodeRecord) -> tuple[Optional[ReflectionEvaluation], bool]:
         """Perform evaluation by prompting the model client and parsing JSON output."""
         if not self.model_client:
-            return None
+            return None, False
 
         trajectory_trace = self._format_trajectory_for_eval(record)
         user_prompt = (
@@ -273,18 +293,30 @@ class EpisodicReflector:
             {"role": "user", "content": user_prompt},
         ]
 
-        resp: ModelResponse = self.model_client.chat(
-            messages=messages,
-            tools=None,
-            model_override=self.model_name,
-        )
+        chat_background = getattr(self.model_client, "chat_background", None)
+        if callable(chat_background):
+            resp = chat_background(
+                messages=messages,
+                tools=None,
+                model_override=self.model_name,
+            )
+        else:
+            resp = self.model_client.chat(
+                messages=messages,
+                tools=None,
+                model_override=self.model_name,
+            )
 
         raw_content = (resp.content or "").strip()
         if not raw_content:
+            if isinstance(resp.raw, dict) and resp.raw.get("skipped_ollama"):
+                return self._fallback_heuristic_eval(record), False
             logger.debug("Model returned empty content during reflection for %s", record.episode_id)
-            return None
+            return None, False
 
-        return self._parse_llm_json(raw_content)
+        parsed = self._parse_llm_json(raw_content)
+        used_local = getattr(self.model_client, "last_provider_used", "") == "ollama"
+        return parsed, used_local
 
     def _parse_llm_json(self, content: str) -> Optional[ReflectionEvaluation]:
         """Extract and validate JSON block into ReflectionEvaluation."""

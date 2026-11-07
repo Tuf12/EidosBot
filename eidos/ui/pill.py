@@ -2,10 +2,11 @@
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QKeySequence, QPainter, QShortcut
+from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -16,6 +17,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizeGrip,
     QSizePolicy,
+    QStyle,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -174,6 +177,43 @@ class ElidedLabel(QLabel):
         )
 
 
+class PillRestoreChip(QWidget):
+    """Small always-on-top handle shown when the desktop has no system tray."""
+
+    restore_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowTitle("EidosBot")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._button = QPushButton("Eidos")
+        self._button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._button.setStyleSheet(
+            "QPushButton { background-color: #1e1f29; color: #8be9fd; font-weight: bold; "
+            "border: 1px solid #44475a; border-radius: 12px; padding: 4px 10px; font-size: 12px; } "
+            "QPushButton:hover { border-color: #bd93f9; color: #f8f8f2; }"
+        )
+        self._button.clicked.connect(self.restore_requested.emit)
+        layout.addWidget(self._button)
+        self.set_hint("EidosBot is minimized. Click to restore.")
+        self.adjustSize()
+
+    def set_hint(self, tip: str) -> None:
+        self.setToolTip(tip)
+        self._button.setToolTip(tip)
+
+    def set_unread(self, count: int) -> None:
+        self._button.setText(f"Eidos ({count})" if count else "Eidos")
+        self.adjustSize()
+
+
 class StatusPill(QWidget):
     """
     Compact, draggable floating HUD widget positioned on top of the desktop.
@@ -233,6 +273,11 @@ class StatusPill(QWidget):
         self._background_active: bool = False
         self._background_task: str = ""
         self._background_details: str = ""
+        self._minimized: bool = False
+        self._tray: Optional[QSystemTrayIcon] = None
+        self._tray_menu: Optional[QMenu] = None
+        self._restore_chip: Optional[PillRestoreChip] = None
+        self._minimize_hint_shown: bool = False
 
         self._init_window()
         self._init_ui()
@@ -321,17 +366,19 @@ class StatusPill(QWidget):
         self.btn_kill.clicked.connect(self._on_kill_or_reset)
         top_bar.addWidget(self.btn_kill)
 
-        # Standard Window Controls: Minimize (−) and Close (✕)
-        self.btn_collapse = QPushButton("−")
-        self.btn_collapse.setToolTip("Minimize (Esc)")
-        self.btn_collapse.setStyleSheet(
+        # Minimize hides the whole pill. Chat toggle stays on the button to its left.
+        self.btn_minimize = QPushButton("−")
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.btn_minimize.setToolTip("Minimize pill. Click the tray icon to restore.")
+        else:
+            self.btn_minimize.setToolTip("Minimize pill. Click the small Eidos button to restore.")
+        self.btn_minimize.setStyleSheet(
             "QPushButton { background-color: #282a36; color: #8be9fd; font-weight: bold; "
             "border: 1px solid #44475a; border-radius: 6px; padding: 4px 9px; font-size: 14px; } "
             "QPushButton:hover { background-color: #44475a; color: #50fa7b; border-color: #50fa7b; }"
         )
-        self.btn_collapse.clicked.connect(self.collapse_chat)
-        self.btn_collapse.setVisible(False)
-        top_bar.addWidget(self.btn_collapse)
+        self.btn_minimize.clicked.connect(self.minimize_pill)
+        top_bar.addWidget(self.btn_minimize)
 
         # Quick Exit / Close Button (immediately to the right of Stop / Minimize)
         self.btn_close = QPushButton("✕")
@@ -469,7 +516,7 @@ class StatusPill(QWidget):
         self.bottom_bar = QHBoxLayout()
         self.bottom_bar.setContentsMargins(0, 0, 0, 0)
 
-        self.lbl_hint = QLabel("💡 Press Esc or Ctrl+E to minimize")
+        self.lbl_hint = QLabel("💡 Press Esc or Ctrl+E to close chat")
         self.lbl_hint.setStyleSheet("color: #6272a4; font-size: 10px;")
         self.lbl_hint.setVisible(False)
         self.bottom_bar.addWidget(self.lbl_hint, stretch=1)
@@ -592,7 +639,6 @@ class StatusPill(QWidget):
         self._expanded_pos = QPoint(target_x, target_y)
 
         def _apply_expand() -> None:
-            self.btn_collapse.setVisible(True)
             self.details_label.setVisible(False)
             self.chat_container.setVisible(True)
             self.lbl_hint.setVisible(True)
@@ -630,7 +676,6 @@ class StatusPill(QWidget):
         expanded_pos = self._expanded_pos
 
         def _apply_collapse() -> None:
-            self.btn_collapse.setVisible(False)
             self.details_label.setVisible(True)
             self.chat_container.setVisible(False)
             self.lbl_hint.setVisible(False)
@@ -648,6 +693,128 @@ class StatusPill(QWidget):
 
         self.unsetCursor()
         self.signal_toggle_expand.emit(False)
+
+    @pyqtSlot()
+    def minimize_pill(self):
+        """Hide the floating pill until the user restores it from the tray or chip."""
+        if self._minimized:
+            return
+        self._minimized = True
+        self.hide()
+        self._show_minimized_affordance()
+
+    @pyqtSlot()
+    def restore_pill(self):
+        """Bring the floating pill back in the same chat state it had when minimized."""
+        self._minimized = False
+        self._hide_minimized_affordance()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _minimized_tooltip(self) -> str:
+        if self._unread_responses:
+            return f"EidosBot — {self._unread_responses} unread. Click to restore."
+        return "EidosBot is minimized. Click to restore."
+
+    def _eidos_icon(self) -> QIcon:
+        icon_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "assets", "eidos_icon.png")
+        )
+        if os.path.exists(icon_path):
+            icon = QIcon(icon_path)
+            if not icon.isNull():
+                return icon
+        style = QApplication.style()
+        if style is None:
+            return QIcon()
+        return style.standardIcon(QStyle.StandardPixmap.SP_DesktopIcon)
+
+    def _ensure_tray(self) -> Optional[QSystemTrayIcon]:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return None
+        if self._tray is not None:
+            return self._tray
+        tray = QSystemTrayIcon(self._eidos_icon(), QApplication.instance())
+        tray.setToolTip(self._minimized_tooltip())
+        menu = QMenu()
+        show_action = menu.addAction("Show EidosBot")
+        show_action.triggered.connect(self.restore_pill)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit EidosBot")
+        quit_action.triggered.connect(self.signal_quit_app.emit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(self._on_tray_activated)
+        tray.messageClicked.connect(self.restore_pill)
+        self._tray = tray
+        self._tray_menu = menu
+        return tray
+
+    def _ensure_restore_chip(self) -> PillRestoreChip:
+        if self._restore_chip is None:
+            chip = PillRestoreChip()
+            chip.restore_requested.connect(self.restore_pill)
+            self._restore_chip = chip
+        return self._restore_chip
+
+    def _position_restore_chip(self) -> None:
+        chip = self._restore_chip
+        if chip is None:
+            return
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        x = avail.right() - chip.width() - 12
+        y = avail.top() + 12
+        chip.move(max(avail.left(), x), max(avail.top(), y))
+
+    def _show_minimized_affordance(self) -> None:
+        tray = self._ensure_tray()
+        if tray is not None:
+            tray.setToolTip(self._minimized_tooltip())
+            tray.show()
+            if not self._minimize_hint_shown:
+                self._minimize_hint_shown = True
+                tray.showMessage(
+                    "EidosBot",
+                    "Pill minimized. Click the tray icon to restore it.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    2500,
+                )
+            return
+        chip = self._ensure_restore_chip()
+        chip.set_unread(self._unread_responses)
+        chip.set_hint(self._minimized_tooltip())
+        self._position_restore_chip()
+        chip.show()
+        chip.raise_()
+        logger.info("System tray unavailable; showing Eidos restore button")
+
+    def _hide_minimized_affordance(self) -> None:
+        if self._tray is not None:
+            self._tray.hide()
+        if self._restore_chip is not None:
+            self._restore_chip.hide()
+
+    def _sync_minimized_affordance(self) -> None:
+        if not self._minimized:
+            return
+        tip = self._minimized_tooltip()
+        if self._tray is not None and self._tray.isVisible():
+            self._tray.setToolTip(tip)
+        if self._restore_chip is not None and self._restore_chip.isVisible():
+            self._restore_chip.set_unread(self._unread_responses)
+            self._restore_chip.set_hint(tip)
+            self._position_restore_chip()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+            QSystemTrayIcon.ActivationReason.MiddleClick,
+        ):
+            self.restore_pill()
 
     def _reset_expand_button_style(self):
         self.btn_expand.setStyleSheet(
@@ -692,6 +859,8 @@ class StatusPill(QWidget):
                 "border: none; border-radius: 6px; padding: 4px 8px; font-size: 12px; } "
                 "QPushButton:hover { background-color: #ff79c6; }"
             )
+        if self._minimized:
+            self._sync_minimized_affordance()
 
     @pyqtSlot(str)
     def add_thought_message(self, thought: str):
@@ -1011,9 +1180,10 @@ class StatusPill(QWidget):
             "QMenu::item:selected { background-color: #44475a; color: #50fa7b; }"
         )
         if self.is_expanded:
-            action_expand = menu.addAction("−  Minimize Chat (Esc or Ctrl+E)")
+            action_expand = menu.addAction("💬  Close Chat (Esc or Ctrl+E)")
         else:
-            action_expand = menu.addAction("💬  Open Chat UI (Ctrl+E)")
+            action_expand = menu.addAction("💬  Open Chat (Ctrl+E)")
+        action_minimize = menu.addAction("−  Minimize Pill")
 
         action_new = menu.addAction("➕  New Chat")
         action_past = menu.addAction("📜  Past Conversations...")
@@ -1034,6 +1204,8 @@ class StatusPill(QWidget):
         action = menu.exec(self.btn_menu.mapToGlobal(QPoint(0, self.btn_menu.height() + 4)))
         if action == action_expand:
             self.toggle_chat()
+        elif action == action_minimize:
+            self.minimize_pill()
         elif action == action_new:
             self.signal_new_chat.emit()
         elif action == action_past:

@@ -4,10 +4,11 @@ import logging
 import os
 import subprocess
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from eidos.safety.gatekeeper import Gatekeeper
 from eidos.sandbox.bwrap import BubblewrapSandbox
+from eidos.sandbox.shell_mode import ShellModeRequest, resolve_shell_sandboxed
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +38,15 @@ class ShellExecutor:
         if sandbox is not None:
             self.sandbox = sandbox
             self.sandbox_enabled = True
+            self.default_workspace = sandbox.workspace_dir
+            self.default_shell_mode = "auto"
             return
 
         cfg = sandbox_config or {}
         self.default_workspace = os.path.abspath(
             os.path.expanduser(cfg.get("default_workspace", "~/EidosWorkspace"))
         )
+        self.default_shell_mode = str(cfg.get("default_shell_mode", "auto"))
         self.sandbox_enabled = bool(cfg.get("enabled", False))
         if self.sandbox_enabled:
             if BubblewrapSandbox.is_available():
@@ -62,6 +66,40 @@ class ShellExecutor:
     def configure_sandbox(self, sandbox_config: Dict[str, Any]):
         """Dynamically update sandbox configuration."""
         self._init_sandbox(None, sandbox_config)
+
+    def writable_roots(self) -> List[str]:
+        """Directories that are read-write inside the bwrap nest."""
+        roots: List[str] = []
+        if self.sandbox is not None:
+            roots.append(self.sandbox.workspace_dir)
+            roots.extend(self.sandbox.extra_writable)
+        elif hasattr(self, "default_workspace"):
+            roots.append(self.default_workspace)
+        # Deduplicate while preserving order
+        seen = set()
+        unique: List[str] = []
+        for p in roots:
+            absp = os.path.abspath(os.path.expanduser(p))
+            if absp not in seen:
+                seen.add(absp)
+                unique.append(absp)
+        return unique
+
+    def resolve_sandboxed(
+        self,
+        requested: ShellModeRequest,
+        command: str,
+        cwd: Optional[str],
+    ) -> bool:
+        """Map tool argument + config policy to a concrete bwrap vs host decision."""
+        return resolve_shell_sandboxed(
+            requested,
+            command=command,
+            cwd=cwd,
+            writable_roots=self.writable_roots(),
+            sandbox_enabled=self.sandbox_enabled and self.sandbox is not None,
+            default_shell_mode=getattr(self, "default_shell_mode", "auto"),
+        )
 
     @staticmethod
     def _is_background_command(command: str) -> bool:
@@ -115,7 +153,7 @@ class ShellExecutor:
         command: str,
         cwd: Optional[str] = None,
         timeout: Optional[float] = None,
-        sandboxed: bool = True,
+        sandboxed: bool = False,
     ) -> Dict[str, Any]:
         """
         Execute a shell command safely.

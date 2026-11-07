@@ -34,6 +34,8 @@ class UIController(QObject):
 
     # Thread-safe signal to request a modal confirmation dialog from worker threads
     signal_prompt_confirmation = pyqtSignal(str, dict, int, str)
+    signal_prompt_gateway_confirmation = pyqtSignal(str, str, dict, int, str)
+    signal_dismiss_gateway_confirmation = pyqtSignal(str)
     signal_update_mic_state = pyqtSignal(bool)
     signal_voice_transcribed = pyqtSignal(str)
 
@@ -62,6 +64,9 @@ class UIController(QObject):
 
         # Thread synchronization for modal confirmation
         self._confirm_result_queue: queue.Queue = queue.Queue()
+        self._active_gateway_confirmation_id: Optional[str] = None
+        self._open_confirmation_dialog: Optional[ConfirmationDialog] = None
+        self._gateway_resolved_externally: bool = False
 
         # UI Components
         self.hud = HUDOverlay()
@@ -97,6 +102,8 @@ class UIController(QObject):
     def _connect_signals(self):
         # Confirmation signal handling on main Qt thread
         self.signal_prompt_confirmation.connect(self._show_confirmation_dialog)
+        self.signal_prompt_gateway_confirmation.connect(self._show_gateway_confirmation_dialog)
+        self.signal_dismiss_gateway_confirmation.connect(self._dismiss_gateway_confirmation_dialog)
 
         # Pill interactions
         self.pill.signal_emergency_kill.connect(self.trigger_emergency_kill)
@@ -425,21 +432,37 @@ class UIController(QObject):
             return
 
         ui_cb = self.get_confirmation_callback()
-        gw_cb = (
-            self._remote_gw.create_confirmation_callback()
-            if (self._remote_gw and hasattr(self._remote_gw, "is_running") and self._remote_gw.is_running())
-            else None
+        gw_running = (
+            self._remote_gw
+            and hasattr(self._remote_gw, "is_running")
+            and self._remote_gw.is_running()
         )
-        tg_cb = (
-            self._telegram_gw.create_confirmation_callback()
-            if (self._telegram_gw and hasattr(self._telegram_gw, "is_running") and self._telegram_gw.is_running() and bool(self._telegram_gw.allowed_user_ids))
-            else None
+        tg_running = (
+            self._telegram_gw
+            and hasattr(self._telegram_gw, "is_running")
+            and self._telegram_gw.is_running()
+            and bool(self._telegram_gw.allowed_user_ids)
         )
 
-        if gw_cb or tg_cb:
+        if gw_running:
+            self._remote_gw.set_confirmation_peers(
+                desktop_ui=self,
+                telegram_gw=self._telegram_gw if tg_running else None,
+            )
+            self._agent_loop.gatekeeper.custom_prompt_callback = (
+                self._remote_gw.create_unified_confirmation_callback()
+            )
+            return
+
+        tg_cb = (
+            self._telegram_gw.create_confirmation_callback()
+            if tg_running
+            else None
+        )
+        if tg_cb:
             from eidos.gateway import TelegramGateway
             self._agent_loop.gatekeeper.custom_prompt_callback = TelegramGateway.combine_callbacks(
-                ui_cb, gw_cb, tg_cb
+                ui_cb, tg_cb
             )
         else:
             self._agent_loop.gatekeeper.custom_prompt_callback = ui_cb
@@ -509,6 +532,64 @@ class UIController(QObject):
                     continue
 
         return callback
+
+    def request_gateway_confirmation(
+        self,
+        confirmation_id: str,
+        action_type: str,
+        details: Dict[str, Any],
+        risk_level_int: int,
+        reason: str,
+    ) -> None:
+        """Show desktop confirmation tied to the gateway's shared confirmation id."""
+        self.pill.signal_set_status.emit("confirming", f"Confirm: {action_type}")
+        self.signal_prompt_gateway_confirmation.emit(
+            confirmation_id, action_type, details, risk_level_int, reason
+        )
+
+    def dismiss_gateway_confirmation(self, confirmation_id: str) -> None:
+        """Close desktop confirmation when web or Telegram resolves first."""
+        self.signal_dismiss_gateway_confirmation.emit(confirmation_id)
+
+    @pyqtSlot(str, str, dict, int, str)
+    def _show_gateway_confirmation_dialog(
+        self,
+        confirmation_id: str,
+        action_type: str,
+        details: dict,
+        risk_level_int: int,
+        reason: str,
+    ):
+        """Executed on Qt GUI main thread — shares id with web/Telegram gateway."""
+        risk_level = RiskLevel(risk_level_int)
+        self._gateway_resolved_externally = False
+        self._active_gateway_confirmation_id = confirmation_id
+        dialog = ConfirmationDialog(action_type, details, risk_level, reason)
+        self._open_confirmation_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+        result = dialog.exec()
+        approved = result == ConfirmationDialog.DialogCode.Accepted
+        remember = dialog.remember_checked
+
+        self._open_confirmation_dialog = None
+        self._active_gateway_confirmation_id = None
+
+        if self._gateway_resolved_externally:
+            return
+
+        if self._remote_gw:
+            self._remote_gw.resolve_confirmation(confirmation_id, approved, remember)
+
+    @pyqtSlot(str)
+    def _dismiss_gateway_confirmation_dialog(self, confirmation_id: str):
+        if self._active_gateway_confirmation_id != confirmation_id:
+            return
+        self._gateway_resolved_externally = True
+        if self._open_confirmation_dialog is not None:
+            self._open_confirmation_dialog.reject()
 
     @pyqtSlot(str, dict, int, str)
     def _show_confirmation_dialog(self, action_type: str, details: dict, risk_level_int: int, reason: str):
