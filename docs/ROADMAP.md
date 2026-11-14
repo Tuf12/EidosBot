@@ -459,9 +459,28 @@ This roadmap defines the step-by-step implementation plan for **EidosBot**, from
 1. [ ] **Integration records (`~/.eidos/integrations/<name>/`):** `integration.yaml` plus `SKILL.md`. `~/.eidos/mcp.json` lists servers. The model cannot edit the server list or read tokens.
 2. [ ] **MCP client:** a daemon thread with its own event loop. Synchronous `list_tools()` / `call_tool()` for `AgentLoop`. Namespaced tools `mcp__<server>__<tool>`. Servers with more than about 20 tools expose a catalog plus `call_mcp_tool`.
 3. [ ] **Focus:** a primary job loads the integrations named on its brief. `focus_integration` loads one integration when no project job is open. Job folders keep `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). Attachments are saved into the project job, not into the integration directory.
+
+   **Updated job concept (groups).** A `group.yaml` above the job binds the default skill and integration. `jobs/Gmail/Clients/acme/` inherits Gmail. `jobs/Coding/notes-app/` inherits the coding skill and the editor server. `list_jobs` can filter by group. A second mail server is its own group folder. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
 4. [ ] **Gatekeeper:** `readOnlyHint` is Level 0, `destructiveHint` is Level 3, every other MCP call is Level 2 and allowlisted by server plus tool name.
 5. [ ] **Memory:** episodes store `job_id` and `integration`. Vector recall stays inside the job. The entity graph may cross jobs on a shared entity without loading the other brief.
 6. [ ] **OptimalX:** the existing in-repo bridge stays until OptimalX ships an MCP server. New apps are built outside this repo.
+
+---
+
+### Phase 15: Scheduled Wake & Autonomous Timers
+**Goal:** Let EidosBot schedule durable reminders and follow-up agent turns while running, and fire them via a headless **systemd** scheduler when the GUI is closed.
+
+*(See [SCHEDULED_WAKE_AND_TIMERS.md](SCHEDULED_WAKE_AND_TIMERS.md), [specs/SPEC_SCHEDULED_WAKE.md](specs/SPEC_SCHEDULED_WAKE.md), [plans/PLAN_SCHEDULED_WAKE.md](plans/PLAN_SCHEDULED_WAKE.md).)*
+
+#### Deliverables & Tasks:
+1. [ ] **`eidos/scheduling/`:** SQLite `scheduled_timers`, `ReminderScheduler`, `ReminderExecutor`, lease-based claims.
+2. [ ] **Agent tools:** `schedule_timer`, `list_scheduled_timers`, `cancel_scheduled_timer` in `tool_registry.py` / `loop.py`.
+3. [ ] **Channels:** Telegram `broadcast_message`, gateway WebSocket `scheduled_notification`, desktop pill inject.
+4. [ ] **Agent-turn on fire:** bounded background `run_task` with deferral while foreground busy.
+5. [ ] **Headless entry:** `python -m eidos.scheduler` / `--scheduler-only` for user `systemd` unit (`deploy/systemd/`).
+6. [ ] **UX:** Settings pending-timer table; Telegram `/timers` and `/cancel_timer`.
+7. [ ] **Tests:** `tests/test_scheduling.py` (store, claim, executor mocks—no full GUI loop).
+8. [ ] **Tailscale (optional):** Host CLI wrapper tools per [`TAILSCALE_AND_EIDOS.md`](TAILSCALE_AND_EIDOS.md); scheduler warns when tailnet down but PWA channel requested.
 
 ---
 

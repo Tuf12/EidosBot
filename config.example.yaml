@@ -44,7 +44,7 @@ safety:
   
   # Confirmation Policy
   confirm_level_1_ui: false        # Require confirmation before mouse clicks and typing
-  confirm_level_2_shell: true      # Require confirmation before running terminal commands
+  confirm_level_2_shell: false     # When true, prompt before every host shell command; false = only Level 3 (red alert)
   confirm_level_3_destructive: true # ALWAYS TRUE (Cannot be disabled)
 
   storage:
@@ -101,6 +101,28 @@ gateway:
       on_job_milestones: true    # Push progress updates for batch runner tasks (e.g. every N items or completion)
       on_task_completed: true    # Send final summary message when an agent task finishes
 
+scheduling:
+  enabled: true                  # Agent-authored timers and proactive notifications (see docs/SCHEDULED_WAKE_AND_TIMERS.md)
+  check_interval_seconds: 15.0
+  lease_ttl_seconds: 45.0        # GUI vs systemd scheduler handoff
+  max_pending_timers: 64
+  min_delay_seconds: 60.0
+  max_horizon_days: 30
+  default_channels: ["telegram", "desktop_chat"]
+  missed_policy: fire_once       # drop | fire_once | fire_immediately_on_startup
+  agent_turn_on_fire:
+    enabled: true
+    max_steps: 15
+    require_confirmation: false
+    defer_while_foreground_busy: true
+    defer_seconds: 120.0
+    max_defer_attempts: 10
+  system_service:
+    enabled: false               # Set true after installing user systemd unit (deploy/systemd/)
+    gateway: true
+    telegram: true
+    start_full_gui_on_agent_turn: false
+
 memory:
   enabled: true                  # Experiential trajectory logging and user profile memory
   user_profile_file: "~/.eidos/user_profile.yaml"
@@ -116,11 +138,22 @@ memory:
     idle_seconds: 900              # Local Ollama critique only after this idle (Chutes when busy)
     prefer_cloud_when_busy: true
     model: ""                    # Optional Chutes model id for critique; empty = router default
+  consolidation:
+    enabled: true                # Sleep-time clustering, golden canonical synthesis, and deduplication
+    auto_idle_runner: true       # Run background consolidation watcher during idle periods
+    idle_seconds: 1800           # Idle duration required before background consolidation runs (30m)
+    check_interval_seconds: 60.0 # Frequency of idle check in seconds
+    similarity_threshold: 0.85   # Cosine similarity cutoff to group episodes into duplicate clusters
+    min_cluster_size: 2          # Minimum redundant runs to trigger canonical golden synthesis
+    max_episodes_per_run: 100    # Maximum unarchived episodes evaluated per consolidation cycle
+    max_runtime_seconds: 30.0    # Hard CPU runtime budget per cycle
+    propose_rules: true          # Promote recurring procedural habits to Tier B candidate rules
+    propose_skills: true         # Scaffold living SKILL.md procedures for recurring multi-step workflows
 
 sandbox:
   enabled: true
   engine: "bwrap"                       # "bwrap" on Linux; "none" fallback
-  default_shell_mode: auto              # auto | host | sandboxed — auto = desktop host unless nest is explicit/confined
+  default_shell_mode: auto              # auto | host | sandboxed — auto = bwrap when paths stay in workspace
   default_workspace: "~/EidosWorkspace" # Default writeable directory
   
   # Paths that are mounted read-write inside the sandbox

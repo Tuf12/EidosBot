@@ -7,6 +7,8 @@ This document defines the architectural design, dynamic capability scoping, gene
 
 **Updated job concept.** A job is the project specified in [PROJECT_JOBS.md](PROJECT_JOBS.md): the brief, the `notes/` and `artifacts/` files (images, text, PDFs, spreadsheets, generated reports), and the focus that survives the turn. The batch queue is a component that project can attach. An outside app is an integration attached to that same job. The skill still says how to do the procedure. Tools for a new outside app come from that app's MCP server, and only while the integration is attached. OptimalX stays a built-in skill because OptimalX does not ship an MCP server.
 
+**Updated job concept (groups).** Related jobs live under a group folder such as `~/EidosWorkspace/jobs/Gmail/Clients/acme/` or `~/EidosWorkspace/jobs/Coding/notes-app/`. `group.yaml` in the group folder binds the skill and the MCP server. Child jobs inherit that binding. The skill does not list those directories. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
+
 ---
 
 ## ⚠️ ARCHITECTURAL MANDATES

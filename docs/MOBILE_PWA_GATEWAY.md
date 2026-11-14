@@ -269,6 +269,28 @@ tailscale ip -4
 5. Scroll down and tap **"Add to Home Screen"**.
 6. iOS creates a standalone app icon. Tapping it opens EidosBot in fullscreen standalone mode (no Safari tabs or address bar).
 
+### 6.5. Agent-assisted Tailscale on the PC (login, health, routing)
+
+Phones and tablets **must** complete Tailscale sign-in in the **Tailscale mobile app** (or accept a **shared machine** invite). EidosBot on Linux Mint cannot log in *for* a remote device—but it is the right **control plane on the host** for everything on the PC side.
+
+See the full design note: **[`TAILSCALE_AND_EIDOS.md`](TAILSCALE_AND_EIDOS.md)**.
+
+**Summary**
+
+| Approach | Role of Eidos |
+|---|---|
+| **Local `tailscale` CLI** (recommended) | Planned tools: status, netcheck, `up`, ping peers; Gatekeeper Level 0–2; open OAuth URL in browser when you run `tailscale up` |
+| **Auth key file** (`~/.eidos/tailscale.authkey`, user-owned) | Optional unattended `tailscale up` after reboot—scheduler/PWA path; never pass keys through chat or tool args |
+| **MCP (optional, later)** | Tailscale **docs** MCP for setup questions only; **Admin API** MCP (community) is high privilege—prefer CLI first; Tailscale **Aperture** tailnet MCP is for multi-node deploy, not phone OAuth |
+| **Routing** | No Eidos proxy: PWA hits `100.x:8420` (or MagicDNS) over WireGuard; gateway bearer token is still required |
+
+**Clever PC workflow Eidos should support (implementation backlog):**
+
+1. Diagnose: `tailscale status` + `netcheck` + confirm gateway listens on `:8420`.
+2. Interactive join: run `tailscale up`, surface login URL, open browser, poll until `Running`.
+3. Verify remote path: `tailscale ping <phone-hostname>` and tell you the exact PWA URL to bookmark.
+4. Pair with scheduled wake: **Telegram** timers work without Tailscale; **PWA** timers need the host on the tailnet (see [`SCHEDULED_WAKE_AND_TIMERS.md`](SCHEDULED_WAKE_AND_TIMERS.md)).
+
 ---
 
 ## 7. Progressive Web App (PWA) Manifest Specification

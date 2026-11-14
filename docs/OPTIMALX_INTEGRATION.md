@@ -6,6 +6,8 @@ This document defines the architecture, data contracts, retrieval mechanics, mut
 
 **Updated job concept.** That bridge stays, because OptimalX does not provide an MCP server. In the job model it is an integration a project job can list, same as Gmail. The OptimalX skill is the procedure. This document remains the contract for the bridge. New apps are built outside EidosBot and expose an MCP server instead of a new module under `eidos/integrations/`. Project files (images, text, PDFs) stay in `~/EidosWorkspace/jobs/<project>/`. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
+**Updated job concept (groups).** OptimalX jobs can live under `~/EidosWorkspace/jobs/OptimalX/` with a `group.yaml` that names the OptimalX skill and integration. Child jobs inherit that binding. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
+
 ---
 
 ## 1. Vision & System Purpose

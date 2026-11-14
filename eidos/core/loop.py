@@ -17,6 +17,7 @@ from eidos.core.tool_registry import ToolRegistry
 from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
 from eidos.jobs import BatchJobRunner, SkillJobProcessor
+from eidos.memory.consolidator import EpisodicConsolidator, IdleConsolidationRunner
 from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.episodic_store import EpisodicStore
 from eidos.memory.recall_stream import RecallStreamInterceptor
@@ -66,6 +67,8 @@ class AgentLoop:
     ):
         self.config = config or {}
         self._task_active = False
+        self._is_busy = threading.Event()
+        self._last_task_finished_time = time.monotonic()
         self.compute_policy = ComputePolicy.from_config(
             self.config,
             is_task_active=lambda: self._task_active,
@@ -83,7 +86,7 @@ class AgentLoop:
             audit_logger=self.audit,
             kill_switch=self.kill_switch,
             confirm_level_1_ui=self.config.get("safety", {}).get("confirm_level_1_ui", False),
-            confirm_level_2_shell=self.config.get("safety", {}).get("confirm_level_2_shell", True),
+            confirm_level_2_shell=self.config.get("safety", {}).get("confirm_level_2_shell", False),
             confirm_profile_writes=mem_cfg_early.get("confirm_profile_writes", True),
         )
 
@@ -280,6 +283,34 @@ class AgentLoop:
             kill_switch=self.kill_switch,
         )
 
+        # Episodic Consolidation Subsystem
+        cons_cfg = mem_cfg.get("consolidation", {})
+        self.consolidation_enabled = cons_cfg.get("enabled", True)
+        self.consolidator: Optional[EpisodicConsolidator] = None
+        self.idle_consolidator: Optional[IdleConsolidationRunner] = None
+        if self.memory_enabled and self.episodic_store:
+            self.consolidator = EpisodicConsolidator(
+                episodic_store=self.episodic_store,
+                user_store=self.user_store,
+                agent_loop=self,
+                skill_manager=self.skills,
+                similarity_threshold=float(cons_cfg.get("similarity_threshold", 0.85)),
+                min_cluster_size=int(cons_cfg.get("min_cluster_size", 2)),
+                max_episodes_per_run=int(cons_cfg.get("max_episodes_per_run", 100)),
+                max_runtime_seconds=float(cons_cfg.get("max_runtime_seconds", 30.0)),
+                propose_rules=bool(cons_cfg.get("propose_rules", True)),
+                propose_skills=bool(cons_cfg.get("propose_skills", True)),
+                on_activity=self.notify_background_activity,
+            )
+            if self.consolidation_enabled and bool(cons_cfg.get("auto_idle_runner", True)):
+                self.idle_consolidator = IdleConsolidationRunner(
+                    consolidator=self.consolidator,
+                    idle_threshold_seconds=float(cons_cfg.get("idle_seconds", 1800.0)),
+                    check_interval_seconds=float(cons_cfg.get("check_interval_seconds", 60.0)),
+                    enabled=self.consolidation_enabled,
+                )
+                self.idle_consolidator.start()
+
         # Voice Subsystem
         voice_cfg = self.config.get("voice", {})
         self.voice = voice_manager or VoiceManager(
@@ -428,8 +459,24 @@ class AgentLoop:
         """Return True if cancellation has been requested for the running task."""
         return self._stop_requested.is_set()
 
+    def is_busy(self) -> bool:
+        """Return True if agent loop or background batch job is actively running."""
+        is_task = (hasattr(self, "_is_busy") and self._is_busy.is_set()) or getattr(self, "_task_active", False)
+        is_job = hasattr(self, "jobs") and self.jobs and self.jobs.is_worker_running()
+        return bool(is_task or is_job)
+
     def shutdown(self, timeout: float = 2.0) -> None:
-        """Shutdown background worker threads including episodic reflector."""
+        """Shutdown background worker threads including episodic reflector and consolidator."""
+        if hasattr(self, "idle_consolidator") and self.idle_consolidator:
+            try:
+                self.idle_consolidator.stop(timeout=timeout)
+            except Exception as e:
+                logger.debug("Error stopping idle consolidator during loop shutdown: %s", e)
+        if hasattr(self, "consolidator") and self.consolidator:
+            try:
+                self.consolidator.stop(timeout=timeout)
+            except Exception as e:
+                logger.debug("Error stopping consolidator during loop shutdown: %s", e)
         if hasattr(self, "reflector") and self.reflector:
             try:
                 self.reflector.stop(timeout=timeout)
@@ -656,6 +703,51 @@ class AgentLoop:
                         idle_seconds=float(refl_cfg.get("idle_seconds", self.compute_policy.idle_seconds)),
                     )
 
+            cons_cfg = mem_cfg.get("consolidation", {})
+            if "enabled" in cons_cfg or "consolidation" in mem_cfg:
+                self.consolidation_enabled = cons_cfg.get("enabled", self.consolidation_enabled)
+                if self.consolidator:
+                    if "similarity_threshold" in cons_cfg:
+                        self.consolidator.similarity_threshold = float(cons_cfg["similarity_threshold"])
+                    if "min_cluster_size" in cons_cfg:
+                        self.consolidator.min_cluster_size = int(cons_cfg["min_cluster_size"])
+                    if "max_episodes_per_run" in cons_cfg:
+                        self.consolidator.max_episodes_per_run = int(cons_cfg["max_episodes_per_run"])
+                    if "max_runtime_seconds" in cons_cfg:
+                        self.consolidator.max_runtime_seconds = float(cons_cfg["max_runtime_seconds"])
+                    if "propose_rules" in cons_cfg:
+                        self.consolidator.propose_rules = bool(cons_cfg["propose_rules"])
+                    if "propose_skills" in cons_cfg:
+                        self.consolidator.propose_skills = bool(cons_cfg["propose_skills"])
+                elif self.memory_enabled and self.episodic_store:
+                    self.consolidator = EpisodicConsolidator(
+                        episodic_store=self.episodic_store,
+                        user_store=self.user_store,
+                        agent_loop=self,
+                        skill_manager=self.skills,
+                        similarity_threshold=float(cons_cfg.get("similarity_threshold", 0.85)),
+                        min_cluster_size=int(cons_cfg.get("min_cluster_size", 2)),
+                        max_episodes_per_run=int(cons_cfg.get("max_episodes_per_run", 100)),
+                        max_runtime_seconds=float(cons_cfg.get("max_runtime_seconds", 30.0)),
+                        propose_rules=bool(cons_cfg.get("propose_rules", True)),
+                        propose_skills=bool(cons_cfg.get("propose_skills", True)),
+                        on_activity=self.notify_background_activity,
+                    )
+                if self.idle_consolidator:
+                    self.idle_consolidator.enabled = self.consolidation_enabled and bool(cons_cfg.get("auto_idle_runner", True))
+                    if "idle_seconds" in cons_cfg:
+                        self.idle_consolidator.idle_threshold_seconds = float(cons_cfg["idle_seconds"])
+                    if "check_interval_seconds" in cons_cfg:
+                        self.idle_consolidator.check_interval_seconds = float(cons_cfg["check_interval_seconds"])
+                elif self.consolidation_enabled and self.consolidator and bool(cons_cfg.get("auto_idle_runner", True)):
+                    self.idle_consolidator = IdleConsolidationRunner(
+                        consolidator=self.consolidator,
+                        idle_threshold_seconds=float(cons_cfg.get("idle_seconds", 1800.0)),
+                        check_interval_seconds=float(cons_cfg.get("check_interval_seconds", 60.0)),
+                        enabled=self.consolidation_enabled,
+                    )
+                    self.idle_consolidator.start()
+
         if "integrations" in new_config and "optimalx" in new_config["integrations"]:
             opt_cfg = new_config["integrations"]["optimalx"]
             self.optimalx = OptimalXBridge(
@@ -800,10 +892,53 @@ ACTIVE JOB MODE: {job_name} ({job_id})
 - Assigned Skill: {skill_name}
 - Working Directory: {job_dir}
 - Artifacts Directory: {artifacts_dir}
-- Progress: {done}/{total} items ({pct}%)
-- Queue State: {dirs.get('queue_file', '')}
-- Manifest: {dirs.get('manifest_file', '')}
----"""
+"""
+            if total > 0:
+                prompt += f"- Progress: {done}/{total} items ({pct}%)\n"
+            if dirs.get("queue_file"):
+                prompt += f"- Queue State: {dirs.get('queue_file')}\n"
+            prompt += f"- Manifest: {dirs.get('manifest_file', '')}\n"
+
+            # Inject project brief details from job.yaml (PROJECT_JOBS.md)
+            identity = self.active_job.get("identity")
+            if isinstance(identity, dict):
+                summary = identity.get("summary")
+                goal = identity.get("goal")
+                phase = identity.get("phase")
+                if summary:
+                    prompt += f"- Summary: {summary}\n"
+                if goal:
+                    prompt += f"- Goal: {goal}\n"
+                if phase:
+                    prompt += f"- Phase: {phase}\n"
+
+            boundary = self.active_job.get("boundary")
+            if isinstance(boundary, dict):
+                this_is = boundary.get("this_is")
+                this_is_not = boundary.get("this_is_not")
+                if this_is:
+                    prompt += f"- Boundary (This Is): {this_is}\n"
+                if this_is_not:
+                    prompt += f"- Boundary (This Is NOT): {this_is_not}\n"
+
+            decisions = self.active_job.get("decisions")
+            if isinstance(decisions, list) and decisions:
+                prompt += "- Key Decisions:\n"
+                for d in decisions[-5:]:
+                    d_text = d.get("text") if isinstance(d, dict) else str(d)
+                    prompt += f"  • {d_text}\n"
+
+            docs = self.active_job.get("documents")
+            if isinstance(docs, list) and docs:
+                prompt += "- Job Documents:\n"
+                for doc in docs[:6]:
+                    if isinstance(doc, dict):
+                        dp = doc.get("path", "")
+                        dsumm = doc.get("summary", "")
+                        drw = doc.get("read_when", "")
+                        prompt += f"  • {dp} ({dsumm}) [Read when: {drw}]\n"
+
+            prompt += "---\n"
 
         if self.active_skill:
             skill_name = self.active_skill.get("name", "unnamed-skill")
@@ -1017,8 +1152,22 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         self.compute_policy.touch_user_activity()
         self._stop_requested.clear()
         self._reset_model_abort()
-        self.active_skill = None
-        self.active_job = None
+
+        # Re-activate assigned skill if a job is in focus; otherwise clear standalone skill
+        if self.active_job:
+            skill_info = self.active_job.get("skill")
+            skill_name = (
+                skill_info.get("name")
+                if isinstance(skill_info, dict)
+                else self.active_job.get("skill_name")
+            )
+            if not skill_name and self.active_job.get("skills"):
+                first_skill = self.active_job["skills"][0]
+                skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
+            if skill_name:
+                self.active_skill = self.skills.load_skill(skill_name)
+        else:
+            self.active_skill = None
         self._emit("on_task_start", user_goal)
         try:
             self.voice.stop_speaking()
@@ -1026,6 +1175,7 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             pass
 
         self._task_active = True
+        self._is_busy.set()
         try:
             return self._run_task_body(
                 user_goal,
@@ -1034,6 +1184,8 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             )
         finally:
             self._task_active = False
+            self._is_busy.clear()
+            self._last_task_finished_time = time.monotonic()
 
     def _run_task_body(
         self,
@@ -1426,8 +1578,10 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         logger.info("Dispatching tool '%s' with args: %s", name, args)
 
         if name == "finish_task":
-            self.active_skill = None
-            self.active_job = None
+            # Standalone skills without an active job reset on completion.
+            # Active job focus survives the turn (PROJECT_JOBS.md Mandate 5).
+            if not self.active_job:
+                self.active_skill = None
             return {"status": "completed", "summary": args.get("summary", "")}, True
 
         if name == "update_user_profile":
@@ -1961,8 +2115,17 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             manifest = self.jobs.load_manifest(job_id)
             self.active_job = manifest or queue.to_manifest_dict()
 
-            # Activate assigned skill if present
+            # Activate assigned skill if present (or inherited from group.yaml / manifest)
             skill_name = queue.skill_name
+            if not skill_name and isinstance(manifest, dict):
+                skill_info = manifest.get("skill")
+                if isinstance(skill_info, dict):
+                    skill_name = skill_info.get("name")
+                elif isinstance(skill_info, str):
+                    skill_name = skill_info
+                elif manifest.get("skills") and isinstance(manifest["skills"], list):
+                    first_skill = manifest["skills"][0]
+                    skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
             if skill_name:
                 skill_res = self.skills.load_skill(skill_name)
                 if skill_res:

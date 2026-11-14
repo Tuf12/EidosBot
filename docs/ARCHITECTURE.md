@@ -234,6 +234,8 @@ Every interaction cycle executes through a six-stage pipeline:
 
 **Updated job concept.** `eidos/jobs/` still owns the project brief, focus, and the batch-queue component. The job directory `~/EidosWorkspace/jobs/<project>/` keeps `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). An outside app is an integration under `~/.eidos/integrations/<name>/`. Its tools come from that app's MCP server, loaded only while the integration is attached to the primary job or is the focus by itself. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
+**Updated job concept (groups).** The job directory may sit under a group: `~/EidosWorkspace/jobs/Gmail/Clients/acme/` or `~/EidosWorkspace/jobs/Coding/notes-app/`. `group.yaml` binds the skill and the server for every leaf job under that folder. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
+
 ### 4.10. Remote Telegram Gateway (`eidos/gateway/telegram_bot.py`)
 
 *(Detailed specifications in [TELEGRAM_GATEWAY.md](TELEGRAM_GATEWAY.md))*
@@ -309,6 +311,8 @@ EidosBot/
 │   ├── PLAYWRIGHT_AUTOMATION.md    # Headless browser automation spec
 │   ├── TELEGRAM_GATEWAY.md         # Telegram mobile companion & approvals spec
 │   ├── MOBILE_PWA_GATEWAY.md       # Mobile PWA companion & Tailscale spec
+│   ├── SCHEDULED_WAKE_AND_TIMERS.md # Autonomous timers & system-level wake spec
+│   ├── TAILSCALE_AND_EIDOS.md      # Tailnet login, CLI vs MCP, PWA routing notes
 │   └── IMPLEMENTATION_GUIDE.md     # Step-by-step master implementation plan
 ├── eidos/
 │   ├── __init__.py

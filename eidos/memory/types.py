@@ -45,6 +45,7 @@ class UserProfile(BaseModel):
     preferences: Dict[str, Any] = Field(default_factory=_default_preferences)
     environment_facts: Dict[str, Any] = Field(default_factory=dict)
     workflow_rules: List[str] = Field(default_factory=_default_workflow_rules)
+    candidate_rules: List[Dict[str, Any]] = Field(default_factory=list)
 
     def format_for_prompt(self, max_items_per_category: int = 5) -> str:
         """Render atomic facts into a compact, low-token text representation for system prompt."""
@@ -151,6 +152,11 @@ class EpisodeMetadata(BaseModel):
     start_time: str = ""
     end_time: str = ""
     duration_seconds: float = 0.0
+    is_canonical: bool = False
+    is_archived: bool = False
+    cluster_id: Optional[str] = None
+    superseded_by: Optional[str] = None
+    consolidation_score: float = 1.0
 
 
 class EpisodeRecord(BaseModel):
@@ -188,6 +194,45 @@ class EpisodicSearchResult(BaseModel):
     key_actions: List[str] = Field(default_factory=list)
     timestamp: str = ""
     matched_entities: List[str] = Field(default_factory=list)
+    is_canonical: bool = False
+    is_archived: bool = False
+    cluster_id: Optional[str] = None
+    superseded_by: Optional[str] = None
+    consolidation_score: float = 1.0
+
+
+class CandidateRule(BaseModel):
+    """Procedural rule or convention proposed by consolidation for Tier B review."""
+
+    rule: str
+    source_cluster_id: str
+    occurrence_count: int
+    detected_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+
+
+class ClusterSummary(BaseModel):
+    """Summary of an identified cluster of duplicate/similar episodes."""
+
+    cluster_id: str
+    task_goal_representative: str
+    member_episode_ids: List[str]
+    average_similarity: float
+    canonical_episode_id: Optional[str] = None
+
+
+class ConsolidationReport(BaseModel):
+    """Execution metrics returned by EpisodicConsolidator."""
+
+    clusters_found: int = 0
+    episodes_evaluated: int = 0
+    episodes_archived: int = 0
+    canonical_synthesized: int = 0
+    promoted_rules_proposed: List[CandidateRule] = Field(default_factory=list)
+    promoted_skills_proposed: List[str] = Field(default_factory=list)
+    duration_seconds: float = 0.0
+    interrupted: bool = False
 
 
 ENTITY_TYPE_COMMAND = "command"

@@ -27,7 +27,7 @@ class Gatekeeper:
         audit_logger: Optional[AuditLogger] = None,
         kill_switch: Optional[KillSwitch] = None,
         confirm_level_1_ui: bool = False,
-        confirm_level_2_shell: bool = True,
+        confirm_level_2_shell: bool = False,
         confirm_profile_writes: bool = True,
     ):
         self.allowlist = allowlist or AllowlistManager()

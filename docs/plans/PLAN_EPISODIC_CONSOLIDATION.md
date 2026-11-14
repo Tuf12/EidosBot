@@ -271,28 +271,28 @@ Create a fast, isolated unit test suite using an in-memory SQLite database (`:me
 
 ## 4. Rollout Strategy & Step-by-Step Task Checklist
 
-- [ ] **Step 1: Data Models & Schema (`eidos/memory/types.py`)**
+- [x] **Step 1: Data Models & Schema (`eidos/memory/types.py`)**
   - Add `CandidateRule`, `ClusterSummary`, `ConsolidationReport`.
   - Update `EpisodicSearchResult` and `UserProfile` with consolidation fields.
-- [ ] **Step 2: Database Migration & Store Support (`eidos/memory/episodic_store.py`)**
+- [x] **Step 2: Database Migration & Store Support (`eidos/memory/episodic_store.py`)**
   - Update `_ensure_episode_schema_migrations()` with consolidation columns and indexes.
   - Add `is_archived = 0` filtering to `_search_sqlite_vec()`, `_search_numpy_fallback()`, and `retrieve_macro_context()`.
   - Add `get_unarchived_episodes()` and `archive_episodes()` methods.
-- [ ] **Step 3: UserStore Candidate Rules Support (`eidos/memory/user_store.py`)**
+- [x] **Step 3: UserStore Candidate Rules Support (`eidos/memory/user_store.py`)**
   - Add `add_candidate_rule()`, `approve_candidate_rule()`, and `reject_candidate_rule()`.
-- [ ] **Step 4: Consolidation Engine Implementation (`eidos/memory/consolidator.py`)**
+- [x] **Step 4: Consolidation Engine Implementation (`eidos/memory/consolidator.py`)**
   - Implement `EpisodicConsolidator` class.
   - Implement BLAS NumPy vector similarity clustering.
   - Implement `synthesize_canonical_episode()` with pitfall/lesson aggregation and score boosting.
   - Implement habit promotion for candidate rules and draft skills.
   - Implement `IdleConsolidationRunner` background thread with interruption guards.
-- [ ] **Step 5: AgentLoop & Subsystem Integration (`eidos/core/loop.py`, `eidos/memory/__init__.py`)**
+- [x] **Step 5: AgentLoop & Subsystem Integration (`eidos/core/loop.py`, `eidos/memory/__init__.py`)**
   - Add `is_busy()` and idle tracking in `AgentLoop`.
   - Wire `EpisodicConsolidator` into `AgentLoop` lifecycle.
   - Export classes in `eidos/memory/__init__.py`.
-- [ ] **Step 6: Gateway API & Configuration (`eidos/gateway/server.py`, `config.example.yaml`)**
+- [x] **Step 6: Gateway API & Configuration (`eidos/gateway/server.py`, `config.example.yaml`)**
   - Add `POST /api/memory/consolidate` endpoint.
   - Document `memory.consolidation` block in `config.example.yaml`.
-- [ ] **Step 7: Verification & Unit Tests (`tests/test_consolidation.py`)**
+- [x] **Step 7: Verification & Unit Tests (`tests/test_consolidation.py`)**
   - Run focused unit tests with `pytest tests/test_consolidation.py`.
   - Verify zero regressions across `tests/test_episodic_store.py` and `tests/test_entity_graph.py`.

@@ -948,6 +948,40 @@ class RemoteGatewayServer:
         self.reset_kill()
         return web.json_response({"ok": True, "message": "Kill switch reset"})
 
+    async def _handle_consolidate_memory(self, request: web.Request) -> web.Response:
+        """Trigger on-demand episodic memory consolidation."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+
+        force = False
+        try:
+            if request.can_read_body:
+                data = await request.json()
+                if isinstance(data, dict):
+                    force = bool(data.get("force", False))
+        except Exception:
+            pass
+
+        consolidator = getattr(self.agent_loop, "consolidator", None)
+        if not consolidator:
+            return web.json_response({
+                "ok": False,
+                "error": "Episodic consolidator is not enabled or available in AgentLoop.",
+            }, status=400)
+
+        loop = asyncio.get_running_loop()
+        try:
+            report = await loop.run_in_executor(None, lambda: consolidator.run_consolidation(force=force))
+            report_data = report.model_dump()
+            self.broadcast_event("memory_consolidated", report_data)
+            return web.json_response({
+                "ok": True,
+                "report": report_data,
+            })
+        except Exception as e:
+            logger.error("Error running consolidation via API: %s", e)
+            return web.json_response({"ok": False, "error": str(e)}, status=500)
+
     async def _handle_open_link(self, request: web.Request) -> web.Response:
         """Open a URL or local file path on the host desktop."""
         if not self._verify_auth(request):
@@ -2335,6 +2369,7 @@ class RemoteGatewayServer:
             self._app.router.add_post("/api/cancel", self._handle_stop)
             self._app.router.add_post("/api/kill", self._handle_kill)
             self._app.router.add_post("/api/reset", self._handle_reset)
+            self._app.router.add_post("/api/memory/consolidate", self._handle_consolidate_memory)
             self._app.router.add_post("/api/open_link", self._handle_open_link)
             self._app.router.add_get("/api/files", self._handle_list_files)
             self._app.router.add_post("/api/files", self._handle_upload_files)

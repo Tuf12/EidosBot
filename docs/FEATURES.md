@@ -108,6 +108,8 @@ To eliminate "prompt fatigue" from endless allowlist confirmation popups while m
 **Old system.** The writable example is the workspace or a batch-job folder.
 
 **Updated job concept.** The writable project directory is `~/EidosWorkspace/jobs/<project>/`, including `notes/` and `artifacts/`. Integration records and tokens under `~/.eidos/` stay outside that mount. The model does not get a writable path to `mcp.json`.
+
+**Updated job concept (groups).** The writable tree includes group folders such as `~/EidosWorkspace/jobs/Gmail/` and `~/EidosWorkspace/jobs/Coding/`. `group.yaml` may name a skill and an integration that already exist. It cannot retarget a server.
 - **Elimination of Allowlist Fatigue:** Shell commands executed inside the sandbox are **auto-allowed** without interrupting the user, because even a rogue `rm -rf /` or recursive deletion physically fails at the kernel VFS layer with `Read-only file system`.
 - **Targeted Host Mode:** Only actions requiring actual host system changes (e.g., system package installs or root configuration) trigger the Gatekeeper confirmation dialog or Telegram approval card.
 
@@ -283,6 +285,8 @@ For full design specifications, see [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md) and
 
 **Updated job concept.** The batch queue is a component of a project job. The project lives in `~/EidosWorkspace/jobs/<project>/` with `job.yaml`, `notes/`, and `artifacts/` for images, text, PDFs, spreadsheets, and generated reports. An outside app is an integration attached to that job. Its tools come from its MCP server. See [PROJECT_JOBS.md](PROJECT_JOBS.md).
 
+**Updated job concept (groups).** Jobs are grouped under folders like `jobs/Gmail/Clients/<client>/` and `jobs/Coding/<app>/`. The group file supplies the skill and the MCP server. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
+
 ---
 
 ## 8. Headless Browser Automation (Playwright & CDP)
@@ -335,6 +339,7 @@ For full design specifications, see [MOBILE_PWA_GATEWAY.md](MOBILE_PWA_GATEWAY.m
 
 ### 10.3. Tailscale Zero-Trust Mesh
 - Encrypted WireGuard private mesh connecting host machine, Android phone, and other devices without open router ports or public IP exposure.
+- **Agent-assisted host setup:** Eidos on the PC can run approved `tailscale` CLI checks, bring the interface up, and verify PWA reachability; phones still authenticate in the Tailscale app. See [`TAILSCALE_AND_EIDOS.md`](TAILSCALE_AND_EIDOS.md) (CLI-first; optional MCP later).
 
 ---
 
@@ -362,5 +367,27 @@ For full design specifications, see [OPTIMALX_INTEGRATION.md](OPTIMALX_INTEGRATI
 - **Mobile Sync Parity:** All writes strictly adhere to `content_hash` and `origin_device_id` conventions so OptimalX Mobile pulls changes seamlessly.
 - **Strict Privacy & Immutability:** Notes marked `ai_blind = 1` are completely invisible to EidosBot; notes marked `ai_locked = 1` are strictly read-only.
 
+---
 
+## 12. Scheduled Wake, Autonomous Timers & Proactive Notifications
+
+For full design specifications, see [SCHEDULED_WAKE_AND_TIMERS.md](SCHEDULED_WAKE_AND_TIMERS.md). Engineering spec: [specs/SPEC_SCHEDULED_WAKE.md](specs/SPEC_SCHEDULED_WAKE.md).
+
+### 12.1. Agent-authored timers (in-process)
+
+- The model can **schedule**, **list**, and **cancel** durable timers via tools while Eidos is running.
+- Timers persist in SQLite (`scheduled_timers`) and survive GUI restarts.
+- **Notify** timers push text to Telegram, the desktop pill, and/or the PWA without a new chat turn.
+- **Agent-turn** timers run a bounded background task at `fire_at` and deliver the summary on configured channels.
+
+### 12.2. System-level wake (headless scheduler)
+
+- Optional user **`systemd`** service runs a headless scheduler that reads the same timer store when the PyQt HUD is closed.
+- **Lease handoff** between GUI and system service prevents duplicate delivery.
+- **`loginctl enable-linger`** supports delivery while logged out (machine still on).
+
+### 12.3. Safety & limits
+
+- Configurable minimum delay, maximum horizon, pending count, and max steps on fire.
+- Background agent turns defer while the user is active; follow [`specs/SPEC_COMPUTE_RESOURCE_POLICY.md`](specs/SPEC_COMPUTE_RESOURCE_POLICY.md).
 

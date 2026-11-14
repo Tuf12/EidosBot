@@ -90,6 +90,60 @@ class BatchJobRunner:
         clean = re.sub(r"[^a-zA-Z0-9_\-]", "_", text.strip().lower())
         return re.sub(r"_+", "_", clean).strip("_") or "job"
 
+    def _find_nearest_group_yaml(self, job_dir: Path) -> Optional[Path]:
+        """Walk upward from job_dir toward default_jobs_dir to find the nearest group.yaml."""
+        try:
+            curr = job_dir.resolve().parent
+            stop_dir = self.default_jobs_dir.resolve().parent
+            while curr and curr != stop_dir and curr != curr.parent:
+                candidate = curr / "group.yaml"
+                if candidate.is_file():
+                    return candidate
+                if curr == self.default_jobs_dir.resolve():
+                    break
+                curr = curr.parent
+        except Exception:
+            pass
+        return None
+
+    def _resolve_job_dir(self, target: str) -> Optional[Path]:
+        """Resolve a path, folder name, or job ID to a job directory Path containing job.yaml or queue.json."""
+        if not target or not isinstance(target, str):
+            return None
+        p = Path(os.path.abspath(os.path.expanduser(target)))
+        if p.is_file() and p.name in ("job.yaml", "queue.json"):
+            return p.parent
+        if p.is_dir() and ((p / "job.yaml").is_file() or (p / "queue.json").is_file()):
+            return p
+
+        # Check directly in default_jobs_dir
+        if self.default_jobs_dir.exists():
+            cand = self.default_jobs_dir / target
+            if cand.is_dir() and ((cand / "job.yaml").is_file() or (cand / "queue.json").is_file()):
+                return cand
+            if (cand / "job.yaml").is_file():
+                return cand.parent
+
+            # Search subdirectories under default_jobs_dir for folder match or job.yaml/queue.json
+            for cand_yaml in self.default_jobs_dir.rglob("job.yaml"):
+                parent_dir = cand_yaml.parent
+                if target == parent_dir.name or target in str(parent_dir):
+                    return parent_dir
+
+            for cand_q in self.default_jobs_dir.rglob("queue.json"):
+                parent_dir = cand_q.parent
+                if target == parent_dir.name or target in str(parent_dir):
+                    return parent_dir
+
+        # Fallback check under parent workspace (e.g. ~/EidosWorkspace/documents/<target>)
+        ws_parent = self.default_jobs_dir.parent
+        if ws_parent.exists():
+            cand_doc = ws_parent / "documents" / target
+            if cand_doc.is_dir() and ((cand_doc / "job.yaml").is_file() or (cand_doc / "queue.json").is_file()):
+                return cand_doc
+
+        return None
+
     def _resolve_queue_file(self, target: str) -> Optional[Path]:
         """Resolve a path or job ID to a queue.json file Path."""
         p = Path(os.path.abspath(os.path.expanduser(target)))
@@ -165,54 +219,144 @@ class BatchJobRunner:
             logger.warning("Failed to save job.yaml manifest to %s: %s", yaml_dest, e)
 
     def load_manifest(self, job_id_or_path: str) -> Optional[Dict[str, Any]]:
-        """Load lean manifest dict from job.yaml or queue."""
-        q_path = self._resolve_queue_file(job_id_or_path)
-        if not q_path:
+        """Load lean manifest dict from job.yaml or queue, inheriting from group.yaml if present."""
+        job_dir = self._resolve_job_dir(job_id_or_path)
+        if not job_dir:
+            q_path = self._resolve_queue_file(job_id_or_path)
+            if q_path:
+                job_dir = q_path.parent
+        if not job_dir:
             return None
-        yaml_path = q_path.parent / "job.yaml"
+
+        manifest_data: Optional[Dict[str, Any]] = None
+        yaml_path = job_dir / "job.yaml"
         if yaml_path.is_file():
             try:
                 with open(yaml_path, "r", encoding="utf-8") as yf:
                     data = yaml.safe_load(yf)
                     if isinstance(data, dict):
-                        return data
+                        manifest_data = data
             except Exception as e:
                 logger.debug("Failed reading job.yaml: %s", e)
-        queue = self.load_job(job_id_or_path)
-        if queue:
-            skill_meta = None
-            if self.skills_manager and queue.skill_name:
-                try:
-                    skill_meta = self.skills_manager.load_skill(queue.skill_name)
-                except Exception:
-                    pass
-            return queue.to_manifest_dict(skill_meta=skill_meta)
-        return None
+
+        if manifest_data is None:
+            queue = self.load_job(job_id_or_path)
+            if queue:
+                skill_meta = None
+                if self.skills_manager and queue.skill_name:
+                    try:
+                        skill_meta = self.skills_manager.load_skill(queue.skill_name)
+                    except Exception:
+                        pass
+                manifest_data = queue.to_manifest_dict(skill_meta=skill_meta)
+
+        if not manifest_data:
+            return None
+
+        # Check for group.yaml inheritance (PROJECT_JOBS.md section 14)
+        group_yaml = self._find_nearest_group_yaml(job_dir)
+        if group_yaml and group_yaml.is_file():
+            try:
+                with open(group_yaml, "r", encoding="utf-8") as gf:
+                    g_data = yaml.safe_load(gf)
+                    if isinstance(g_data, dict):
+                        inherited_skill = g_data.get("skill")
+                        if inherited_skill:
+                            if not manifest_data.get("skill") and not manifest_data.get("skill_name"):
+                                manifest_data["skill_name"] = inherited_skill
+                                manifest_data["skill"] = {"name": inherited_skill}
+                            elif isinstance(manifest_data.get("skill"), dict) and not manifest_data["skill"].get("name"):
+                                manifest_data["skill"]["name"] = inherited_skill
+                        inherited_integration = g_data.get("integration")
+                        if inherited_integration and not manifest_data.get("integration"):
+                            manifest_data["integration"] = inherited_integration
+            except Exception as e:
+                logger.debug("Failed reading group.yaml from %s: %s", group_yaml, e)
+
+        # Ensure directories dict includes standard paths
+        dirs = manifest_data.setdefault("directories", {})
+        dirs.setdefault("job_dir", str(job_dir))
+        dirs.setdefault("output_dir", str(job_dir))
+        dirs.setdefault("manifest_file", str(job_dir / "job.yaml"))
+        if (job_dir / "notes").is_dir():
+            dirs.setdefault("notes_dir", str(job_dir / "notes"))
+        if (job_dir / "artifacts").is_dir():
+            dirs.setdefault("artifacts_dir", str(job_dir / "artifacts"))
+        if (job_dir / "queue.json").is_file():
+            dirs.setdefault("queue_file", str(job_dir / "queue.json"))
+
+        return manifest_data
 
     def load_job(self, job_id_or_path: str) -> Optional[JobQueue]:
-        """Load an existing queue from queue.json path, job.yaml, or job ID."""
-        q_path = self._resolve_queue_file(job_id_or_path)
-        if not q_path or not q_path.is_file():
-            return None
+        """Load an existing queue from queue.json path or standalone project job from job.yaml."""
+        job_dir = self._resolve_job_dir(job_id_or_path)
+        q_path = (job_dir / "queue.json") if job_dir else self._resolve_queue_file(job_id_or_path)
 
-        try:
-            with open(q_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            queue = JobQueue.model_validate(data)
+        if q_path and q_path.is_file():
+            try:
+                with open(q_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                queue = JobQueue.model_validate(data)
+                self.active_job = queue
+
+                # Ensure job.yaml manifest exists
+                yaml_path = q_path.parent / "job.yaml"
+                if not yaml_path.exists():
+                    try:
+                        with open(yaml_path, "w", encoding="utf-8") as yf:
+                            yaml.dump(queue.to_manifest_dict(), yf, sort_keys=False, allow_unicode=True)
+                    except Exception as ye:
+                        logger.debug("Could not create job.yaml on load: %s", ye)
+                return queue
+            except Exception as e:
+                logger.error("Failed to parse queue from %s: %s", q_path, e)
+                return None
+
+        # Standalone project job without batch queue (has job.yaml)
+        if job_dir and (job_dir / "job.yaml").is_file():
+            manifest = self.load_manifest(str(job_dir))
+            if not manifest:
+                return None
+            job_id = manifest.get("job_id") or f"job_{job_dir.name}"
+            job_name = manifest.get("name") or manifest.get("job_name") or job_dir.name
+            skill_info = manifest.get("skill") or {}
+            skill_name = (
+                skill_info.get("name")
+                if isinstance(skill_info, dict)
+                else manifest.get("skill_name") or ""
+            )
+            if not skill_name and manifest.get("skills"):
+                first_skill = manifest["skills"][0]
+                skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
+
+            desc = None
+            if isinstance(manifest.get("identity"), dict):
+                desc = manifest["identity"].get("summary")
+            elif isinstance(manifest.get("description"), str):
+                desc = manifest["description"]
+
+            phase = None
+            if isinstance(manifest.get("identity"), dict):
+                phase = manifest["identity"].get("phase")
+            elif isinstance(manifest.get("phase"), str):
+                phase = manifest["phase"]
+
+            queue = JobQueue(
+                job_id=job_id,
+                job_name=job_name,
+                skill_name=skill_name or "",
+                description=desc,
+                project=manifest.get("project") or (job_dir.parent.name if job_dir.parent.name != "jobs" else None),
+                phase=phase,
+                output_dir=str(job_dir),
+                status=manifest.get("status", "active"),
+                total_items=0,
+                completed_items=0,
+            )
             self.active_job = queue
-
-            # Ensure job.yaml manifest exists
-            yaml_path = q_path.parent / "job.yaml"
-            if not yaml_path.exists():
-                try:
-                    with open(yaml_path, "w", encoding="utf-8") as yf:
-                        yaml.dump(queue.to_manifest_dict(), yf, sort_keys=False, allow_unicode=True)
-                except Exception as ye:
-                    logger.debug("Could not create job.yaml on load: %s", ye)
             return queue
-        except Exception as e:
-            logger.error("Failed to parse queue from %s: %s", q_path, e)
-            return None
+
+        return None
 
     def initialize_job(
         self,

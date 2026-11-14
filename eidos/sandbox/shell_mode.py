@@ -80,6 +80,8 @@ def resolve_shell_sandboxed(
         return False
 
     if cwd is None:
+        if writable_roots and not command_references_outside_roots(command, writable_roots):
+            return True
         return False
 
     work_dir = os.path.abspath(os.path.expanduser(cwd))

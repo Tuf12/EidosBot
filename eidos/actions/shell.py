@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from eidos.safety.gatekeeper import Gatekeeper
+from eidos.safety.risk_classifier import RiskClassifier, RiskLevel
 from eidos.sandbox.bwrap import BubblewrapSandbox
 from eidos.sandbox.shell_mode import ShellModeRequest, resolve_shell_sandboxed
 
@@ -191,6 +192,25 @@ class ShellExecutor:
                     "command": cmd_clean,
                     "sandboxed": True,
                 }
+
+            shell_risk, shell_risk_reason = RiskClassifier.classify_shell_command(cmd_clean)
+            if shell_risk == RiskLevel.LEVEL_3_DESTRUCTIVE:
+                allowed, deny_reason = self.gatekeeper.evaluate(
+                    "shell",
+                    {"command": cmd_clean, "cwd": work_dir, "sandboxed": True},
+                )
+                if not allowed:
+                    return {
+                        "success": False,
+                        "denied": True,
+                        "error": f"Execution denied by safety gatekeeper: {deny_reason}",
+                        "stdout": "",
+                        "stderr": "",
+                        "exit_code": -1,
+                        "duration_ms": 0.0,
+                        "command": cmd_clean,
+                        "sandboxed": True,
+                    }
 
             # Step 2: Auto-allow and log to audit logger
             self.gatekeeper.audit.log(

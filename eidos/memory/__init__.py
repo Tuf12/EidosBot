@@ -1,5 +1,6 @@
 """EidosBot Memory and Experiential Learning Subsystem."""
 
+from eidos.memory.consolidator import EpisodicConsolidator, IdleConsolidationRunner
 from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.embeddings import OllamaEmbeddingClient
 from eidos.memory.entity_extractor import EntityExtractor
@@ -9,6 +10,9 @@ from eidos.memory.recall_stream import RecallStreamInterceptor
 from eidos.memory.reflector import EpisodicReflector
 from eidos.memory.trajectory_logger import TrajectoryLogger
 from eidos.memory.types import (
+    CandidateRule,
+    ClusterSummary,
+    ConsolidationReport,
     ENTITY_TAXONOMY,
     ENTITY_TYPE_COMMAND,
     ENTITY_TYPE_DEVICE,
@@ -30,6 +34,9 @@ from eidos.memory.types import (
 from eidos.memory.user_store import UserStore
 
 __all__ = [
+    "CandidateRule",
+    "ClusterSummary",
+    "ConsolidationReport",
     "ConversationStore",
     "EpisodeMetadata",
     "EpisodeRecord",
@@ -55,5 +62,7 @@ __all__ = [
     "OllamaEmbeddingClient",
     "EpisodicStore",
     "EpisodicReflector",
+    "EpisodicConsolidator",
+    "IdleConsolidationRunner",
     "RecallStreamInterceptor",
 ]

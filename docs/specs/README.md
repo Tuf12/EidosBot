@@ -10,8 +10,8 @@ This directory contains the detailed engineering specifications for completing t
 |---|---|---|---|
 | [`SPEC_EPISODIC_REFLECTOR.md`](SPEC_EPISODIC_REFLECTOR.md) ([Plan](PLAN_EPISODIC_REFLECTOR.md)) | **Autonomous Post-Task Reflector & Critic** | `eidos/memory/reflector.py` | Asynchronous evaluation pass to extract nuanced lessons, detect hallucinated successes, and calibrate critic scores. |
 | [`SPEC_EPISODIC_ENTITY_GRAPH.md`](SPEC_EPISODIC_ENTITY_GRAPH.md) ([Plan](PLAN_EPISODIC_ENTITY_GRAPH.md)) | **Entity Linking & Relational Knowledge Graph** | `eidos/memory/graph_store.py`, `eidos/memory/entity_extractor.py` | Deterministic entity extraction (paths, binaries, projects, devices) and embedded SQLite graph linking for hybrid Graph-Augmented Retrieval. |
-| [`SPEC_EPISODIC_CONSOLIDATION.md`](SPEC_EPISODIC_CONSOLIDATION.md) | **Sleep-Time Consolidation, Generalization & Pruning** | `eidos/memory/consolidator.py` | Off-peak clustering of repetitive tasks into canonical golden recipes, deduplication, and habit promotion to Tier B profile rules and skills. |
-| [`SPEC_EPISODIC_DYNAMIC_SCOPING.md`](SPEC_EPISODIC_DYNAMIC_SCOPING.md) | **Dynamic Task Scoping & Multi-Source Fusion** | `eidos/memory/scope_resolver.py` | Environmental context awareness (project boundaries, active skill, window class) and calibrated re-ranking across episodic, note, and chat stores. |
+| [`SPEC_EPISODIC_CONSOLIDATION.md`](SPEC_EPISODIC_CONSOLIDATION.md) ([Plan](../plans/PLAN_EPISODIC_CONSOLIDATION.md)) | **Sleep-Time Consolidation, Generalization & Pruning** | `eidos/memory/consolidator.py` | Off-peak clustering of repetitive tasks into canonical golden recipes, deduplication, and habit promotion to Tier B profile rules and skills. |
+| [`SPEC_EPISODIC_DYNAMIC_SCOPING.md`](SPEC_EPISODIC_DYNAMIC_SCOPING.md) ([Plan](../plans/PLAN_EPISODIC_DYNAMIC_SCOPING.md)) | **Dynamic Task Scoping & Multi-Source Fusion** | `eidos/memory/scope_resolver.py` | Environmental context awareness (project boundaries, active skill, window class) and calibrated re-ranking across episodic, note, and chat stores. |
 
 ---
 
@@ -27,3 +27,5 @@ These 4 modules systematically complete the four cognitive capabilities required
 **Old system (item 4).** Surroundings mean the git project, working directory, skill, and window.
 
 **Updated job concept.** Surroundings also mean the primary project job and any attached integration. Vector hits from another job are dropped. A shared entity may still surface that other job's episode. The other job's files and tools stay unloaded. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.
+
+**Updated job concept (groups).** The integration in scope may be inherited from the group folder above the leaf job. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 14.

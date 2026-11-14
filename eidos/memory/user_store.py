@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 import yaml
 
-from eidos.memory.types import UserProfile
+from eidos.memory.types import CandidateRule, UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -196,4 +196,73 @@ class UserStore:
             profile.workflow_rules.remove(rule_or_index)
             self.save(profile)
             return True
+        return False
+
+    def add_candidate_rule(
+        self,
+        rule: str,
+        source_cluster_id: str = "",
+        occurrence_count: int = 1,
+    ) -> bool:
+        """Stage a proposed procedural rule from consolidation without polluting prompt context."""
+        rule_clean = rule.strip()
+        if not rule_clean:
+            return False
+        profile = self.load(force_reload=True)
+        if rule_clean in profile.workflow_rules:
+            return False
+        for cr in profile.candidate_rules:
+            if cr.get("rule", "").strip() == rule_clean:
+                cr["occurrence_count"] = max(cr.get("occurrence_count", 1), occurrence_count)
+                if source_cluster_id:
+                    cr["source_cluster_id"] = source_cluster_id
+                self.save(profile)
+                return False
+        candidate = CandidateRule(
+            rule=rule_clean,
+            source_cluster_id=source_cluster_id,
+            occurrence_count=occurrence_count,
+        )
+        profile.candidate_rules.append(candidate.model_dump())
+        self.save(profile)
+        return True
+
+    def approve_candidate_rule(self, rule_or_index: str | int) -> bool:
+        """Promote a staged candidate rule into active workflow_rules."""
+        profile = self.load(force_reload=True)
+        target_rule: Optional[str] = None
+        if isinstance(rule_or_index, int):
+            if 0 <= rule_or_index < len(profile.candidate_rules):
+                item = profile.candidate_rules.pop(rule_or_index)
+                target_rule = item.get("rule", "").strip()
+        else:
+            search_str = str(rule_or_index).strip().lower()
+            for idx, item in enumerate(profile.candidate_rules):
+                if item.get("rule", "").strip().lower() == search_str:
+                    target_rule = item.get("rule", "").strip()
+                    profile.candidate_rules.pop(idx)
+                    break
+        if target_rule:
+            if target_rule not in profile.workflow_rules:
+                profile.workflow_rules.append(target_rule)
+            self.save(profile)
+            return True
+        return False
+
+    def reject_candidate_rule(self, rule_or_index: str | int) -> bool:
+        """Dismiss a staged candidate rule."""
+        profile = self.load(force_reload=True)
+        if isinstance(rule_or_index, int):
+            if 0 <= rule_or_index < len(profile.candidate_rules):
+                profile.candidate_rules.pop(rule_or_index)
+                self.save(profile)
+                return True
+            return False
+
+        search_str = str(rule_or_index).strip().lower()
+        for idx, item in enumerate(profile.candidate_rules):
+            if item.get("rule", "").strip().lower() == search_str:
+                profile.candidate_rules.pop(idx)
+                self.save(profile)
+                return True
         return False

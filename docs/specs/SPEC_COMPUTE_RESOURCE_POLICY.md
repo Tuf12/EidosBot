@@ -28,3 +28,4 @@ See `models.compute` and `memory.reflector` in [`config.example.yaml`](../../con
 - [`SPEC_EPISODIC_REFLECTOR.md`](SPEC_EPISODIC_REFLECTOR.md)
 - [`SPEC_EPISODIC_ENTITY_GRAPH.md`](SPEC_EPISODIC_ENTITY_GRAPH.md)
 - [`SPEC_EPISODIC_CONSOLIDATION.md`](SPEC_EPISODIC_CONSOLIDATION.md)
+- [`SPEC_SCHEDULED_WAKE.md`](SPEC_SCHEDULED_WAKE.md) (background agent-turn timers on fire)

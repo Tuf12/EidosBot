@@ -1,7 +1,8 @@
 # Specification: Context-Aware Dynamic Task Scoping & Multi-Source Cross-Referencing
 
 **Document:** `docs/specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md`  
-**Status:** Draft / Specification  
+**Plan:** [`docs/plans/PLAN_EPISODIC_DYNAMIC_SCOPING.md`](../plans/PLAN_EPISODIC_DYNAMIC_SCOPING.md)  
+**Status:** Ready for Implementation  
 **Component:** `eidos/memory/scope_resolver.py`, `eidos/memory/recall_stream.py`  
 **Related Systems:** `eidos/core/loop.py`, `eidos/memory/episodic_store.py`, `eidos/integrations/optimalx.py`, `eidos/memory/conversation_store.py`
 
@@ -107,7 +108,7 @@ job_id: Optional[str] = None            # primary project job, empty when none
 integration: Optional[str] = None       # attached or focused app, e.g. "gmail"
 ```
 
-`job_id` is the project in `~/EidosWorkspace/jobs/<project>/`. `integration` is the outside app used on that turn. The git `project_name` stays the code repository under the working directory. It is not a substitute for the job. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.
+`job_id` is the leaf project, which may live under a group such as `~/EidosWorkspace/jobs/Gmail/Clients/acme/` or `~/EidosWorkspace/jobs/Coding/notes-app/`. `integration` is the outside app used on that turn, inherited from the nearest `group.yaml` or added on the brief. The git `project_name` stays the code repository under the working directory. It is not a substitute for the job. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) sections 13 and 14.
 
 ---
 

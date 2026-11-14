@@ -5,7 +5,7 @@ This document defines how a **job** becomes the project EidosBot is working insi
 
 The batch runner, queue schema, and per-item processor stay as specified in [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md). This document changes what `job.yaml` is for, how the agent sees it, and how depth documents are read.
 
-Outside apps (Gmail, Calendar, Schwab, OptimalX) are integrations attached to a job. They are specified in [section 13](#13-integrations-and-mcp-servers). An integration is not a job.
+Outside apps (Gmail, Calendar, Schwab, OptimalX) are integrations attached to a job. They are specified in [section 13](#13-integrations-and-mcp-servers). An integration is not a job. Jobs are grouped on disk under a folder that binds the skill and the server. That layout is [section 14](#14-job-groups).
 
 ---
 
@@ -66,6 +66,8 @@ A project needs a small file that states what this thing is, what it is not, whi
 
 The brief is not a fifth copy of the profile, and it is not a dump of embeddings. It is the boundary of the current project. The integration record is not a second brief. It does not say what the lease or the lantern is.
 
+**Updated job concept (groups).** A job inherits its main skill and integration from the nearest `group.yaml`. The integration row applies when the job inherits that binding, not only when the brief lists it.
+
 ---
 
 ## 3. Directory layout
@@ -84,6 +86,31 @@ The brief is not a fifth copy of the profile, and it is not a dump of embeddings
 **Old system.** `artifacts/` is generated output only: portfolios, variants, and reports.
 
 **Updated job concept.** `artifacts/` also holds files that pertain to the project and were not produced by the batch runner. That includes images, PDFs, spreadsheets, and attachments saved out of an integration. `notes/` stays the long text. `documents` in `job.yaml` is the index for both. Integration config does not live in this folder. A Gmail connection is shared by every project that sends mail, so it lives under `~/.eidos/integrations/gmail/` as specified in [section 13](#13-integrations-and-mcp-servers).
+
+**Old system.** Every job is a direct child of `~/EidosWorkspace/jobs/`. The path does not say which app the job uses.
+
+**Updated job concept (groups).** Jobs sit under a group folder. The group file binds the skill and the MCP server. A directory between the group and the job is only for navigation. The job is the directory that contains `job.yaml`. See [section 14](#14-job-groups).
+
+```
+~/EidosWorkspace/jobs/Gmail/
+├── group.yaml                 # skill: gmail, integration: gmail
+└── Clients/
+    └── acme/
+        ├── job.yaml           # who Acme is
+        ├── notes/
+        └── artifacts/
+
+~/EidosWorkspace/jobs/Coding/
+├── group.yaml                 # skill: coding, integration: vscode
+├── notes-app/
+│   ├── job.yaml
+│   ├── notes/
+│   └── artifacts/
+└── lantern-firmware/
+    ├── job.yaml
+    ├── notes/
+    └── artifacts/
+```
 
 `queue.json` remains the checkpointed item list from [SKILLS_AND_JOBS.md](SKILLS_AND_JOBS.md). Saving the queue must not rewrite the brief. The runner may refresh the `progress` block inside `job.yaml`. It must leave identity, boundary, decisions, skills, document pointers, and integration attachments untouched.
 
@@ -163,6 +190,10 @@ Rules for the brief:
 **Old system.** The brief lists skills, documents, and an optional batch queue. It has no field for an outside app.
 
 **Updated job concept.** The brief also has `integrations:`, a list of `{name, use_when}` entries. Each name matches a directory under `~/.eidos/integrations/`. Focusing the job loads those integrations. The schema is in [section 13](#13-integrations-and-mcp-servers).
+
+**Old system.** The brief is the only place a job is connected to an app. Every Gmail client would repeat `integrations: [gmail]`, or the Gmail skill would list client directories.
+
+**Updated job concept (groups).** The connection is the nearest `group.yaml` above the job. A job under `jobs/Gmail/` inherits the Gmail skill and the Gmail server without copying them into `job.yaml`. `integrations:` on the brief is for an extra app, such as Calendar on one client, or Gmail on a job that lives under `jobs/Coding/`. The Gmail skill stays the procedure. It does not catalog client folders.
 
 ---
 
@@ -253,6 +284,8 @@ The default is one job. Several running queues are a real case (a long invention
 
 **Updated job concept.** An outside app is not an attached job. It is an integration named by the primary job. Attached jobs remain other projects, and their briefs stay out of the prompt. When the user asks to check mail and no project is open, Gmail can be the focus by itself. That loads the Gmail skill and the Gmail tools. It does not invent a job named Gmail, and it does not load the lease brief or the lantern brief.
 
+**Updated job concept (groups).** `jobs/Gmail/` is a group, not a brief. Listing it returns the client jobs inside it, one line each, and does not load those briefs. Focusing `jobs/Gmail/Clients/acme/` loads the Acme brief plus the skill and server inherited from `jobs/Gmail/group.yaml`. `focus_integration` remains the path for checking the inbox when no client job should open. A second mail server is a second group folder, such as `jobs/Work-Email/`, so its clients are not mixed into the Gmail list.
+
 ### 7.3. Where focus is stored
 
 Focus is agent-wide, so the pill and the web app agree. It is stored beside the jobs, in a small pointer file such as `~/EidosWorkspace/jobs/focus.yaml`:
@@ -281,6 +314,8 @@ Base tools gain project focus, separate from the batch-runner skill:
 **Old system.** The base job tools are `create_job`, `focus_job`, `list_jobs`, `update_job_brief`, `close_job`, and `read_job_document`.
 
 **Updated job concept.** Add `list_integrations` and `focus_integration` to that base set. `list_integrations` returns the configured integrations (name, server, one-line use). `focus_integration` makes one integration the focus when no project job should open. `update_job_brief` is how a project job gains or drops an `integrations:` entry. The model cannot add an MCP server, change a server command, or read stored tokens.
+
+**Updated job concept (groups).** `list_jobs` accepts a group name and returns the leaf jobs under that folder. `create_job` accepts the group and any navigation path inside it (`Gmail`, `Clients/acme`). The new directory is created under that group. The model still cannot edit `mcp.json` or retarget `group.yaml` at a server that is not already configured.
 
 `init_batch_job`, `run_batch_job`, `step_batch_job`, `pause_batch_job`, `resume_batch_job`, and `generate_batch_summary` stay on the `batch-runner` skill. A job lists that skill when it has a queue.
 
@@ -477,6 +512,8 @@ An integration is the connection to one outside app. A job is the project that u
 
 Opening a job named Gmail would put the lease threads and the lantern threads in one brief and one memory pile. The lease job stays primary. Gmail is attached to it.
 
+**Updated job concept (groups).** The Gmail attachment for a client job comes from `~/EidosWorkspace/jobs/Gmail/group.yaml`, not from a job named Gmail. The client leaf under `Clients/` is the brief. See [section 14](#14-job-groups).
+
 ### 13.1. Where an integration lives
 
 ```
@@ -492,7 +529,7 @@ description: Search mail, read a thread, and create a draft.
 use_when: The user asks to read, find, or draft email.
 ```
 
-The job brief attaches it by name:
+**Old system.** Every job repeats the attachment on its own brief:
 
 ```yaml
 integrations:
@@ -500,22 +537,26 @@ integrations:
     use_when: Reading or drafting mail about this lease.
 ```
 
+**Updated job concept (groups).** A job under `jobs/Gmail/` inherits that binding from `group.yaml`. The brief lists an integration only when the job needs an extra one. A lantern firmware job stays under `jobs/Coding/` and adds Gmail on its own brief when it sends mail. It does not move under `jobs/Gmail/`.
+
 `~/.eidos/mcp.json` is the server list. The model cannot edit it. A remote server is a URL. A local server is a command, args, and env. Tokens stay in that env or in a secret file. They are not copied into `integration.yaml`, `job.yaml`, the prompt, or `documents`.
 
 Gmail's server is Google's, at `https://gmailmcp.googleapis.com/mcp/v1`, over streamable HTTP, with Google OAuth. Calendar is a different server and a different integration. Schwab has no server to point at. A Schwab integration exists only after an API bridge or an MCP server is written in front of Schwab's API, outside this repo, the same way OptimalX was bridged inside the repo because OptimalX ships no MCP server.
 
-Project files stay in the job directory from [section 3](#3-directory-layout):
+Project files stay in the leaf job directory. For a Gmail client that is:
 
 ```
-~/EidosWorkspace/jobs/lease/
+~/EidosWorkspace/jobs/Gmail/Clients/acme/
 ├── job.yaml
-├── notes/            # long text
-└── artifacts/        # images, PDFs, spreadsheets, generated reports
+├── notes/
+└── artifacts/
 ```
 
 ### 13.2. What is loaded
 
 Focusing a project job loads the integrations named on its brief.
+
+**Updated job concept (groups).** Resolve the skill and the integration by walking up from the job directory to the nearest `group.yaml`, then add any `skills:` and `integrations:` on the leaf brief. Both are loaded. The group file is not a second brief.
 
 - The integration `SKILL.md` is appended with the brief.
 - The client connects to that server, calls `tools/list`, and adds those schemas to the tool payload for subsequent steps.
@@ -554,3 +595,59 @@ Vector recall prefers the active `job_id` and does not replace a miss with anoth
 **Old system.** An outside app is a Python bridge and a list of tool schemas inside this repo. OptimalX is that pattern: `eidos/integrations/optimalx.py` plus the `optimalx` skill.
 
 **Updated job concept.** OptimalX keeps that bridge until it has an MCP server. The next app is its own process, with its own MCP server. EidosBot adds the client, the integration record, the skill, and the `job_id` / `integration` tags. It does not gain a Gmail client, a Calendar client, or a Schwab client in `eidos/integrations/`.
+
+---
+
+## 14. Job groups
+
+A group is a folder the user can scan. The job is the leaf inside it. The group file is the connection to a skill and an MCP server. The Gmail skill does not list client directories, and client jobs do not each repeat the Gmail server.
+
+```
+~/EidosWorkspace/jobs/Gmail/
+├── group.yaml
+└── Clients/
+    └── acme/
+        ├── job.yaml
+        ├── notes/
+        └── artifacts/
+
+~/EidosWorkspace/jobs/Work-Email/
+├── group.yaml
+└── Clients/
+    └── acme/
+
+~/EidosWorkspace/jobs/Coding/
+├── group.yaml
+├── notes-app/
+│   ├── job.yaml
+│   ├── notes/
+│   └── artifacts/
+└── lantern-firmware/
+    ├── job.yaml
+    ├── notes/
+    └── artifacts/
+```
+
+```yaml
+# ~/EidosWorkspace/jobs/Gmail/group.yaml
+skill: gmail
+integration: gmail
+```
+
+```yaml
+# ~/EidosWorkspace/jobs/Coding/group.yaml
+skill: coding
+integration: vscode
+```
+
+Rules:
+
+- A directory that contains `group.yaml` is a group. It has no brief and no `notes/` of its own. Opening it lists the jobs underneath, one line each.
+- A directory that contains `job.yaml` is a job. Focusing it loads that brief.
+- A directory that contains neither, such as `Clients/`, is navigation. `list_jobs` skips it except as part of the path.
+- Inheritance walks upward from the job to the nearest `group.yaml`. The job receives that skill and that integration at focus time. The leaf file does not copy them.
+- `skills:` and `integrations:` on the leaf add extras. A client who also uses Calendar lists `calendar`. A coding project that sometimes sends mail stays under `jobs/Coding/` and lists `gmail`. It does not move under `jobs/Gmail/`.
+- A second mail server is a second group. Its clients never appear in the Gmail list.
+- `list_jobs(group)` returns leaf jobs under that group. `create_job` takes the group and the path inside it. Changing `group.yaml` changes what every child inherits. The model cannot point `group.yaml` at a server that is not already in `~/.eidos/mcp.json`.
+- `focus_integration` is still how the inbox is checked when no client job should open. The group folder is not that focus, and it does not load every client brief.
+- The pill shows the leaf and the group: `Job · Acme · Gmail`. Episodes store the leaf `job_id` and the integration that was actually used, inherited or added.

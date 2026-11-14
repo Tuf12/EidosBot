@@ -115,7 +115,13 @@ class EpisodicStore:
                     embedding_text TEXT,
                     full_record_json TEXT,
                     embedding_blob BLOB,
-                    created_at REAL
+                    created_at REAL,
+                    entity_link_attempted INTEGER DEFAULT 0,
+                    is_canonical INTEGER DEFAULT 0,
+                    is_archived INTEGER DEFAULT 0,
+                    cluster_id TEXT,
+                    superseded_by TEXT,
+                    consolidation_score REAL DEFAULT 1.0
                 );
                 """
             )
@@ -123,6 +129,8 @@ class EpisodicStore:
                 "CREATE INDEX IF NOT EXISTS idx_episodes_outcome ON episodes(outcome);"
             )
 
+            # Existing databases predate consolidation columns. Add them before
+            # indexing is_archived / cluster_id, or CREATE INDEX fails on startup.
             self._ensure_episode_schema_migrations()
             self.graph_store.init_schema()
 
@@ -153,6 +161,34 @@ class EpisodicStore:
                 self._conn.execute(
                     "ALTER TABLE episodes ADD COLUMN entity_link_attempted INTEGER DEFAULT 0"
                 )
+            if "is_canonical" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN is_canonical INTEGER DEFAULT 0"
+                )
+            if "is_archived" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN is_archived INTEGER DEFAULT 0"
+                )
+            if "cluster_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN cluster_id TEXT"
+                )
+            if "superseded_by" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN superseded_by TEXT"
+                )
+            if "consolidation_score" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN consolidation_score REAL DEFAULT 1.0"
+                )
+
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episodes_active ON episodes(is_archived, is_canonical);"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episodes_cluster ON episodes(cluster_id);"
+            )
+            self._conn.commit()
         except Exception as e:
             logger.warning("Episode schema migration skipped: %s", e)
 
@@ -397,6 +433,13 @@ class EpisodicStore:
                     logger.debug("Episode %s already indexed; skipping.", record.episode_id)
                     return False
 
+                is_canonical_val = int(bool(getattr(record.metadata, "is_canonical", False)))
+                is_archived_val = int(bool(getattr(record.metadata, "is_archived", False)))
+                cluster_id_val = getattr(record.metadata, "cluster_id", None)
+                superseded_by_val = getattr(record.metadata, "superseded_by", None)
+                raw_score = getattr(record.metadata, "consolidation_score", None)
+                consolidation_score_val = float(raw_score) if raw_score is not None else 1.0
+
                 if exists:
                     # Update metadata table
                     self._conn.execute(
@@ -405,7 +448,9 @@ class EpisodicStore:
                             task_goal = ?, outcome = ?, critic_score = ?, timestamp = ?,
                             summary = ?, pitfalls_avoided = ?, lessons_learned = ?,
                             key_actions = ?, embedding_text = ?, full_record_json = ?,
-                            embedding_blob = ?, created_at = ?
+                            embedding_blob = ?, created_at = ?, is_canonical = ?,
+                            is_archived = ?, cluster_id = ?, superseded_by = ?,
+                            consolidation_score = ?
                         WHERE episode_id = ?
                         """,
                         (
@@ -421,6 +466,11 @@ class EpisodicStore:
                             record_json,
                             blob,
                             now_ts,
+                            is_canonical_val,
+                            is_archived_val,
+                            cluster_id_val,
+                            superseded_by_val,
+                            consolidation_score_val,
                             record.episode_id,
                         ),
                     )
@@ -442,8 +492,10 @@ class EpisodicStore:
                         INSERT INTO episodes (
                             episode_id, task_goal, outcome, critic_score, timestamp,
                             summary, pitfalls_avoided, lessons_learned, key_actions,
-                            embedding_text, full_record_json, embedding_blob, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            embedding_text, full_record_json, embedding_blob, created_at,
+                            is_canonical, is_archived, cluster_id, superseded_by,
+                            consolidation_score
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.episode_id,
@@ -459,6 +511,11 @@ class EpisodicStore:
                             record_json,
                             blob,
                             now_ts,
+                            is_canonical_val,
+                            is_archived_val,
+                            cluster_id_val,
+                            superseded_by_val,
+                            consolidation_score_val,
                         ),
                     )
                     if self._has_sqlite_vec:
@@ -495,6 +552,7 @@ class EpisodicStore:
         min_similarity: float = 0.0,
         entity_weight: float = 0.35,
         query_vector: Optional[List[float]] = None,
+        include_archived: bool = False,
     ) -> List[EpisodicSearchResult]:
         """Hybrid semantic and graph-augmented search against indexed episodic memories.
 
@@ -502,6 +560,7 @@ class EpisodicStore:
         ``(1 - entity_weight) * vector + entity_weight * graph_overlap`` even if no
         episodes match on the graph (graph overlap treated as 0). ``EpisodicSearchResult.similarity``
         reflects that composite score in hybrid mode, otherwise raw vector similarity.
+        Archived duplicate episodes (is_archived = 1) are excluded by default unless include_archived=True.
         """
         cleaned_query = query.strip()
         if not cleaned_query:
@@ -534,6 +593,7 @@ class EpisodicStore:
                 min_similarity=min_similarity,
                 graph_matches=graph_matches,
                 entity_weight=entity_weight,
+                include_archived=include_archived,
             )
         else:
             return self._search_numpy_fallback(
@@ -543,6 +603,7 @@ class EpisodicStore:
                 min_similarity=min_similarity,
                 graph_matches=graph_matches,
                 entity_weight=entity_weight,
+                include_archived=include_archived,
             )
 
     def _search_sqlite_vec(
@@ -553,6 +614,7 @@ class EpisodicStore:
         min_similarity: float,
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
         entity_weight: float = 0.35,
+        include_archived: bool = False,
     ) -> List[EpisodicSearchResult]:
         """Execute nearest-neighbor vector search via sqlite-vec extension with hybrid entity re-ranking."""
         query_blob = self._vector_to_blob(query_vector)
@@ -565,13 +627,15 @@ class EpisodicStore:
                     """
                     SELECT v.episode_id, v.distance, e.task_goal, e.outcome,
                            e.critic_score, e.timestamp, e.summary, e.pitfalls_avoided,
-                           e.lessons_learned, e.key_actions, e.embedding_blob
+                           e.lessons_learned, e.key_actions, e.embedding_blob,
+                           e.is_canonical, e.is_archived, e.cluster_id, e.superseded_by,
+                           e.consolidation_score
                     FROM vec_episodes v
                     JOIN episodes e ON e.episode_id = v.episode_id
-                    WHERE v.embedding MATCH ? AND k = ?
+                    WHERE v.embedding MATCH ? AND k = ? AND (e.is_archived = 0 OR ?)
                     ORDER BY v.distance ASC
                     """,
-                    (query_blob, fetch_k),
+                    (query_blob, fetch_k, 1 if include_archived else 0),
                 )
                 rows = cursor.fetchall()
             except Exception as e:
@@ -583,6 +647,7 @@ class EpisodicStore:
                     min_similarity,
                     graph_matches=graph_matches,
                     entity_weight=entity_weight,
+                    include_archived=include_archived,
                 )
 
         seen_ids = {r["episode_id"] for r in rows}
@@ -598,11 +663,13 @@ class EpisodicStore:
                             f"""
                             SELECT episode_id, 0.0 as distance, task_goal, outcome,
                                    critic_score, timestamp, summary, pitfalls_avoided,
-                                   lessons_learned, key_actions, embedding_blob
+                                   lessons_learned, key_actions, embedding_blob,
+                                   is_canonical, is_archived, cluster_id, superseded_by,
+                                   consolidation_score
                             FROM episodes
-                            WHERE episode_id IN ({placeholders})
+                            WHERE episode_id IN ({placeholders}) AND (is_archived = 0 OR ?)
                             """,
-                            missing_ids,
+                            list(missing_ids) + [1 if include_archived else 0],
                         )
                         extra_rows = extra_cursor.fetchall()
                     except Exception as extra_err:
@@ -636,6 +703,10 @@ class EpisodicStore:
             if composite_sim < min_similarity:
                 continue
 
+            is_archived = bool(r["is_archived"]) if "is_archived" in r.keys() and r["is_archived"] is not None else False
+            if not include_archived and is_archived:
+                continue
+
             outcome = r["outcome"]
             if outcome_filter is not None:
                 if outcome_filter == "pitfall":
@@ -652,6 +723,11 @@ class EpisodicStore:
                 except Exception:
                     pass
 
+            is_canonical = bool(r["is_canonical"]) if "is_canonical" in r.keys() and r["is_canonical"] is not None else False
+            cluster_id = r["cluster_id"] if "cluster_id" in r.keys() else None
+            superseded_by = r["superseded_by"] if "superseded_by" in r.keys() else None
+            consolidation_score = float(r["consolidation_score"]) if "consolidation_score" in r.keys() and r["consolidation_score"] is not None else 1.0
+
             item = EpisodicSearchResult(
                 episode_id=ep_id,
                 task_goal=r["task_goal"],
@@ -664,6 +740,11 @@ class EpisodicStore:
                 key_actions=key_actions,
                 timestamp=r["timestamp"] or "",
                 matched_entities=matched_ents,
+                is_canonical=is_canonical,
+                is_archived=is_archived,
+                cluster_id=cluster_id,
+                superseded_by=superseded_by,
+                consolidation_score=consolidation_score,
             )
             candidates.append((composite_sim, item))
 
@@ -678,6 +759,7 @@ class EpisodicStore:
         min_similarity: float,
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
         entity_weight: float = 0.35,
+        include_archived: bool = False,
     ) -> List[EpisodicSearchResult]:
         """Pure-python/numpy cosine similarity calculation over stored BLOBs with hybrid entity re-ranking."""
         with self._lock:
@@ -685,9 +767,12 @@ class EpisodicStore:
                 """
                 SELECT episode_id, task_goal, outcome, critic_score, timestamp,
                        summary, pitfalls_avoided, lessons_learned, key_actions,
-                       embedding_blob
+                       embedding_blob, is_canonical, is_archived, cluster_id,
+                       superseded_by, consolidation_score
                 FROM episodes
-                """
+                WHERE (is_archived = 0 OR ?)
+                """,
+                (1 if include_archived else 0,),
             )
             rows = cursor.fetchall()
 
@@ -709,11 +794,12 @@ class EpisodicStore:
                         f"""
                         SELECT episode_id, task_goal, outcome, critic_score, timestamp,
                                summary, pitfalls_avoided, lessons_learned, key_actions,
-                               embedding_blob
+                               embedding_blob, is_canonical, is_archived, cluster_id,
+                               superseded_by, consolidation_score
                         FROM episodes
-                        WHERE episode_id IN ({placeholders})
+                        WHERE episode_id IN ({placeholders}) AND (is_archived = 0 OR ?)
                         """,
-                        missing_ids,
+                        list(missing_ids) + [1 if include_archived else 0],
                     )
                     for extra in extra_cursor.fetchall():
                         row_by_id[extra["episode_id"]] = extra
@@ -741,6 +827,10 @@ class EpisodicStore:
             if composite_sim < min_similarity:
                 continue
 
+            is_archived = bool(r["is_archived"]) if "is_archived" in r.keys() and r["is_archived"] is not None else False
+            if not include_archived and is_archived:
+                continue
+
             outcome = r["outcome"]
             if outcome_filter is not None:
                 if outcome_filter == "pitfall":
@@ -757,6 +847,11 @@ class EpisodicStore:
                 except Exception:
                     pass
 
+            is_canonical = bool(r["is_canonical"]) if "is_canonical" in r.keys() and r["is_canonical"] is not None else False
+            cluster_id = r["cluster_id"] if "cluster_id" in r.keys() else None
+            superseded_by = r["superseded_by"] if "superseded_by" in r.keys() else None
+            consolidation_score = float(r["consolidation_score"]) if "consolidation_score" in r.keys() and r["consolidation_score"] is not None else 1.0
+
             item = EpisodicSearchResult(
                 episode_id=ep_id,
                 task_goal=r["task_goal"],
@@ -769,6 +864,11 @@ class EpisodicStore:
                 key_actions=key_actions,
                 timestamp=r["timestamp"] or "",
                 matched_entities=matched_ents,
+                is_canonical=is_canonical,
+                is_archived=is_archived,
+                cluster_id=cluster_id,
+                superseded_by=superseded_by,
+                consolidation_score=consolidation_score,
             )
             candidates.append((composite_sim, item))
 
@@ -781,6 +881,7 @@ class EpisodicStore:
         top_k_success: int = 1,
         top_k_pitfall: int = 1,
         min_similarity: float = 0.15,
+        include_archived: bool = False,
     ) -> str:
         """Retrieve top golden path success and cautionary pitfall for macro context injection."""
         if not task_goal.strip():
@@ -798,6 +899,7 @@ class EpisodicStore:
             outcome_filter="success",
             min_similarity=min_similarity,
             query_vector=shared_vector,
+            include_archived=include_archived,
         )
         success_ids = {s.episode_id for s in successes}
 
@@ -807,6 +909,7 @@ class EpisodicStore:
             outcome_filter="pitfall",
             min_similarity=min_similarity,
             query_vector=shared_vector,
+            include_archived=include_archived,
         )
 
         # Avoid showing the same episode in both sections
@@ -848,6 +951,48 @@ class EpisodicStore:
 
         sections.append("</episodic_context>")
         return "\n".join(sections).strip()
+
+    def get_unarchived_episodes(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch unarchived episodes for consolidation and clustering."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT episode_id, task_goal, outcome, critic_score, timestamp,
+                       summary, pitfalls_avoided, lessons_learned, key_actions,
+                       embedding_blob, full_record_json, is_canonical, is_archived,
+                       cluster_id, superseded_by, consolidation_score
+                FROM episodes
+                WHERE COALESCE(is_archived, 0) = 0
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (max(1, limit),),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def archive_episodes(
+        self,
+        episode_ids: List[str],
+        cluster_id: str,
+        superseded_by: str,
+    ) -> int:
+        """Mark duplicate/superseded member episodes as archived in an atomic transaction."""
+        if not episode_ids:
+            return 0
+        with self._lock:
+            placeholders = ",".join("?" for _ in episode_ids)
+            cursor = self._conn.execute(
+                f"""
+                UPDATE episodes
+                SET is_archived = 1,
+                    cluster_id = ?,
+                    superseded_by = ?
+                WHERE episode_id IN ({placeholders})
+                """,
+                [cluster_id, superseded_by] + list(episode_ids),
+            )
+            self._conn.commit()
+            return cursor.rowcount
 
     def sync_from_trajectory_file(
         self,

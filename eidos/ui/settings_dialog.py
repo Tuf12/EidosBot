@@ -378,15 +378,17 @@ class SettingsDialog(QDialog):
         self.chk_confirm_ui.setStyleSheet("color: #f8f8f2; font-size: 13px;")
         safety_layout.addWidget(self.chk_confirm_ui)
 
-        self.chk_confirm_shell = QCheckBox("Require confirmation before Level 2 Shell commands (Recommended: ON)")
+        self.chk_confirm_shell = QCheckBox(
+            "Also require confirmation before normal (Level 2) host shell commands"
+        )
         self.chk_confirm_shell.setStyleSheet("color: #f8f8f2; font-size: 13px;")
         safety_layout.addWidget(self.chk_confirm_shell)
 
         # Destructive explanation badge
         desc_badge = QLabel(
-            "🔒 <b>Level 3 Destructive Commands:</b> Commands like <code>rm</code>, <code>dd</code>, "
-            "<code>reboot</code>, and <code>sudo</code> <b>always</b> require one-time approval and "
-            "cannot be bypassed or added to the allowlist."
+            "🚨 <b>Level 3 (red alert):</b> Commands like <code>rm</code>, <code>dd</code>, "
+            "<code>reboot</code>, and <code>sudo</code> <b>always</b> show a red approval dialog and "
+            "cannot be added to the allowlist. Routine workspace commands run in the bwrap sandbox without prompting."
         )
         desc_badge.setWordWrap(True)
         desc_badge.setStyleSheet(
@@ -799,7 +801,7 @@ class SettingsDialog(QDialog):
         # Safety
         safety_cfg = self.config.get("safety", {})
         self.chk_confirm_ui.setChecked(bool(safety_cfg.get("confirm_level_1_ui", False)))
-        self.chk_confirm_shell.setChecked(bool(safety_cfg.get("confirm_level_2_shell", True)))
+        self.chk_confirm_shell.setChecked(bool(safety_cfg.get("confirm_level_2_shell", False)))
 
         # Voice
         voice_cfg = self.config.get("voice", {})

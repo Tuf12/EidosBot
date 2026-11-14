@@ -33,6 +33,8 @@ To solve this, EidosBot strictly decouples execution into three distinct layers:
 
 **Updated job concept.** The triad stays the execution engine. It attaches to a project job. The invention list is the batch-queue component. Portfolios, images, and source PDFs stay in that job's `artifacts/`. The job brief holds what this invention is and what it is not, and that brief is in the worker prompt ahead of prior-art hits. See [PROJECT_JOBS.md](PROJECT_JOBS.md).
 
+**Updated job concept (groups).** An invention job lives under its group, for example `~/EidosWorkspace/jobs/Inventions/coil-lantern/`. The group file supplies the shared skill. Each invention keeps its own brief. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
+
 1. **Domain Skill (`invention-evaluator/SKILL.md`):** Contains the 4-dimension commercial rubric (0–100 score), search query blueprints, and standardized portfolio format.
 2. **Fresh-Context Sub-Agent Processor (`eidos/jobs/processor.py`):** An isolated worker that processes exactly one item at a time with a pristine context window, using Brave Search and headless Chromium to gather evidence, score against the rubric, and generate a portfolio document.
 3. **Resilient Batch Job Runner (`eidos/jobs/runner.py`):** A domain-agnostic state machine that tracks progress in `queue.json`, coordinates pacing and retries, handles pauses/cancellations, pushes Telegram milestones, and compiles a final ranked leaderboard (`RANKING_SUMMARY.md`).
