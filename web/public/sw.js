@@ -1,5 +1,5 @@
-// EidosBot Mobile PWA Service Worker (v10 - background keep-alive & notifications)
-const CACHE_NAME = 'eidos-pwa-v10';
+// EidosBot Mobile PWA Service Worker (v11 - remote model settings)
+const CACHE_NAME = 'eidos-pwa-v11';
 const PRECACHE_ASSETS = [
   '/manifest.json',
   '/icons/icon-192.png',

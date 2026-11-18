@@ -1,5 +1,6 @@
 """UI Controller and Qt Application integration for EidosBot."""
 
+import copy
 import logging
 import os
 import queue
@@ -48,6 +49,7 @@ class UIController(QObject):
     signal_chat_error = pyqtSignal(str)
     signal_task_running = pyqtSignal(bool)
     signal_sync_conversation = pyqtSignal(str, str, list)
+    signal_remote_model_changed = pyqtSignal(str)
 
     def __init__(
         self,
@@ -141,6 +143,7 @@ class UIController(QObject):
         self.pill.signal_edit_submitted.connect(self._on_message_edited)
         self.signal_task_running.connect(self.pill.set_task_running)
         self.signal_sync_conversation.connect(self._apply_conversation_sync)
+        self.signal_remote_model_changed.connect(self._on_remote_model_changed)
 
     @pyqtSlot(str, str, list)
     def _apply_conversation_sync(self, conv_id: str, title: str, messages: list):
@@ -415,6 +418,19 @@ class UIController(QObject):
 
         pref = new_config.get("models", {}).get("provider_preference", "local")
         self.pill.set_status("idle", f"Settings updated (Mode: {pref})")
+
+    def notify_remote_model_change(self, summary: str) -> None:
+        """Queue a phone-side model change onto the desktop UI thread."""
+        self.signal_remote_model_changed.emit(summary or "Model updated")
+
+    @pyqtSlot(str)
+    def _on_remote_model_changed(self, summary: str):
+        """Refresh an open settings window and show which model the phone selected."""
+        if self.settings_dialog is not None:
+            self.settings_dialog.config = copy.deepcopy(self.config)
+            self.settings_dialog.load_from_config()
+        state = getattr(self.pill, "_current_state", "idle") or "idle"
+        self.pill.set_status(state, summary)
 
     def set_telegram_gateway(self, telegram_gw):
         """Set the Telegram Gateway instance."""

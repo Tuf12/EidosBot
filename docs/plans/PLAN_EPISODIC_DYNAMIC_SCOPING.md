@@ -3,7 +3,7 @@
 **Specification:** [`docs/specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md`](../specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md)  
 **Related Systems:** [`docs/PROJECT_JOBS.md`](../PROJECT_JOBS.md), [`docs/EPISODIC_MEMORY.md`](../EPISODIC_MEMORY.md), [`docs/plans/PLAN_EPISODIC_ENTITY_GRAPH.md`](PLAN_EPISODIC_ENTITY_GRAPH.md)  
 **Target Modules:** `eidos/memory/types.py`, `eidos/memory/scope_resolver.py`, `eidos/memory/episodic_store.py`, `eidos/memory/recall_stream.py`, `eidos/core/loop.py`, `eidos/integrations/optimalx.py`, `eidos/memory/__init__.py`  
-**Status:** Ready for Implementation  
+**Status:** Completed  
 **Estimated Complexity:** Medium (Runtime desktop environment sensing, calibrated multi-factor re-ranking math, atomic SQLite schema migrations, and mid-stream multi-source XML containerization)
 
 ---
@@ -270,27 +270,27 @@ Create a fast, isolated unit test suite using `tempfile.TemporaryDirectory()` an
 
 ## 4. Rollout Strategy & Step-by-Step Task Checklist
 
-- [ ] **Step 1: Data Contracts & Types (`eidos/memory/types.py`)**
+- [x] **Step 1: Data Contracts & Types (`eidos/memory/types.py`)**
   - Define `TaskScope` model.
   - Extend `EpisodeMetadata`, `EpisodeRecord`, and `EpisodicSearchResult` with scope fields.
-- [ ] **Step 2: Database Schema Migration & Persistence (`eidos/memory/episodic_store.py`)**
+- [x] **Step 2: Database Schema Migration & Persistence (`eidos/memory/episodic_store.py`)**
   - Add scope columns and composite index in `_ensure_episode_schema_migrations()`.
   - Update `index_episode()` to persist scope fields into SQLite.
-- [ ] **Step 3: Environmental Scope Resolver Engine (`eidos/memory/scope_resolver.py`)**
+- [x] **Step 3: Environmental Scope Resolver Engine (`eidos/memory/scope_resolver.py`)**
   - Implement `ScopeResolver` with cached Git detection and desktop sensor resolution.
   - Export `ScopeResolver` and `TaskScope` in `eidos/memory/__init__.py`.
-- [ ] **Step 4: Scoped Re-Ranking & Job Boundary Filtering (`eidos/memory/episodic_store.py`)**
+- [x] **Step 4: Scoped Re-Ranking & Job Boundary Filtering (`eidos/memory/episodic_store.py`)**
   - Update `search()` and `_search_numpy_fallback()` / `_search_sqlite_vec()` to calculate $\Delta_{scope}$.
   - Implement job boundary isolation and cross-job graph bridge filtering.
   - Update `retrieve_macro_context()` to accept and pass `TaskScope`.
-- [ ] **Step 5: Multi-Source Recall & XML Containerization (`eidos/memory/recall_stream.py` & `optimalx.py`)**
+- [x] **Step 5: Multi-Source Recall & XML Containerization (`eidos/memory/recall_stream.py` & `optimalx.py`)**
   - Wire `TaskScope` through `RecallStreamInterceptor`.
   - Update `format_recalled_memory()` to emit scoped `<recalled_memory>` and `<recalled_notes>` tags.
   - Wire project-scoped queries into `OptimalXBridge.search_notes()`.
-- [ ] **Step 6: AgentLoop Lifecycle Integration (`eidos/core/loop.py`)**
+- [x] **Step 6: AgentLoop Lifecycle Integration (`eidos/core/loop.py`)**
   - Resolve `task_scope` at the beginning of `run_task()`.
   - Pass scope to macro context and recall interceptor.
   - Tag completed trajectories in `_finish_and_index_episode()`.
-- [ ] **Step 7: Isolated Test Suite & Verification (`tests/test_dynamic_scoping.py`)**
+- [x] **Step 7: Isolated Test Suite & Verification (`tests/test_dynamic_scoping.py`)**
   - Run focused unit tests with `pytest tests/test_dynamic_scoping.py`.
   - Verify zero regressions across `tests/test_episodic_store.py` and `tests/test_entity_graph.py`.

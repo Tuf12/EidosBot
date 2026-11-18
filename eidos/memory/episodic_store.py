@@ -26,6 +26,7 @@ from eidos.memory.types import (
     EpisodeReflection,
     EpisodicSearchResult,
     ReflectionEvaluation,
+    TaskScope,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,13 @@ class EpisodicStore:
                     is_archived INTEGER DEFAULT 0,
                     cluster_id TEXT,
                     superseded_by TEXT,
-                    consolidation_score REAL DEFAULT 1.0
+                    consolidation_score REAL DEFAULT 1.0,
+                    project_name TEXT,
+                    workspace_path TEXT,
+                    active_skill TEXT,
+                    window_class TEXT,
+                    job_id TEXT,
+                    integration TEXT
                 );
                 """
             )
@@ -181,12 +188,39 @@ class EpisodicStore:
                 self._conn.execute(
                     "ALTER TABLE episodes ADD COLUMN consolidation_score REAL DEFAULT 1.0"
                 )
+            if "project_name" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN project_name TEXT"
+                )
+            if "workspace_path" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN workspace_path TEXT"
+                )
+            if "active_skill" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN active_skill TEXT"
+                )
+            if "window_class" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN window_class TEXT"
+                )
+            if "job_id" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN job_id TEXT"
+                )
+            if "integration" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE episodes ADD COLUMN integration TEXT"
+                )
 
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_episodes_active ON episodes(is_archived, is_canonical);"
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_episodes_cluster ON episodes(cluster_id);"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_episodes_scope ON episodes(project_name, active_skill, job_id);"
             )
             self._conn.commit()
         except Exception as e:
@@ -439,6 +473,12 @@ class EpisodicStore:
                 superseded_by_val = getattr(record.metadata, "superseded_by", None)
                 raw_score = getattr(record.metadata, "consolidation_score", None)
                 consolidation_score_val = float(raw_score) if raw_score is not None else 1.0
+                project_name_val = getattr(record.metadata, "project_name", None)
+                workspace_path_val = getattr(record.metadata, "workspace_path", None)
+                active_skill_val = getattr(record.metadata, "active_skill", None)
+                window_class_val = getattr(record.metadata, "window_class", None)
+                job_id_val = getattr(record.metadata, "job_id", None)
+                integration_val = getattr(record.metadata, "integration", None)
 
                 if exists:
                     # Update metadata table
@@ -450,7 +490,9 @@ class EpisodicStore:
                             key_actions = ?, embedding_text = ?, full_record_json = ?,
                             embedding_blob = ?, created_at = ?, is_canonical = ?,
                             is_archived = ?, cluster_id = ?, superseded_by = ?,
-                            consolidation_score = ?
+                            consolidation_score = ?, project_name = ?,
+                            workspace_path = ?, active_skill = ?, window_class = ?,
+                            job_id = ?, integration = ?
                         WHERE episode_id = ?
                         """,
                         (
@@ -471,6 +513,12 @@ class EpisodicStore:
                             cluster_id_val,
                             superseded_by_val,
                             consolidation_score_val,
+                            project_name_val,
+                            workspace_path_val,
+                            active_skill_val,
+                            window_class_val,
+                            job_id_val,
+                            integration_val,
                             record.episode_id,
                         ),
                     )
@@ -494,8 +542,9 @@ class EpisodicStore:
                             summary, pitfalls_avoided, lessons_learned, key_actions,
                             embedding_text, full_record_json, embedding_blob, created_at,
                             is_canonical, is_archived, cluster_id, superseded_by,
-                            consolidation_score
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            consolidation_score, project_name, workspace_path,
+                            active_skill, window_class, job_id, integration
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             record.episode_id,
@@ -516,6 +565,12 @@ class EpisodicStore:
                             cluster_id_val,
                             superseded_by_val,
                             consolidation_score_val,
+                            project_name_val,
+                            workspace_path_val,
+                            active_skill_val,
+                            window_class_val,
+                            job_id_val,
+                            integration_val,
                         ),
                     )
                     if self._has_sqlite_vec:
@@ -544,6 +599,91 @@ class EpisodicStore:
                 logger.error("Failed to save episode %s to episodic store: %s", record.episode_id, e)
                 return False
 
+    def _evaluate_candidate_scope(
+        self,
+        cand_project: Optional[str],
+        cand_workspace: Optional[str],
+        cand_skill: Optional[str],
+        cand_job_id: Optional[str],
+        cand_integration: Optional[str],
+        outcome: str,
+        has_pitfall: bool,
+        matched_entity_count: int,
+        scope: Optional[TaskScope],
+    ) -> Tuple[bool, float, bool]:
+        """Evaluate candidate episode against TaskScope environmental boundaries.
+
+        Returns:
+            Tuple of (keep_candidate, scope_boost, cross_job_shared)
+        """
+        if scope is None:
+            return True, 0.0, False
+
+        cross_job_shared = False
+
+        # Job boundary isolation when scope.job_id is specified
+        if scope.job_id and scope.job_id.strip():
+            scope_job_clean = scope.job_id.strip().lower()
+            cand_job_clean = cand_job_id.strip().lower() if cand_job_id and cand_job_id.strip() else None
+
+            if cand_job_clean:
+                if cand_job_clean == scope_job_clean:
+                    # Same primary project job
+                    cross_job_shared = False
+                else:
+                    # Foreign project job
+                    if matched_entity_count > 0:
+                        # Entity-graph bridge: foreign job episode shares real-world entities
+                        cross_job_shared = True
+                    else:
+                        # Strict vector pruning: pure vector candidate from another job is dropped
+                        return False, 0.0, False
+            else:
+                # Candidate has no job_id (unscoped / general environment)
+                is_pitfall = (outcome != "success") or has_pitfall
+                if is_pitfall:
+                    # General OS/environment pitfalls are kept as cautionary warnings
+                    cross_job_shared = False
+                elif matched_entity_count > 0:
+                    # Entity-matched general experience
+                    cross_job_shared = False
+                else:
+                    # Pure vector unscoped success is not backfilled into a focused job
+                    return False, 0.0, False
+
+        # Calculate calibrated additive scope boost
+        boost = 0.0
+
+        # Delta project (+0.25)
+        if scope.project_name and cand_project:
+            if scope.project_name.strip().lower() == cand_project.strip().lower():
+                boost += 0.25
+
+        # Delta cwd / workspace (+0.15)
+        if cand_workspace:
+            cand_ws_clean = cand_workspace.strip().rstrip("/").lower()
+            if scope.workspace_path and scope.workspace_path.strip().rstrip("/").lower() == cand_ws_clean:
+                boost += 0.15
+            elif scope.cwd and scope.cwd.strip().rstrip("/").lower() == cand_ws_clean:
+                boost += 0.15
+
+        # Delta skill (+0.10)
+        if scope.active_skill and cand_skill:
+            if scope.active_skill.strip().lower() == cand_skill.strip().lower():
+                boost += 0.10
+
+        # Delta job (+0.25) - only awarded when job_id directly matches
+        if scope.job_id and cand_job_id:
+            if scope.job_id.strip().lower() == cand_job_id.strip().lower():
+                boost += 0.25
+
+        # Delta integration (+0.10)
+        if scope.integration and cand_integration:
+            if scope.integration.strip().lower() == cand_integration.strip().lower():
+                boost += 0.10
+
+        return True, boost, cross_job_shared
+
     def search(
         self,
         query: str,
@@ -553,13 +693,20 @@ class EpisodicStore:
         entity_weight: float = 0.35,
         query_vector: Optional[List[float]] = None,
         include_archived: bool = False,
+        scope: Optional[TaskScope] = None,
     ) -> List[EpisodicSearchResult]:
-        """Hybrid semantic and graph-augmented search against indexed episodic memories.
+        """Hybrid semantic, graph-augmented, and scope-aware search against indexed episodic memories.
 
         When the query yields one or more entities, ranking uses composite similarity
         ``(1 - entity_weight) * vector + entity_weight * graph_overlap`` even if no
-        episodes match on the graph (graph overlap treated as 0). ``EpisodicSearchResult.similarity``
-        reflects that composite score in hybrid mode, otherwise raw vector similarity.
+        episodes match on the graph (graph overlap treated as 0).
+
+        When ``scope`` is provided (a ``TaskScope`` instance), calibrated additive re-ranking
+        boosts are applied for matching project, workspace directory, skill, job, and integration.
+        If ``scope.job_id`` is specified, strict job boundary isolation is enforced: pure vector
+        hits from different jobs are pruned, foreign job episodes are admitted only via entity-graph
+        sharing (marked with ``cross_job_shared=True``), and general environment pitfalls are retained.
+
         Archived duplicate episodes (is_archived = 1) are excluded by default unless include_archived=True.
         """
         cleaned_query = query.strip()
@@ -594,6 +741,7 @@ class EpisodicStore:
                 graph_matches=graph_matches,
                 entity_weight=entity_weight,
                 include_archived=include_archived,
+                scope=scope,
             )
         else:
             return self._search_numpy_fallback(
@@ -604,6 +752,7 @@ class EpisodicStore:
                 graph_matches=graph_matches,
                 entity_weight=entity_weight,
                 include_archived=include_archived,
+                scope=scope,
             )
 
     def _search_sqlite_vec(
@@ -615,11 +764,12 @@ class EpisodicStore:
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
         entity_weight: float = 0.35,
         include_archived: bool = False,
+        scope: Optional[TaskScope] = None,
     ) -> List[EpisodicSearchResult]:
         """Execute nearest-neighbor vector search via sqlite-vec extension with hybrid entity re-ranking."""
         query_blob = self._vector_to_blob(query_vector)
         # Fetch larger k from vector index to allow post-filtering and re-ranking
-        fetch_k = max(top_k * 6, 30)
+        fetch_k = max(top_k * 8, 40) if scope is not None else max(top_k * 6, 30)
 
         with self._lock:
             try:
@@ -629,7 +779,8 @@ class EpisodicStore:
                            e.critic_score, e.timestamp, e.summary, e.pitfalls_avoided,
                            e.lessons_learned, e.key_actions, e.embedding_blob,
                            e.is_canonical, e.is_archived, e.cluster_id, e.superseded_by,
-                           e.consolidation_score
+                           e.consolidation_score, e.project_name, e.workspace_path,
+                           e.active_skill, e.window_class, e.job_id, e.integration
                     FROM vec_episodes v
                     JOIN episodes e ON e.episode_id = v.episode_id
                     WHERE v.embedding MATCH ? AND k = ? AND (e.is_archived = 0 OR ?)
@@ -648,9 +799,11 @@ class EpisodicStore:
                     graph_matches=graph_matches,
                     entity_weight=entity_weight,
                     include_archived=include_archived,
+                    scope=scope,
                 )
 
-        seen_ids = {r["episode_id"] for r in rows}
+        vec_result_ids = {r["episode_id"] for r in rows}
+        seen_ids = set(vec_result_ids)
         extra_rows = []
 
         if graph_matches:
@@ -665,15 +818,42 @@ class EpisodicStore:
                                    critic_score, timestamp, summary, pitfalls_avoided,
                                    lessons_learned, key_actions, embedding_blob,
                                    is_canonical, is_archived, cluster_id, superseded_by,
-                                   consolidation_score
+                                   consolidation_score, project_name, workspace_path,
+                                   active_skill, window_class, job_id, integration
                             FROM episodes
                             WHERE episode_id IN ({placeholders}) AND (is_archived = 0 OR ?)
                             """,
                             list(missing_ids) + [1 if include_archived else 0],
                         )
-                        extra_rows = extra_cursor.fetchall()
+                        for er in extra_cursor.fetchall():
+                            extra_rows.append(er)
+                            seen_ids.add(er["episode_id"])
                     except Exception as extra_err:
                         logger.warning("Error fetching extra graph-matched episodes: %s", extra_err)
+
+        if scope and scope.job_id:
+            with self._lock:
+                try:
+                    job_cursor = self._conn.execute(
+                        """
+                        SELECT episode_id, 0.0 as distance, task_goal, outcome,
+                               critic_score, timestamp, summary, pitfalls_avoided,
+                               lessons_learned, key_actions, embedding_blob,
+                               is_canonical, is_archived, cluster_id, superseded_by,
+                               consolidation_score, project_name, workspace_path,
+                               active_skill, window_class, job_id, integration
+                        FROM episodes
+                        WHERE job_id = ? AND (is_archived = 0 OR ?)
+                        LIMIT ?
+                        """,
+                        (scope.job_id, 1 if include_archived else 0, max(top_k * 6, 30)),
+                    )
+                    for jr in job_cursor.fetchall():
+                        if jr["episode_id"] not in seen_ids:
+                            extra_rows.append(jr)
+                            seen_ids.add(jr["episode_id"])
+                except Exception as je:
+                    logger.warning("Error fetching job-scoped episodes: %s", je)
 
         all_rows = list(rows) + list(extra_rows)
         candidates: List[Tuple[float, EpisodicSearchResult]] = []
@@ -682,7 +862,7 @@ class EpisodicStore:
 
         for r in all_rows:
             ep_id = r["episode_id"]
-            if ep_id in seen_ids and "distance" in r.keys() and r["distance"] is not None:
+            if ep_id in vec_result_ids and "distance" in r.keys() and r["distance"] is not None:
                 distance = float(r["distance"])
                 vec_sim = max(0.0, min(1.0, 1.0 - distance))
             else:
@@ -700,21 +880,36 @@ class EpisodicStore:
             else:
                 composite_sim = vec_sim
 
-            if composite_sim < min_similarity:
-                continue
-
             is_archived = bool(r["is_archived"]) if "is_archived" in r.keys() and r["is_archived"] is not None else False
             if not include_archived and is_archived:
                 continue
 
             outcome = r["outcome"]
+            has_pitfall = bool(r["pitfalls_avoided"] and r["pitfalls_avoided"].strip())
             if outcome_filter is not None:
                 if outcome_filter == "pitfall":
-                    has_pitfall = bool(r["pitfalls_avoided"] and r["pitfalls_avoided"].strip())
                     if outcome == "success" and not has_pitfall:
                         continue
                 elif outcome != outcome_filter:
                     continue
+
+            keep, scope_boost, cross_job_shared = self._evaluate_candidate_scope(
+                cand_project=r["project_name"] if "project_name" in r.keys() else None,
+                cand_workspace=r["workspace_path"] if "workspace_path" in r.keys() else None,
+                cand_skill=r["active_skill"] if "active_skill" in r.keys() else None,
+                cand_job_id=r["job_id"] if "job_id" in r.keys() else None,
+                cand_integration=r["integration"] if "integration" in r.keys() else None,
+                outcome=outcome,
+                has_pitfall=has_pitfall,
+                matched_entity_count=len(matched_ents),
+                scope=scope,
+            )
+            if not keep:
+                continue
+
+            final_sim = composite_sim + scope_boost
+            if final_sim < min_similarity:
+                continue
 
             key_actions: List[str] = []
             if r["key_actions"]:
@@ -733,7 +928,7 @@ class EpisodicStore:
                 task_goal=r["task_goal"],
                 outcome=outcome,
                 critic_score=r["critic_score"],
-                similarity=round(composite_sim, 4),
+                similarity=round(final_sim, 4),
                 summary=r["summary"] or "",
                 pitfalls_avoided=r["pitfalls_avoided"] or "",
                 lessons_learned=r["lessons_learned"] or "",
@@ -745,8 +940,16 @@ class EpisodicStore:
                 cluster_id=cluster_id,
                 superseded_by=superseded_by,
                 consolidation_score=consolidation_score,
+                project_name=r["project_name"] if "project_name" in r.keys() else None,
+                workspace_path=r["workspace_path"] if "workspace_path" in r.keys() else None,
+                active_skill=r["active_skill"] if "active_skill" in r.keys() else None,
+                window_class=r["window_class"] if "window_class" in r.keys() else None,
+                job_id=r["job_id"] if "job_id" in r.keys() else None,
+                integration=r["integration"] if "integration" in r.keys() else None,
+                scope_boost=round(scope_boost, 4),
+                cross_job_shared=cross_job_shared,
             )
-            candidates.append((composite_sim, item))
+            candidates.append((final_sim, item))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in candidates[:top_k]]
@@ -760,6 +963,7 @@ class EpisodicStore:
         graph_matches: Optional[Dict[str, Tuple[float, List[str]]]] = None,
         entity_weight: float = 0.35,
         include_archived: bool = False,
+        scope: Optional[TaskScope] = None,
     ) -> List[EpisodicSearchResult]:
         """Pure-python/numpy cosine similarity calculation over stored BLOBs with hybrid entity re-ranking."""
         with self._lock:
@@ -768,7 +972,8 @@ class EpisodicStore:
                 SELECT episode_id, task_goal, outcome, critic_score, timestamp,
                        summary, pitfalls_avoided, lessons_learned, key_actions,
                        embedding_blob, is_canonical, is_archived, cluster_id,
-                       superseded_by, consolidation_score
+                       superseded_by, consolidation_score, project_name,
+                       workspace_path, active_skill, window_class, job_id, integration
                 FROM episodes
                 WHERE (is_archived = 0 OR ?)
                 """,
@@ -795,7 +1000,8 @@ class EpisodicStore:
                         SELECT episode_id, task_goal, outcome, critic_score, timestamp,
                                summary, pitfalls_avoided, lessons_learned, key_actions,
                                embedding_blob, is_canonical, is_archived, cluster_id,
-                               superseded_by, consolidation_score
+                               superseded_by, consolidation_score, project_name,
+                               workspace_path, active_skill, window_class, job_id, integration
                         FROM episodes
                         WHERE episode_id IN ({placeholders}) AND (is_archived = 0 OR ?)
                         """,
@@ -824,21 +1030,36 @@ class EpisodicStore:
             else:
                 composite_sim = vec_sim
 
-            if composite_sim < min_similarity:
-                continue
-
             is_archived = bool(r["is_archived"]) if "is_archived" in r.keys() and r["is_archived"] is not None else False
             if not include_archived and is_archived:
                 continue
 
             outcome = r["outcome"]
+            has_pitfall = bool(r["pitfalls_avoided"] and r["pitfalls_avoided"].strip())
             if outcome_filter is not None:
                 if outcome_filter == "pitfall":
-                    has_pitfall = bool(r["pitfalls_avoided"] and r["pitfalls_avoided"].strip())
                     if outcome == "success" and not has_pitfall:
                         continue
                 elif outcome != outcome_filter:
                     continue
+
+            keep, scope_boost, cross_job_shared = self._evaluate_candidate_scope(
+                cand_project=r["project_name"] if "project_name" in r.keys() else None,
+                cand_workspace=r["workspace_path"] if "workspace_path" in r.keys() else None,
+                cand_skill=r["active_skill"] if "active_skill" in r.keys() else None,
+                cand_job_id=r["job_id"] if "job_id" in r.keys() else None,
+                cand_integration=r["integration"] if "integration" in r.keys() else None,
+                outcome=outcome,
+                has_pitfall=has_pitfall,
+                matched_entity_count=len(matched_ents),
+                scope=scope,
+            )
+            if not keep:
+                continue
+
+            final_sim = composite_sim + scope_boost
+            if final_sim < min_similarity:
+                continue
 
             key_actions: List[str] = []
             if r["key_actions"]:
@@ -857,7 +1078,7 @@ class EpisodicStore:
                 task_goal=r["task_goal"],
                 outcome=outcome,
                 critic_score=r["critic_score"],
-                similarity=round(composite_sim, 4),
+                similarity=round(final_sim, 4),
                 summary=r["summary"] or "",
                 pitfalls_avoided=r["pitfalls_avoided"] or "",
                 lessons_learned=r["lessons_learned"] or "",
@@ -869,8 +1090,16 @@ class EpisodicStore:
                 cluster_id=cluster_id,
                 superseded_by=superseded_by,
                 consolidation_score=consolidation_score,
+                project_name=r["project_name"] if "project_name" in r.keys() else None,
+                workspace_path=r["workspace_path"] if "workspace_path" in r.keys() else None,
+                active_skill=r["active_skill"] if "active_skill" in r.keys() else None,
+                window_class=r["window_class"] if "window_class" in r.keys() else None,
+                job_id=r["job_id"] if "job_id" in r.keys() else None,
+                integration=r["integration"] if "integration" in r.keys() else None,
+                scope_boost=round(scope_boost, 4),
+                cross_job_shared=cross_job_shared,
             )
-            candidates.append((composite_sim, item))
+            candidates.append((final_sim, item))
 
         candidates.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in candidates[:top_k]]
@@ -882,6 +1111,7 @@ class EpisodicStore:
         top_k_pitfall: int = 1,
         min_similarity: float = 0.15,
         include_archived: bool = False,
+        scope: Optional[TaskScope] = None,
     ) -> str:
         """Retrieve top golden path success and cautionary pitfall for macro context injection."""
         if not task_goal.strip():
@@ -900,6 +1130,7 @@ class EpisodicStore:
             min_similarity=min_similarity,
             query_vector=shared_vector,
             include_archived=include_archived,
+            scope=scope,
         )
         success_ids = {s.episode_id for s in successes}
 
@@ -910,10 +1141,19 @@ class EpisodicStore:
             min_similarity=min_similarity,
             query_vector=shared_vector,
             include_archived=include_archived,
+            scope=scope,
         )
 
         # Avoid showing the same episode in both sections
-        filtered_pitfalls = [p for p in raw_pitfalls if p.episode_id not in success_ids][:top_k_pitfall]
+        filtered_pitfalls = [p for p in raw_pitfalls if p.episode_id not in success_ids]
+        if scope and scope.job_id:
+            job_clean = scope.job_id.strip().lower()
+            same_job = [p for p in filtered_pitfalls if p.job_id and p.job_id.strip().lower() == job_clean]
+            cross_job = [p for p in filtered_pitfalls if p.cross_job_shared]
+            unscoped = [p for p in filtered_pitfalls if not p.job_id][:1]
+            filtered_pitfalls = (same_job + cross_job + unscoped)[:top_k_pitfall]
+        else:
+            filtered_pitfalls = filtered_pitfalls[:top_k_pitfall]
 
         if not successes and not filtered_pitfalls:
             return ""
@@ -921,7 +1161,15 @@ class EpisodicStore:
         sections: List[str] = ["<episodic_context>"]
 
         for s in successes:
-            sections.append(f"Past Experience - Golden Path Success (Similarity: {s.similarity:.2f}):")
+            scope_tag = ""
+            if s.cross_job_shared and s.job_id:
+                scope_tag = f" [Cross-Job Entity Match: {s.job_id}]"
+            elif s.job_id:
+                scope_tag = f" [Job: {s.job_id}]"
+            elif s.project_name:
+                scope_tag = f" [Project: {s.project_name}]"
+
+            sections.append(f"Past Experience - Golden Path Success (Similarity: {s.similarity:.2f}){scope_tag}:")
             sections.append(f"- Past Task: {s.task_goal}")
             if s.summary:
                 sections.append(f"- Resolution Summary: {s.summary}")
@@ -935,7 +1183,17 @@ class EpisodicStore:
             sections.append("")
 
         for p in filtered_pitfalls:
-            sections.append(f"Past Experience - Cautionary Pitfall (Similarity: {p.similarity:.2f}):")
+            scope_tag = ""
+            if p.cross_job_shared and p.job_id:
+                scope_tag = f" [Cross-Job Entity Match: {p.job_id}]"
+            elif p.job_id:
+                scope_tag = f" [Job: {p.job_id}]"
+            elif p.project_name:
+                scope_tag = f" [Project: {p.project_name}]"
+            elif not p.job_id and scope and scope.job_id:
+                scope_tag = " [General Environment Caution]"
+
+            sections.append(f"Past Experience - Cautionary Pitfall (Similarity: {p.similarity:.2f}){scope_tag}:")
             sections.append(f"- Past Task: {p.task_goal}")
             sections.append(f"- Outcome: {p.outcome}")
             if p.pitfalls_avoided:

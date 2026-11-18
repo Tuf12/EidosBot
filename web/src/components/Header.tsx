@@ -15,6 +15,7 @@ import {
   Bell,
   BellRing,
   BellOff,
+  SlidersHorizontal,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -31,6 +32,7 @@ interface HeaderProps {
   onRefreshSync?: () => void;
   onNewChat?: () => void;
   onOpenConversations?: () => void;
+  onOpenModelSettings?: () => void;
   onSetToken: (token: string) => void;
   onKill: () => void;
   onReset: () => void;
@@ -50,6 +52,7 @@ export const Header: React.FC<HeaderProps> = ({
   onRefreshSync,
   onNewChat,
   onOpenConversations,
+  onOpenModelSettings,
   onSetToken,
   onKill,
   onReset,
@@ -184,6 +187,16 @@ export const Header: React.FC<HeaderProps> = ({
               className="p-1.5 sm:p-2 rounded-lg bg-[#282a36] border border-[#44475a] text-[#8be9fd] hover:border-[#8be9fd] transition active:scale-95"
             >
               <History className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+            </button>
+          )}
+
+          {onOpenModelSettings && (
+            <button
+              onClick={onOpenModelSettings}
+              title="Switch the AI model used for the next reply"
+              className="p-1.5 sm:p-2 rounded-lg bg-[#282a36] border border-[#44475a] text-[#8be9fd] hover:border-[#8be9fd] transition active:scale-95"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             </button>
           )}
 

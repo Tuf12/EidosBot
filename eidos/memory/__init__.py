@@ -8,6 +8,7 @@ from eidos.memory.episodic_store import EpisodicStore
 from eidos.memory.graph_store import GraphStore
 from eidos.memory.recall_stream import RecallStreamInterceptor
 from eidos.memory.reflector import EpisodicReflector
+from eidos.memory.scope_resolver import ScopeResolver
 from eidos.memory.trajectory_logger import TrajectoryLogger
 from eidos.memory.types import (
     CandidateRule,
@@ -29,6 +30,7 @@ from eidos.memory.types import (
     ExtractedEntity,
     ReflectionEvaluation,
     StepRecord,
+    TaskScope,
     UserProfile,
 )
 from eidos.memory.user_store import UserStore
@@ -56,6 +58,7 @@ __all__ = [
     "GraphStore",
     "ReflectionEvaluation",
     "StepRecord",
+    "TaskScope",
     "UserProfile",
     "UserStore",
     "TrajectoryLogger",
@@ -65,4 +68,5 @@ __all__ = [
     "EpisodicConsolidator",
     "IdleConsolidationRunner",
     "RecallStreamInterceptor",
+    "ScopeResolver",
 ]

@@ -142,6 +142,13 @@ export const ChatView: React.FC<ChatViewProps> = ({
 }) => {
   const [inputText, setInputText] = useState('');
   const [isExpanded, setIsExpanded] = useState(false);
+  const [composerCollapsed, setComposerCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('eidos_composer_collapsed') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [isRecording, setIsRecording] = useState(false);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -234,12 +241,16 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const adjustTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
+    if (composerCollapsed) {
+      el.style.height = '40px';
+      return;
+    }
     el.style.height = 'auto';
     const minHeight = isExpanded ? 160 : 40;
     const maxHeight = isExpanded ? 320 : 180;
     const targetHeight = Math.max(minHeight, Math.min(el.scrollHeight, maxHeight));
     el.style.height = `${targetHeight}px`;
-  }, [isExpanded]);
+  }, [isExpanded, composerCollapsed]);
 
   useEffect(() => {
     adjustTextareaHeight();
@@ -299,6 +310,20 @@ export const ChatView: React.FC<ChatViewProps> = ({
     onEditRetry(userIndex, user.content, user.id);
   };
 
+  const applyComposerCollapse = useCallback(() => {
+    textareaRef.current?.blur();
+    setIsExpanded(false);
+    setComposerCollapsed(true);
+    if (textareaRef.current) {
+      textareaRef.current.style.height = '40px';
+    }
+    try {
+      localStorage.setItem('eidos_composer_collapsed', 'true');
+    } catch {
+      /* ignore private-mode storage failures */
+    }
+  }, []);
+
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (isThinking || isUploading) return;
@@ -308,10 +333,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     if (pendingFiles.length === 0) {
       onSendMessage(text);
       setInputText('');
-      setIsExpanded(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = '40px';
-      }
+      applyComposerCollapse();
       return;
     }
     void uploadAndSend(text);
@@ -337,10 +359,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
       }
       setInputText('');
       setPendingFiles([]);
-      setIsExpanded(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = '40px';
-      }
+      applyComposerCollapse();
     } catch (err) {
       setAttachNotice(err instanceof Error ? err.message : 'Upload failed');
       if (autoSpeak) onReleasePreparedPlayback?.();
@@ -464,6 +483,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
               setInputText('');
               micArmedPlaybackRef.current = false;
               onSendMessage(transcribed);
+              applyComposerCollapse();
             } else {
               setInputText((prev) => (prev ? `${prev} ${transcribed}` : transcribed));
               releaseMicPlayback();
@@ -498,7 +518,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         setMicNotice(`Could not access microphone: ${err.message}`);
       }
     }
-  }, [token, autoSubmitVoice, onSendMessage]);
+  }, [token, autoSubmitVoice, onSendMessage, applyComposerCollapse]);
 
   const stopRecording = useCallback(() => {
     if (
@@ -539,6 +559,30 @@ export const ChatView: React.FC<ChatViewProps> = ({
       startRecording();
     }
   }, [isRecording, isTranscribing, stopRecording, startRecording]);
+
+  const expandComposer = useCallback(() => {
+    setComposerCollapsed((current) => {
+      if (!current) return current;
+      try {
+        localStorage.setItem('eidos_composer_collapsed', 'false');
+      } catch {
+        /* ignore private-mode storage failures */
+      }
+      return false;
+    });
+  }, []);
+
+  const collapseComposer = useCallback(() => {
+    if (isRecording || isTranscribing || isUploading) return;
+    applyComposerCollapse();
+  }, [isRecording, isTranscribing, isUploading, applyComposerCollapse]);
+
+  const handleCollapsedMic = useCallback(() => {
+    expandComposer();
+    if (!isRecording && !isTranscribing) {
+      void startRecording();
+    }
+  }, [expandComposer, isRecording, isTranscribing, startRecording]);
 
   const handleStopSpeech = useCallback(() => {
     onStopAudio?.();
@@ -933,8 +977,23 @@ export const ChatView: React.FC<ChatViewProps> = ({
       />
 
       {/* Voice Controls Bar & Input Form */}
-      <div className="p-3 bg-[#1e1f29] border-t border-[#44475a] space-y-2">
+      <div className="bg-[#1e1f29] border-t border-[#44475a]">
+        {!composerCollapsed && (
+          <button
+            type="button"
+            onClick={collapseComposer}
+            disabled={isRecording || isTranscribing || isUploading}
+            title="Collapse the composer so the conversation can use the screen"
+            className="w-full flex items-center justify-center gap-1.5 py-2 bg-[#282a36] border-b border-[#44475a] text-[11px] font-semibold text-[#6272a4] hover:text-[#f8f8f2] hover:bg-[#44475a]/40 transition disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+            <span>Collapse</span>
+          </button>
+        )}
+        <div className={`space-y-2 ${composerCollapsed ? 'px-3 py-2' : 'p-3'}`}>
+
         {/* Quick Voice Bar */}
+        {!composerCollapsed && (
         <div className="flex items-center justify-between text-[11px] text-[#6272a4] px-1">
           <div className="flex items-center gap-3">
             {/* Auto-Read responses toggle */}
@@ -965,6 +1024,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
             </button>
           </div>
         </div>
+        )}
 
         {/* Active Recording / Transcription Banner */}
         {isRecording && (
@@ -1047,28 +1107,68 @@ export const ChatView: React.FC<ChatViewProps> = ({
               ))}
             </div>
           )}
+          <div className={composerCollapsed ? 'flex items-center gap-1.5 px-1.5 py-1.5' : 'flex flex-col'}>
+          {composerCollapsed && (
+            <button
+              type="button"
+              onClick={handleCollapsedMic}
+              disabled={isTranscribing}
+              title={isTranscribing ? 'Transcribing with Parakeet STT...' : 'Dictate and open the composer'}
+              className={`shrink-0 p-2 rounded-xl transition active:scale-95 ${
+                isTranscribing
+                  ? 'text-[#50fa7b] cursor-wait'
+                  : 'text-[#bd93f9] hover:bg-[#bd93f9]/10'
+              }`}
+            >
+              {isTranscribing ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Mic className="w-4 h-4" />
+              )}
+            </button>
+          )}
+
           {/* Text input area */}
-          <div className="px-3.5 pt-2.5 pb-1 relative">
+          <div className={composerCollapsed ? 'flex-1 min-w-0' : 'px-3.5 pt-2.5 pb-1 relative'}>
             <textarea
               ref={textareaRef}
               rows={1}
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
+              onFocus={expandComposer}
               onKeyDown={handleKeyDown}
               placeholder={
-                isRecording
+                composerCollapsed
+                  ? 'Message EidosBot...'
+                  : isRecording
                   ? 'Listening... Speak freely at your pace (tap Finish when done)'
                   : isTranscribing
                   ? 'Transcribing with Parakeet STT...'
                   : 'Message EidosBot... (Shift+Enter for newline)'
               }
-              className={`w-full bg-transparent text-sm text-[#f8f8f2] placeholder-[#6272a4] leading-relaxed resize-none focus:outline-none overflow-y-auto transition-[height] duration-100 ease-out ${
-                isExpanded ? 'min-h-[160px] max-h-80' : 'min-h-[40px] max-h-48'
+              className={`w-full bg-transparent text-sm text-[#f8f8f2] placeholder-[#6272a4] leading-relaxed resize-none focus:outline-none transition-[height] duration-100 ease-out ${
+                composerCollapsed
+                  ? 'h-10 max-h-10 overflow-hidden py-2'
+                  : isExpanded
+                  ? 'min-h-[160px] max-h-80 overflow-y-auto'
+                  : 'min-h-[40px] max-h-48 overflow-y-auto'
               }`}
             />
           </div>
 
+          {composerCollapsed && isThinking && (
+            <button
+              type="button"
+              onClick={handleStopTask}
+              title="Stop the current task"
+              className="shrink-0 p-2 rounded-xl bg-[#ff5555] text-white transition active:scale-95"
+            >
+              <Square className="w-4 h-4 fill-current" />
+            </button>
+          )}
+
           {/* Action Toolbar */}
+          {!composerCollapsed && (
           <div className="flex items-center justify-between px-2.5 py-1.5 border-t border-[#44475a]/30 bg-[#21232d]/50">
             {/* Left Actions */}
             <div className="flex items-center gap-1">
@@ -1197,7 +1297,10 @@ export const ChatView: React.FC<ChatViewProps> = ({
               )}
             </div>
           </div>
+          )}
+          </div>
         </form>
+        </div>
       </div>
     </div>
   );

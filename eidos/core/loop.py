@@ -22,8 +22,9 @@ from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.episodic_store import EpisodicStore
 from eidos.memory.recall_stream import RecallStreamInterceptor
 from eidos.memory.reflector import EpisodicReflector
+from eidos.memory.scope_resolver import ScopeResolver
 from eidos.memory.trajectory_logger import TrajectoryLogger
-from eidos.memory.types import StepRecord
+from eidos.memory.types import StepRecord, TaskScope
 from eidos.memory.user_store import UserStore
 from eidos.models.base import BaseModelClient, ToolCall
 from eidos.models.chutes_client import ChutesClient
@@ -268,6 +269,7 @@ class AgentLoop:
         )
         self.active_skill: Optional[Dict[str, Any]] = None
         self.active_job: Optional[Dict[str, Any]] = None
+        self.current_task_scope: Optional[TaskScope] = None
         self.job_processor = SkillJobProcessor(
             model_router=self.router,
             web_research_engine=self.web,
@@ -778,7 +780,7 @@ class AgentLoop:
         final_summary: str = "",
         user_intervened: bool = False,
     ):
-        """Finalize trajectory logging and index into vector episodic store."""
+        """Finalize trajectory logging and index into vector episodic store with TaskScope metadata."""
         if not self.memory_enabled or not episode_id:
             return None
         try:
@@ -789,6 +791,19 @@ class AgentLoop:
                 user_intervened=user_intervened,
             )
             if rec and self.episodic_store:
+                if self.current_task_scope:
+                    rec.metadata.project_name = self.current_task_scope.project_name
+                    rec.metadata.workspace_path = self.current_task_scope.workspace_path
+                    rec.metadata.cwd = self.current_task_scope.cwd
+                    rec.metadata.active_skill = self.current_task_scope.active_skill
+                    rec.metadata.window_class = self.current_task_scope.window_class
+                    rec.metadata.window_title = self.current_task_scope.window_title
+                    rec.metadata.job_id = self.current_task_scope.job_id
+                    rec.metadata.integration = self.current_task_scope.integration
+                    try:
+                        self.trajectory_logger.update_episode(rec)
+                    except Exception as upd_err:
+                        logger.debug("Failed to update trajectory file with scope metadata: %s", upd_err)
                 self.episodic_store.index_episode(rec)
             return rec
         except Exception as e:
@@ -1226,17 +1241,28 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             }
 
         # Macro retrieval of past experience (golden path + pitfall)
+        active_win = self.windows.get_active_window_info()
+        self.current_task_scope = ScopeResolver.resolve_current_scope(
+            cwd=os.getcwd(),
+            active_window=active_win,
+            active_skill=self.active_skill,
+            active_job=self.active_job,
+        )
+        if self.recall_interceptor:
+            self.recall_interceptor.set_current_scope(self.current_task_scope)
+
         episodic_ctx = ""
         if self.memory_enabled and self.episodic_store:
             try:
-                episodic_ctx = self.episodic_store.retrieve_macro_context(user_goal)
+                episodic_ctx = self.episodic_store.retrieve_macro_context(
+                    user_goal, scope=self.current_task_scope
+                )
                 if episodic_ctx:
                     logger.info("Macro recall retrieved episodic context for task: %s", user_goal)
             except Exception as e:
                 logger.warning("Failed to retrieve macro episodic context: %s", e)
 
         user_profile_ctx = self.user_store.get_prompt_context() if self.memory_enabled else None
-        active_win = self.windows.get_active_window_info()
         system_prompt = self._assemble_system_prompt(
             active_win,
             user_profile_ctx=user_profile_ctx,

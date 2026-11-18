@@ -142,6 +142,19 @@ class ReflectionEvaluation(BaseModel):
     )
 
 
+class TaskScope(BaseModel):
+    """Runtime environmental scope defining the context of an execution turn."""
+
+    project_name: Optional[str] = None  # e.g., "OptimalX", "EidosBot"
+    workspace_path: Optional[str] = None  # e.g., "/home/tuf/CursorProjects/OptimalX"
+    cwd: str = ""  # Current working directory
+    active_skill: Optional[str] = None  # e.g., "browser-automation", "desktop-gui"
+    window_class: Optional[str] = None  # e.g., "Code", "Google-chrome"
+    window_title: Optional[str] = None  # e.g., "main.py - EidosBot"
+    job_id: Optional[str] = None  # Primary project job id (e.g., "notes-app")
+    integration: Optional[str] = None  # Outside app integration (e.g., "gmail", "optimalx")
+
+
 class EpisodeMetadata(BaseModel):
     """Metadata describing the overall execution and evaluation of an episode."""
 
@@ -157,6 +170,14 @@ class EpisodeMetadata(BaseModel):
     cluster_id: Optional[str] = None
     superseded_by: Optional[str] = None
     consolidation_score: float = 1.0
+    project_name: Optional[str] = None
+    workspace_path: Optional[str] = None
+    cwd: str = ""
+    active_skill: Optional[str] = None
+    window_class: Optional[str] = None
+    window_title: Optional[str] = None
+    job_id: Optional[str] = None
+    integration: Optional[str] = None
 
 
 class EpisodeRecord(BaseModel):
@@ -199,6 +220,14 @@ class EpisodicSearchResult(BaseModel):
     cluster_id: Optional[str] = None
     superseded_by: Optional[str] = None
     consolidation_score: float = 1.0
+    project_name: Optional[str] = None
+    workspace_path: Optional[str] = None
+    active_skill: Optional[str] = None
+    window_class: Optional[str] = None
+    job_id: Optional[str] = None
+    integration: Optional[str] = None
+    scope_boost: float = 0.0
+    cross_job_shared: bool = False
 
 
 class CandidateRule(BaseModel):

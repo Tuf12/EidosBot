@@ -2,7 +2,7 @@
 
 **Document:** `docs/specs/SPEC_EPISODIC_DYNAMIC_SCOPING.md`  
 **Plan:** [`docs/plans/PLAN_EPISODIC_DYNAMIC_SCOPING.md`](../plans/PLAN_EPISODIC_DYNAMIC_SCOPING.md)  
-**Status:** Ready for Implementation  
+**Status:** Implemented  
 **Component:** `eidos/memory/scope_resolver.py`, `eidos/memory/recall_stream.py`  
 **Related Systems:** `eidos/core/loop.py`, `eidos/memory/episodic_store.py`, `eidos/integrations/optimalx.py`, `eidos/memory/conversation_store.py`
 

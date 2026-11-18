@@ -9,6 +9,7 @@ import { ScreenViewport } from './components/ScreenViewport';
 import { SafetyModal } from './components/SafetyModal';
 import { ConversationsModal } from './components/ConversationsModal';
 import { BackgroundSettingsModal } from './components/BackgroundSettingsModal';
+import { ModelSettingsModal } from './components/ModelSettingsModal';
 import { AudioPlayerBar } from './components/AudioPlayerBar';
 import { MessageSquare, Monitor, Terminal, ShieldAlert } from 'lucide-react';
 
@@ -18,6 +19,7 @@ export function App() {
   const [activeTab, setActiveTab] = useState<Tab>('chat');
   const [showConversationsModal, setShowConversationsModal] = useState(false);
   const [showBackgroundSettings, setShowBackgroundSettings] = useState(false);
+  const [showModelSettings, setShowModelSettings] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const { scale: textScale, showBadge: showTextScale } = usePinchTextScale();
 
@@ -168,6 +170,7 @@ export function App() {
         onRefreshSync={refreshSync}
         onNewChat={() => startNewChat('New Chat')}
         onOpenConversations={() => setShowConversationsModal(true)}
+        onOpenModelSettings={() => setShowModelSettings(true)}
         onSetToken={setToken}
         onKill={handleKill}
         onReset={resetKill}
@@ -317,6 +320,12 @@ export function App() {
       />
 
       {/* Android Background Execution & Permissions Settings */}
+      <ModelSettingsModal
+        isOpen={showModelSettings}
+        token={token}
+        onClose={() => setShowModelSettings(false)}
+      />
+
       <BackgroundSettingsModal
         isOpen={showBackgroundSettings}
         onClose={() => setShowBackgroundSettings(false)}

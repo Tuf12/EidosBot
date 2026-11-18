@@ -145,6 +145,7 @@ def run_gui_mode(
             auth_token=gw_cfg.get("auth_token"),
             token_env_var=gw_cfg.get("auth_token_env", "EIDOS_GATEWAY_AUTH_TOKEN"),
             token_file=gw_cfg.get("token_file", "~/.eidos/gateway.token"),
+            config_path=config_path,
         )
         gateway.start()
 
@@ -195,6 +196,7 @@ def run_cli_mode(
     max_steps: Optional[int],
     start_gateway: bool = False,
     start_telegram: bool = False,
+    config_path: str = "config.yaml",
 ):
     """Run EidosBot in terminal REPL or one-shot mode."""
     agent = AgentLoop(config=cfg, kill_switch=kill_switch)
@@ -219,6 +221,7 @@ def run_cli_mode(
             auth_token=gw_cfg.get("auth_token"),
             token_env_var=gw_cfg.get("auth_token_env", "EIDOS_GATEWAY_AUTH_TOKEN"),
             token_file=gw_cfg.get("token_file", "~/.eidos/gateway.token"),
+            config_path=config_path,
         )
         gateway.start()
 
@@ -309,6 +312,7 @@ def run_batch_cli(
     args: argparse.Namespace,
     start_gateway: bool = False,
     start_telegram: bool = False,
+    config_path: str = "config.yaml",
 ) -> int:
     """Execute batch job operations directly from CLI without full GUI."""
     agent = AgentLoop(config=cfg, kill_switch=kill_switch)
@@ -332,6 +336,7 @@ def run_batch_cli(
             auth_token=gw_cfg.get("auth_token"),
             token_env_var=gw_cfg.get("auth_token_env", "EIDOS_GATEWAY_AUTH_TOKEN"),
             token_file=gw_cfg.get("token_file", "~/.eidos/gateway.token"),
+            config_path=config_path,
         )
         gateway.start()
 
@@ -482,7 +487,14 @@ def cli_entrypoint():
     # Determine mode:
     # 0. If batch job operations requested -> run batch CLI
     if args.job_init or args.job_run is not None or args.job_status is not None or args.job_summary is not None:
-        sys.exit(run_batch_cli(cfg, kill_switch, args, start_gateway=args.gateway, start_telegram=args.telegram))
+        sys.exit(run_batch_cli(
+            cfg,
+            kill_switch,
+            args,
+            start_gateway=args.gateway,
+            start_telegram=args.telegram,
+            config_path=args.config,
+        ))
 
     # 1. If explicit --gui -> GUI mode
     # 2. If prompt supplied -> one-shot CLI mode
@@ -497,7 +509,15 @@ def cli_entrypoint():
             config_path=args.config,
         )
     elif args.prompt or args.cli:
-        run_cli_mode(cfg, kill_switch, args.prompt, args.steps, start_gateway=args.gateway, start_telegram=args.telegram)
+        run_cli_mode(
+            cfg,
+            kill_switch,
+            args.prompt,
+            args.steps,
+            start_gateway=args.gateway,
+            start_telegram=args.telegram,
+            config_path=args.config,
+        )
     else:
         # Default with no arguments: Check if DISPLAY is available
         if os.environ.get("DISPLAY"):
@@ -509,7 +529,15 @@ def cli_entrypoint():
                 config_path=args.config,
             )
         else:
-            run_cli_mode(cfg, kill_switch, args.prompt, args.steps, start_gateway=args.gateway, start_telegram=args.telegram)
+            run_cli_mode(
+            cfg,
+            kill_switch,
+            args.prompt,
+            args.steps,
+            start_gateway=args.gateway,
+            start_telegram=args.telegram,
+            config_path=args.config,
+        )
 
 
 if __name__ == "__main__":

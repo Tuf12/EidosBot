@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 
 from eidos.memory.episodic_store import EpisodicStore
-from eidos.memory.types import EpisodicSearchResult
+from eidos.memory.types import EpisodicSearchResult, TaskScope
 from eidos.models.base import ModelResponse, ToolCall
 
 logger = logging.getLogger(__name__)
@@ -58,62 +58,105 @@ class RecallStreamInterceptor:
         self.optimalx = optimalx_bridge
         self.max_recalls_per_turn = max_recalls_per_turn
         self.min_similarity = min_similarity
+        self.current_scope: Optional[TaskScope] = None
 
-    def lookup_memory(self, query: str) -> Optional[EpisodicSearchResult]:
-        """Query episodic memory via Hybrid Graph-Augmented Retrieval (GAR).
+    def set_current_scope(self, scope: Optional[TaskScope]) -> None:
+        """Set the active environmental TaskScope for mid-stream recall queries."""
+        self.current_scope = scope
+
+    def lookup_memory(
+        self,
+        query: str,
+        scope: Optional[TaskScope] = None,
+    ) -> Optional[EpisodicSearchResult]:
+        """Query episodic memory via Hybrid Graph-Augmented Retrieval (GAR) and TaskScope.
 
         Delegates to ``EpisodicStore.search``. When the query contains entity
         prefixes or inferred entities (e.g. ``cmd:xrandr display brightness``,
         ``project:OptimalX audio setup``, ``device:HDMI-0``, ``path:/etc/pulse``),
-        results are ranked with blended vector and entity-overlap scores. With no
-        entities detected, behavior matches pure semantic (vector) search.
-
-        Prefix parsing and taxonomy validation happen in
-        ``EntityExtractor.extract_from_query``; this method only sanitizes the
-        query string and forwards it to the store.
+        results are ranked with blended vector and entity-overlap scores. When scope is
+        provided (or ``current_scope`` is set), calibrated re-ranking boosts and job boundary
+        isolation are applied.
         """
         if not self.episodic_store:
             return None
         cleaned_query = sanitize_recall_query(query)
         if not cleaned_query:
             return None
+        effective_scope = scope if scope is not None else self.current_scope
         try:
             results = self.episodic_store.search(
                 query=cleaned_query,
                 top_k=1,
                 min_similarity=self.min_similarity,
+                scope=effective_scope,
             )
             return results[0] if results else None
         except Exception as e:
             logger.warning("Error querying episodic store for recall '%s': %s", cleaned_query, e)
             return None
 
-    def lookup_optimalx_notes(self, query: str, limit: int = 2) -> List[Dict[str, Any]]:
-        """Search personal OptimalX notes and knowledge bases for active recall context."""
+    def lookup_optimalx_notes(
+        self,
+        query: str,
+        limit: int = 2,
+        scope: Optional[TaskScope] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search personal OptimalX notes and knowledge bases for active recall context.
+
+        When scope has a project_name, first queries OptimalX with parent_folder=project_name,
+        falling back to global notes if no results are returned.
+        """
         if not self.optimalx:
             return []
         cleaned_query = sanitize_recall_query(query)
         if not cleaned_query:
             return []
-        try:
-            return self.optimalx.search_notes(query=cleaned_query, limit=limit)
-        except Exception as e:
-            logger.warning("Error querying OptimalX notes for recall '%s': %s", cleaned_query, e)
-            return []
+
+        effective_scope = scope if scope is not None else self.current_scope
+        notes: List[Dict[str, Any]] = []
+
+        if effective_scope and effective_scope.project_name:
+            try:
+                notes = self.optimalx.search_notes(
+                    query=cleaned_query,
+                    limit=limit,
+                    parent_folder=effective_scope.project_name,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Project-scoped OptimalX note search failed for '%s' in '%s': %s",
+                    cleaned_query,
+                    effective_scope.project_name,
+                    e,
+                )
+
+        if not notes:
+            try:
+                notes = self.optimalx.search_notes(query=cleaned_query, limit=limit)
+            except Exception as e:
+                logger.warning("Error querying OptimalX notes for recall '%s': %s", cleaned_query, e)
+                return []
+
+        return notes
 
     def format_recalled_memory(
         self,
         result: Optional[EpisodicSearchResult],
         query: str,
         optimalx_notes: Optional[List[Dict[str, Any]]] = None,
+        scope: Optional[TaskScope] = None,
     ) -> str:
         """Format matching episodic memory and/or OptimalX notes into XML blocks for mid-stream splicing.
 
-        When hybrid GAR returns ``matched_entities`` on the search result, they are
-        included so the model can see which graph nodes drove the recall.
+        Produces cleanly containerized, disambiguated XML:
+        - `<recalled_memory episode="..." scope="..." job_id="...">`
+        - `<recalled_memory episode="..." scope="ExternalJob" job_id="..." integration="..." cross_job="true">`
+        - `<recalled_notes project="...">`
         """
         has_episodic = result is not None
         has_notes = bool(optimalx_notes)
+        effective_scope = scope if scope is not None else self.current_scope
 
         if not has_episodic and not has_notes:
             return (
@@ -126,7 +169,31 @@ class RecallStreamInterceptor:
         parts: List[str] = []
 
         if has_episodic and result is not None:
-            lines = [f'\n<recalled_memory episode="{result.episode_id}">']
+            attrs = [f'episode="{result.episode_id}"']
+            if getattr(result, "cross_job_shared", False):
+                scope_val = result.project_name or "ExternalJob"
+                attrs.append(f'scope="{scope_val}"')
+                if getattr(result, "job_id", None):
+                    attrs.append(f'job_id="{result.job_id}"')
+                if getattr(result, "integration", None):
+                    attrs.append(f'integration="{result.integration}"')
+                attrs.append('cross_job="true"')
+            else:
+                if getattr(result, "project_name", None):
+                    attrs.append(f'scope="{result.project_name}"')
+                elif effective_scope and effective_scope.project_name:
+                    attrs.append(f'scope="{effective_scope.project_name}"')
+                if getattr(result, "job_id", None):
+                    attrs.append(f'job_id="{result.job_id}"')
+                if getattr(result, "integration", None):
+                    attrs.append(f'integration="{result.integration}"')
+
+            tag_header = f'\n<recalled_memory {" ".join(attrs)}>'
+            lines = [tag_header]
+
+            if getattr(result, "cross_job_shared", False) and getattr(result, "matched_entities", None):
+                lines.append(f"- Notice: Recalled via shared entity '{', '.join(result.matched_entities)}'")
+
             lines.append(f"- Past Task: {result.task_goal}")
             lines.append(f"- Outcome: {result.outcome}")
             if result.summary:
@@ -138,13 +205,18 @@ class RecallStreamInterceptor:
             if result.key_actions:
                 actions_str = " -> ".join(result.key_actions)
                 lines.append(f"- Proven Tool Pattern: {actions_str}")
-            if result.matched_entities:
+            if getattr(result, "matched_entities", None) and not getattr(result, "cross_job_shared", False):
                 lines.append(f"- Matched Entities: {', '.join(result.matched_entities)}")
             lines.append("</recalled_memory>")
             parts.append("\n".join(lines))
 
         if has_notes and optimalx_notes:
-            notes_lines = ["\n<recalled_notes>"]
+            notes_proj = effective_scope.project_name if effective_scope and effective_scope.project_name else None
+            if notes_proj:
+                notes_lines = [f'\n<recalled_notes project="{notes_proj}">']
+            else:
+                notes_lines = ["\n<recalled_notes>"]
+
             for note in optimalx_notes:
                 loc = note.get("location") or note.get("title") or "Personal Note"
                 snip = note.get("snippet") or note.get("text") or note.get("summary") or ""
@@ -272,9 +344,11 @@ class RecallStreamInterceptor:
                             resp.close()
                             resp = None
 
-                            mem_result = self.lookup_memory(query)
-                            notes_result = self.lookup_optimalx_notes(query, limit=2)
-                            splice_text = self.format_recalled_memory(mem_result, query, optimalx_notes=notes_result)
+                            mem_result = self.lookup_memory(query, scope=self.current_scope)
+                            notes_result = self.lookup_optimalx_notes(query, limit=2, scope=self.current_scope)
+                            splice_text = self.format_recalled_memory(
+                                mem_result, query, optimalx_notes=notes_result, scope=self.current_scope
+                            )
 
                             if on_recall_callback:
                                 try:
@@ -487,9 +561,11 @@ class RecallStreamInterceptor:
                             resp.close()
                             resp = None
 
-                            mem_result = self.lookup_memory(query)
-                            notes_result = self.lookup_optimalx_notes(query, limit=2)
-                            splice_text = self.format_recalled_memory(mem_result, query, optimalx_notes=notes_result)
+                            mem_result = self.lookup_memory(query, scope=self.current_scope)
+                            notes_result = self.lookup_optimalx_notes(query, limit=2, scope=self.current_scope)
+                            splice_text = self.format_recalled_memory(
+                                mem_result, query, optimalx_notes=notes_result, scope=self.current_scope
+                            )
 
                             if on_recall_callback:
                                 try:

@@ -93,6 +93,32 @@ export interface BackgroundActivity {
   details: string;
 }
 
+export type ModelPreference = 'local' | 'auto' | 'cloud';
+export type CloudProvider = 'chutes' | 'meta';
+
+export interface ModelChoiceGroup {
+  reasoning_model: string;
+  vision_model: string;
+  models: string[];
+}
+
+export interface ModelSettings {
+  preference: ModelPreference;
+  cloud_provider: CloudProvider;
+  active_backend: 'local' | 'chutes' | 'meta';
+  active_reasoning_model: string;
+  active_vision_model: string;
+  summary: string;
+  persisted?: boolean;
+  local: ModelChoiceGroup & { reachable: boolean | null };
+  chutes: ModelChoiceGroup & { configured: boolean };
+  meta: ModelChoiceGroup & {
+    configured: boolean;
+    reasoning_effort: string;
+    efforts: string[];
+  };
+}
+
 export interface OutboundWSMessage {
   type:
     | 'ping'

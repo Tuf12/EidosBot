@@ -22,6 +22,7 @@ import uuid
 from aiohttp import web, WSMsgType
 
 from eidos.gateway.files import SharedFileRegistry, content_disposition
+from eidos.gateway.model_settings import apply_model_settings, describe_model_settings
 from eidos.gateway.llm_proxy import (
     handle_llm_health,
     handle_proxy_openai_chat,
@@ -443,10 +444,12 @@ class RemoteGatewayServer:
         token_env_var: str = "EIDOS_GATEWAY_AUTH_TOKEN",
         token_file: str = "~/.eidos/gateway.token",
         screen_capture: Optional[ScreenCapture] = None,
+        config_path: Optional[str] = None,
     ):
         self.agent_loop = agent_loop
         self.host = host
         self.port = port
+        self.config_path = config_path
         self.auth_token = resolve_gateway_token(auth_token, token_env_var=token_env_var, token_file=token_file)
         self.screen = screen_capture or ScreenCapture()
 
@@ -599,6 +602,77 @@ class RemoteGatewayServer:
             ],
         }
         return web.json_response(default_manifest, content_type="application/manifest+json")
+
+    def _settings_path(self) -> Optional[str]:
+        """Config file the desktop app saves, so a phone change survives restart."""
+        if self.config_path:
+            return self.config_path
+        ui = self._desktop_ui
+        path = getattr(ui, "config_path", None) if ui is not None else None
+        return str(path) if path else None
+
+    async def _handle_get_models(self, request: web.Request) -> web.Response:
+        """Return the active model and the choices available on this PC."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        refresh = request.query.get("refresh", "").strip().lower() in {"1", "true", "yes"}
+        try:
+            loop = asyncio.get_running_loop()
+            data = await loop.run_in_executor(
+                None,
+                lambda: describe_model_settings(self.agent_loop, refresh=refresh),
+            )
+            return web.json_response({"ok": True, **data})
+        except Exception as exc:
+            logger.error("Failed to read model settings: %s", exc)
+            return web.json_response({"ok": False, "error": "Could not read model settings"}, status=500)
+
+    async def _handle_post_models(self, request: web.Request) -> web.Response:
+        """Switch the live model and save that choice for the next launch."""
+        if not self._verify_auth(request):
+            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"ok": False, "error": "Expected a JSON object"}, status=400)
+
+        try:
+            loop = asyncio.get_running_loop()
+            path = self._settings_path()
+            data = await loop.run_in_executor(
+                None,
+                lambda: apply_model_settings(self.agent_loop, payload, path),
+            )
+        except ValueError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.error("Failed to update model settings: %s", exc)
+            return web.json_response({"ok": False, "error": "Could not update the model"}, status=500)
+
+        summary = str(data.get("summary") or "Model updated")
+        self.broadcast_event("model_settings", {
+            "summary": summary,
+            "preference": data.get("preference"),
+            "cloud_provider": data.get("cloud_provider"),
+            "active_backend": data.get("active_backend"),
+            "active_reasoning_model": data.get("active_reasoning_model"),
+        })
+        self._notify_desktop_model_change(summary)
+        logger.info("Remote client switched model: %s", summary)
+        return web.json_response({"ok": True, **data})
+
+    def _notify_desktop_model_change(self, summary: str) -> None:
+        """Ask the desktop UI, on its own thread, to show the new model."""
+        ui = self._desktop_ui
+        notify = getattr(ui, "notify_remote_model_change", None) if ui is not None else None
+        if not callable(notify):
+            return
+        try:
+            notify(summary)
+        except Exception:
+            logger.debug("Desktop could not show the remote model change", exc_info=True)
 
     async def _handle_status(self, request: web.Request) -> web.Response:
         """Return current agent status."""
@@ -2352,6 +2426,8 @@ class RemoteGatewayServer:
             self._app.router.add_get("/api/tags", self._handle_proxy_ollama_tags)
             self._app.router.add_post("/v1/chat/completions", self._handle_proxy_openai_chat)
             self._app.router.add_get("/api/status", self._handle_status)
+            self._app.router.add_get("/api/models", self._handle_get_models)
+            self._app.router.add_post("/api/models", self._handle_post_models)
             self._app.router.add_get("/api/history", self._handle_history)
             self._app.router.add_post("/api/conversations/new", self._handle_new_chat)
             self._app.router.add_post("/api/new_chat", self._handle_new_chat)
