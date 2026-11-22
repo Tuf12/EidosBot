@@ -7,14 +7,23 @@ function touchDistance(touches: TouchList): number {
   return Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
 }
 
-/** The desktop mirror handles its own pinch-to-zoom. Leave those gestures alone. */
+/** The desktop mirror and full view file viewer handle their own pinch-to-zoom. Leave those gestures alone. */
 function gestureTargetsScreen(event: Event): boolean {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
-  if (path.some((node) => node instanceof Element && node.hasAttribute('data-eidos-screen'))) {
+  if (
+    path.some(
+      (node) =>
+        node instanceof Element &&
+        (node.hasAttribute('data-eidos-screen') || node.hasAttribute('data-eidos-zoomable'))
+    )
+  ) {
     return true;
   }
   const target = event.target;
-  return target instanceof Element && Boolean(target.closest('[data-eidos-screen]'));
+  return (
+    target instanceof Element &&
+    Boolean(target.closest('[data-eidos-screen], [data-eidos-zoomable]'))
+  );
 }
 
 /**

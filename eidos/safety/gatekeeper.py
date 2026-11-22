@@ -82,9 +82,12 @@ class Gatekeeper:
             self.audit.log(action_type, details, int(risk_level), decision, reason)
             return approved, "Approved by user" if approved else "Denied by user"
 
-        # Level 2: Shell / Modifications
+        # Level 2: Shell / Modifications / External Tools
         if risk_level == RiskLevel.LEVEL_2_SHELL:
             cmd = details.get("command", "")
+            if not cmd and (action_type.startswith("mcp__") or action_type == "call_mcp_tool"):
+                cmd = details.get("mcp_target") or action_type
+
             # Check allowlist
             if cmd and self.allowlist.is_allowed(cmd):
                 self.allowlist.record_usage(cmd)

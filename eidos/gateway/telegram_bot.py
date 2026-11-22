@@ -370,11 +370,25 @@ class TelegramGateway:
         if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
             kill_active = self.agent_loop.kill_switch.is_triggered()
 
-        # Batch job status if available
-        job_summary = "None"
-        if hasattr(self.agent_loop, "jobs") and self.agent_loop.jobs and self.agent_loop.jobs.active_job:
-            q = self.agent_loop.jobs.active_job
-            job_summary = f"{q.job_name} ({q.status}, {q.completed_items}/{q.total_items})"
+        # Primary project job and running jobs status (PROJECT_JOBS.md Phase 13.6)
+        active_job = getattr(self.agent_loop, "active_job", None)
+        jobs_runner = getattr(self.agent_loop, "jobs", None)
+
+        primary_summary = "None"
+        if active_job and isinstance(active_job, dict):
+            j_name = active_job.get("name") or active_job.get("job_name", "Job")
+            j_id = active_job.get("job_id", "")
+            j_stat = active_job.get("status", "active")
+            primary_summary = f"{j_name} ({j_stat}, {j_id})"
+
+        running_lines = ""
+        if jobs_runner:
+            w_id = jobs_runner.get_active_worker_job_id()
+            if w_id:
+                w_man = jobs_runner.load_manifest(w_id)
+                w_name = (w_man.get("name") or w_man.get("job_name") or w_id) if w_man else w_id
+                w_prog = (w_man.get("progress") if w_man else None) or {}
+                running_lines = f"\n• *Running Worker:* `{w_name} ({w_prog.get('completed_items', 0)}/{w_prog.get('total_items', 0)})`"
 
         status_text = (
             "📊 *EidosBot System Status*\n"
@@ -383,7 +397,7 @@ class TelegramGateway:
             f"• *Active Window:* `{win_title}`\n"
             f"• *Window Class:* `{win_class}`\n"
             f"• *Kill Switch:* `{'🛑 TRIPPED' if kill_active else '✅ Ready'}`\n"
-            f"• *Active Job:* `{job_summary}`\n"
+            f"• *Primary Job:* `{primary_summary}`{running_lines}\n"
         )
         await update.message.reply_text(status_text, parse_mode="Markdown")
 

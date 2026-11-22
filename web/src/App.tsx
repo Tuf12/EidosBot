@@ -35,6 +35,7 @@ export function App() {
     stateDetails,
     isKilled,
     backgroundWork,
+    jobFocus,
     confirmations,
     messages,
     sharedFiles,
@@ -162,6 +163,7 @@ export function App() {
         stateDetails={stateDetails}
         isKilled={isKilled}
         backgroundWork={backgroundWork}
+        jobFocus={jobFocus}
         token={token}
         conversationTitle={conversationTitle}
         isSyncing={isSyncing}

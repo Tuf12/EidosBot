@@ -1,12 +1,9 @@
 import React, { useState } from 'react';
-import { AgentState, BackgroundActivity } from '../types/gateway';
+import { AgentState, BackgroundActivity, JobFocusState } from '../types/gateway';
 import { NotificationPermissionState } from '../hooks/useBackgroundKeepAlive';
 import {
   Bot,
-  ShieldAlert,
   Key,
-  Wifi,
-  WifiOff,
   Eye,
   EyeOff,
   RefreshCw,
@@ -15,7 +12,8 @@ import {
   Bell,
   BellRing,
   BellOff,
-  SlidersHorizontal,
+  Settings,
+  Briefcase,
 } from 'lucide-react';
 
 interface HeaderProps {
@@ -24,6 +22,7 @@ interface HeaderProps {
   stateDetails: string;
   isKilled: boolean;
   backgroundWork?: BackgroundActivity;
+  jobFocus?: JobFocusState | null;
   token: string;
   conversationTitle?: string;
   isSyncing?: boolean;
@@ -34,8 +33,8 @@ interface HeaderProps {
   onOpenConversations?: () => void;
   onOpenModelSettings?: () => void;
   onSetToken: (token: string) => void;
-  onKill: () => void;
-  onReset: () => void;
+  onKill?: () => void;
+  onReset?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -44,6 +43,7 @@ export const Header: React.FC<HeaderProps> = ({
   stateDetails,
   isKilled,
   backgroundWork,
+  jobFocus,
   token,
   conversationTitle = 'New Chat',
   isSyncing = false,
@@ -104,10 +104,22 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="min-w-0">
             <div className="flex items-center gap-1.5 flex-wrap">
               <h1 className="text-sm sm:text-base font-bold text-[#f8f8f2] tracking-tight">EidosBot</h1>
-              <div className="flex items-center gap-1 bg-[#282a36] border border-[#44475a] px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0">
-                <span className={`w-1.5 h-1.5 rounded-full ${getStatusColor()}`} />
-                <span className="text-[#f8f8f2]">{getStatusLabel()}</span>
-              </div>
+              {isKilled && onReset ? (
+                <button
+                  type="button"
+                  onClick={onReset}
+                  title="Emergency Stop active. Click to reset."
+                  className="flex items-center gap-1 bg-[#ff5555]/20 hover:bg-[#ff5555]/30 border border-[#ff5555] px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0 transition active:scale-95 cursor-pointer"
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${getStatusColor()}`} />
+                  <span className="text-[#f8f8f2]">{getStatusLabel()} 🔄</span>
+                </button>
+              ) : (
+                <div className="flex items-center gap-1 bg-[#282a36] border border-[#44475a] px-1.5 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0">
+                  <span className={`w-1.5 h-1.5 rounded-full ${getStatusColor()}`} />
+                  <span className="text-[#f8f8f2]">{getStatusLabel()}</span>
+                </div>
+              )}
               {backgroundWork?.active && (
                 <div
                   className="flex items-center gap-1 bg-[#bd93f9]/20 border border-[#bd93f9]/50 text-[#bd93f9] px-2 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0 animate-pulse"
@@ -121,6 +133,48 @@ export const Header: React.FC<HeaderProps> = ({
                   <span>⚡ {backgroundWork.task || 'Background Task'}</span>
                 </div>
               )}
+              {/* Primary Job Scope Tag (PROJECT_JOBS.md Phase 13.6 & Phase 14) */}
+              {jobFocus?.primary && (
+                <div
+                  className="flex items-center gap-1 bg-[#8be9fd]/15 border border-[#8be9fd]/40 text-[#8be9fd] px-2 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0"
+                  title={
+                    jobFocus.primary.path
+                      ? `Primary Job: ${jobFocus.primary.name}\nID: ${jobFocus.primary.job_id}\nPath: ${jobFocus.primary.path}`
+                      : `Primary Job: ${jobFocus.primary.name}`
+                  }
+                >
+                  <Briefcase className="w-3 h-3 text-[#8be9fd]" />
+                  <span className="truncate max-w-[130px] sm:max-w-[180px]">
+                    Job · {jobFocus.primary.name}
+                    {jobFocus.integrations && jobFocus.integrations.length > 0 ? ` · ${jobFocus.integrations[0].name}` : ''}
+                  </span>
+                </div>
+              )}
+              {/* Standalone Integration Focus Tag (PROJECT_JOBS.md Phase 14) */}
+              {!jobFocus?.primary && jobFocus?.integration_focus && (
+                <div
+                  className="flex items-center gap-1 bg-[#ffb86c]/15 border border-[#ffb86c]/40 text-[#ffb86c] px-2 py-0.5 rounded-full text-[10px] sm:text-[11px] font-semibold shrink-0"
+                  title={`Integration Focus: ${jobFocus.integration_focus}`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#ffb86c]" />
+                  <span className="truncate max-w-[130px] sm:max-w-[180px]">
+                    Integration · {jobFocus.integration_focus}
+                  </span>
+                </div>
+              )}
+              {/* Running Attached Job Chips */}
+              {jobFocus?.running?.map((r) => (
+                <div
+                  key={r.job_id}
+                  className="flex items-center gap-1 bg-[#50fa7b]/15 border border-[#50fa7b]/40 text-[#50fa7b] px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-medium shrink-0 animate-pulse"
+                  title={`Running worker: ${r.name}`}
+                >
+                  <span className="w-1.5 h-1.5 rounded-full bg-[#50fa7b]" />
+                  <span className="truncate max-w-[110px]">
+                    Running · {r.name} {r.completed_items !== undefined && r.total_items ? `${r.completed_items}/${r.total_items}` : ''}
+                  </span>
+                </div>
+              ))}
             </div>
 
             {/* Conversation Topic / Status Details */}
@@ -190,16 +244,6 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {onOpenModelSettings && (
-            <button
-              onClick={onOpenModelSettings}
-              title="Switch the AI model used for the next reply"
-              className="p-1.5 sm:p-2 rounded-lg bg-[#282a36] border border-[#44475a] text-[#8be9fd] hover:border-[#8be9fd] transition active:scale-95"
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
-            </button>
-          )}
-
           {/* Key / Auth Button */}
           <button
             onClick={() => {
@@ -244,35 +288,15 @@ export const Header: React.FC<HeaderProps> = ({
             </button>
           )}
 
-          {/* Connection status indicator */}
-          <div
-            title={connected ? 'Connected via Tailscale/Local' : 'Disconnected'}
-            className="p-1.5 sm:p-2 rounded-lg bg-[#282a36] border border-[#44475a]"
-          >
-            {connected ? (
-              <Wifi className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#50fa7b]" />
-            ) : (
-              <WifiOff className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#ff5555]" />
-            )}
-          </div>
-
-          {/* Emergency Kill Switch Button */}
-          {isKilled ? (
+          {/* Settings Button (Change AI Models) */}
+          {onOpenModelSettings && (
             <button
-              onClick={onReset}
-              title="Reset Emergency Stop"
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#ffb86c]/20 border border-[#ffb86c] text-[#ffb86c] font-bold text-xs hover:bg-[#ffb86c]/30 transition active:scale-95"
+              onClick={onOpenModelSettings}
+              title="Settings (Change AI models & providers)"
+              aria-label="Settings"
+              className="p-1.5 sm:p-2 rounded-lg bg-[#282a36] border border-[#44475a] text-[#8be9fd] hover:border-[#8be9fd] hover:text-[#8be9fd] transition active:scale-95"
             >
-              🔄 Reset
-            </button>
-          ) : (
-            <button
-              onClick={onKill}
-              title="Emergency Kill Switch (Immediately halts all processing, audio, and tasks)"
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition shadow-[0_0_12px_rgba(255,85,85,0.4)] active:scale-95"
-            >
-              <ShieldAlert className="w-3.5 h-3.5" />
-              <span className="hidden xs:inline sm:inline">STOP</span>
+              <Settings className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             </button>
           )}
         </div>

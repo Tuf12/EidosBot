@@ -14,6 +14,8 @@ from eidos.browser.manager import PlaywrightManager
 from eidos.core.clock import EidosClock
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
 from eidos.core.tool_registry import ToolRegistry
+from eidos.integrations.mcp_client import MCPClientManager
+from eidos.integrations.mcp_config import MCPConfigManager
 from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
 from eidos.jobs import BatchJobRunner, SkillJobProcessor
@@ -144,6 +146,11 @@ class AgentLoop:
             cdp_port=opt_cfg.get("cdp_port", 9222),
             window_detector=self.windows,
         )
+
+        # Model Context Protocol (MCP) integrations subsystem (PROJECT_JOBS.md Section 13)
+        self.mcp_config = MCPConfigManager()
+        self.mcp_client = MCPClientManager(config_manager=self.mcp_config)
+        self.active_integration_focus: Optional[str] = None
 
         self.ollama = OllamaClient(
             base_url=local_cfg.get("base_url", "http://localhost:11434"),
@@ -285,6 +292,42 @@ class AgentLoop:
             kill_switch=self.kill_switch,
         )
 
+        # Restore active primary job focus if persisted in focus.yaml (PROJECT_JOBS.md)
+        try:
+            persisted_primary = self.jobs.focus_manager.get_primary()
+            if persisted_primary:
+                primary_manifest = self.jobs.load_manifest(persisted_primary)
+                if primary_manifest:
+                    self.active_job = primary_manifest
+                    logger.info(
+                        "Restored primary job focus: '%s' (%s)",
+                        primary_manifest.get("name") or primary_manifest.get("job_name", "job"),
+                        primary_manifest.get("job_id", persisted_primary),
+                    )
+                    # Activate declared skill if any
+                    sk_name = primary_manifest.get("skill_name")
+                    if not sk_name and isinstance(primary_manifest.get("skill"), dict):
+                        sk_name = primary_manifest["skill"].get("name")
+                    elif primary_manifest.get("skills") and isinstance(primary_manifest["skills"], list):
+                        first = primary_manifest["skills"][0]
+                        sk_name = first.get("name") if isinstance(first, dict) else str(first)
+                    if sk_name:
+                        sk_res = self.skills.load_skill(sk_name)
+                        if sk_res:
+                            self.active_skill = sk_res
+            if not self.active_job:
+                persisted_int = self.jobs.focus_manager.get_integration_focus()
+                if persisted_int:
+                    self.active_integration_focus = persisted_int
+                    logger.info("Restored standalone integration focus: '%s'", persisted_int)
+        except Exception as e:
+            logger.debug("Could not restore primary job or integration focus on init: %s", e)
+
+        try:
+            self._reconcile_startup_scope()
+        except Exception as e:
+            logger.debug("Could not bind startup job scope to the active conversation: %s", e)
+
         # Episodic Consolidation Subsystem
         cons_cfg = mem_cfg.get("consolidation", {})
         self.consolidation_enabled = cons_cfg.get("enabled", True)
@@ -346,6 +389,7 @@ class AgentLoop:
             "on_conversation_title_changed": [],
             "on_conversation_changed": [],
             "on_background_activity": [],
+            "on_job_focus": [],
         }
         self.background_active: bool = False
         self.background_task: str = ""
@@ -485,26 +529,200 @@ class AgentLoop:
             except Exception as e:
                 logger.debug("Error stopping reflector during loop shutdown: %s", e)
 
+    def _skill_name_from_manifest(self, manifest: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Return the first declared skill name on a job manifest."""
+        if not isinstance(manifest, dict):
+            return None
+        skill_name = manifest.get("skill_name")
+        if not skill_name and isinstance(manifest.get("skill"), dict):
+            skill_name = manifest["skill"].get("name")
+        elif isinstance(manifest.get("skills"), list) and manifest["skills"]:
+            first = manifest["skills"][0]
+            skill_name = first.get("name") if isinstance(first, dict) else str(first)
+        if isinstance(skill_name, str) and skill_name.strip():
+            return skill_name.strip()
+        return None
+
+    def _activate_manifest_skill(self, manifest: Optional[Dict[str, Any]]) -> None:
+        """Load the job's declared skill, or clear the skill when the job has none."""
+        self.active_skill = None
+        skill_name = self._skill_name_from_manifest(manifest)
+        skills = getattr(self, "skills", None)
+        if skill_name and skills:
+            loaded = skills.load_skill(skill_name)
+            if loaded:
+                self.active_skill = loaded
+
+    def _write_live_focus(self, primary: Optional[str], integration: Optional[str]) -> None:
+        """Mirror the active conversation's scope into focus.yaml without shuffling attached jobs."""
+        jobs = getattr(self, "jobs", None)
+        focus_manager = getattr(jobs, "focus_manager", None) if jobs else None
+        if not focus_manager:
+            return
+        current = focus_manager.get_focus()
+        focus_manager.save_focus(
+            primary=primary,
+            attached=current.get("attached") or [],
+            integration_focus=None if primary else integration,
+        )
+
+    def _clear_live_scope(self) -> None:
+        """Drop the in-memory job, skill, and integration focus for this conversation."""
+        self.active_job = None
+        self.active_skill = None
+        self.active_integration_focus = None
+        self._write_live_focus(None, None)
+
+    def _restore_live_scope(self, job_id: Optional[str], integration: Optional[str]) -> None:
+        """Load one conversation's saved job or integration into the live session."""
+        self.active_job = None
+        self.active_skill = None
+        self.active_integration_focus = None
+        loaded = None
+        jobs = getattr(self, "jobs", None)
+        if job_id and jobs:
+            try:
+                loaded = jobs.load_manifest(job_id)
+            except Exception as e:
+                logger.debug("Could not restore conversation job '%s': %s", job_id, e)
+        if isinstance(loaded, dict):
+            self.active_job = loaded
+            self._activate_manifest_skill(loaded)
+            self._write_live_focus(str(loaded.get("job_id") or job_id), None)
+            return
+        if integration:
+            self.active_integration_focus = integration
+            self._write_live_focus(None, integration)
+            return
+        self._write_live_focus(None, None)
+
+    def _persist_scope_on_conversation(self, conversation_id: Optional[str]) -> None:
+        """Save the live job or integration focus onto one conversation."""
+        store = getattr(self, "conversation_store", None)
+        if not conversation_id or not store:
+            return
+        job_id = None
+        integration = None
+        job = getattr(self, "active_job", None)
+        if isinstance(job, dict):
+            raw = job.get("job_id") or (job.get("directories") or {}).get("job_dir")
+            if raw:
+                job_id = str(raw)
+        if not job_id:
+            raw_integration = getattr(self, "active_integration_focus", None)
+            if isinstance(raw_integration, str) and raw_integration.strip():
+                integration = raw_integration.strip()
+        try:
+            store.set_conversation_scope(conversation_id, job_id, integration)
+        except Exception as e:
+            logger.debug("Could not store conversation scope for %s: %s", conversation_id, e)
+
+    def _apply_stored_scope(self, conversation_id: Optional[str]) -> None:
+        """Make the live session match the scope stored on a conversation."""
+        store = getattr(self, "conversation_store", None)
+        scope = None
+        if conversation_id and store:
+            try:
+                scope = store.get_conversation_scope(conversation_id)
+            except Exception as e:
+                logger.debug("Could not read conversation scope for %s: %s", conversation_id, e)
+        if scope and scope.get("bound"):
+            self._restore_live_scope(scope.get("job_id"), scope.get("integration_focus"))
+            return
+        self._clear_live_scope()
+        if conversation_id and store:
+            try:
+                store.set_conversation_scope(conversation_id, None, None)
+            except Exception as e:
+                logger.debug("Could not mark conversation %s unscoped: %s", conversation_id, e)
+
+    def _conversation_has_messages(self, conversation_id: str) -> bool:
+        store = getattr(self, "conversation_store", None)
+        if not store:
+            return False
+        try:
+            return bool(store.get_messages(conversation_id, limit=1))
+        except Exception:
+            return False
+
+    def _reconcile_startup_scope(self) -> None:
+        """Prefer the open conversation's saved scope over the last global focus.yaml pointer.
+
+        A conversation that already has turns and has never stored a scope keeps the
+        focus restored at startup. An empty conversation is a new chat: the previous
+        job stays on the earlier conversation, and this one starts unscoped.
+        """
+        conversation_id = getattr(self, "active_conversation_id", None)
+        store = getattr(self, "conversation_store", None)
+        if not conversation_id or not store:
+            return
+        scope = store.get_conversation_scope(conversation_id)
+        if scope and scope.get("bound"):
+            self._restore_live_scope(scope.get("job_id"), scope.get("integration_focus"))
+            return
+        if self._conversation_has_messages(conversation_id):
+            self._persist_scope_on_conversation(conversation_id)
+            return
+
+        if self.active_job or self.active_integration_focus:
+            try:
+                others = store.list_conversations(limit=20)
+            except Exception:
+                others = []
+            for conv in others:
+                other_id = conv.get("id") if isinstance(conv, dict) else None
+                if not other_id or other_id == conversation_id:
+                    continue
+                try:
+                    other_scope = store.get_conversation_scope(other_id)
+                except Exception:
+                    continue
+                if other_scope and other_scope.get("bound"):
+                    continue
+                if not self._conversation_has_messages(other_id):
+                    continue
+                self._persist_scope_on_conversation(other_id)
+                break
+        self._clear_live_scope()
+        try:
+            store.set_conversation_scope(conversation_id, None, None)
+        except Exception as e:
+            logger.debug("Could not mark conversation %s unscoped at startup: %s", conversation_id, e)
+
     def start_new_conversation(self, title: str = "New Chat") -> str:
-        """Create a fresh conversation thread, reset context history, and set active."""
+        """Create a fresh conversation with no job scope from the conversation being left."""
+        self._persist_scope_on_conversation(getattr(self, "active_conversation_id", None))
         if self.conversation_store:
             new_id = self.conversation_store.create_conversation(title=title)
             self.active_conversation_id = new_id
+            self.conversation_store.set_conversation_scope(new_id, None, None)
         else:
             self.active_conversation_id = None
+        self._clear_live_scope()
         self.conversation_history.clear()
         self._emit("on_conversation_title_changed", title)
         self._emit("on_conversation_changed", self.active_conversation_id, title)
+        self._emit("on_job_focus")
         return self.active_conversation_id or ""
 
     def switch_conversation(self, conversation_id: str) -> bool:
-        """Switch active conversation, loading its prior turns into loop context."""
+        """Switch active conversation, restoring that conversation's own job scope."""
         if not self.conversation_store:
             return False
         conv = self.conversation_store.get_conversation(conversation_id)
         if not conv:
             return False
-        self.active_conversation_id = conversation_id
+        if self.active_conversation_id != conversation_id:
+            self._persist_scope_on_conversation(self.active_conversation_id)
+            self.active_conversation_id = conversation_id
+            self._apply_stored_scope(conversation_id)
+            try:
+                self.conversation_store.touch_conversation(conversation_id)
+            except Exception as e:
+                logger.debug("Could not touch conversation %s: %s", conversation_id, e)
+            self._emit("on_job_focus")
+        else:
+            self.active_conversation_id = conversation_id
         self.reload_conversation_history()
         title = conv.get("title", "New Chat")
         self._emit("on_conversation_title_changed", title)
@@ -888,32 +1106,21 @@ class AgentLoop:
         if self.active_job:
             job_id = self.active_job.get("job_id", "")
             job_name = self.active_job.get("name") or self.active_job.get("job_name", "")
-            status = self.active_job.get("status", "")
-            skill_info = self.active_job.get("skill", {})
-            skill_name = skill_info.get("name") if isinstance(skill_info, dict) else self.active_job.get("skill_name", "")
+            status = self.active_job.get("status", "active")
             dirs = self.active_job.get("directories", {})
             job_dir = dirs.get("job_dir") or dirs.get("output_dir", "")
+            notes_dir = dirs.get("notes_dir") or (str(Path(job_dir) / "notes") if job_dir else "")
             artifacts_dir = dirs.get("artifacts_dir") or dirs.get("portfolios_dir", "")
-            prog = self.active_job.get("progress", {})
-            total = prog.get("total_items", 0)
-            done = prog.get("completed_items", 0)
-            pct = prog.get("percent", 0.0)
 
             prompt += f"""
 
 ---
-ACTIVE JOB MODE: {job_name} ({job_id})
+PRIMARY JOB: {job_name} ({job_id})
 - Status: {status}
-- Assigned Skill: {skill_name}
 - Working Directory: {job_dir}
+- Notes Directory: {notes_dir}
 - Artifacts Directory: {artifacts_dir}
 """
-            if total > 0:
-                prompt += f"- Progress: {done}/{total} items ({pct}%)\n"
-            if dirs.get("queue_file"):
-                prompt += f"- Queue State: {dirs.get('queue_file')}\n"
-            prompt += f"- Manifest: {dirs.get('manifest_file', '')}\n"
-
             # Inject project brief details from job.yaml (PROJECT_JOBS.md)
             identity = self.active_job.get("identity")
             if isinstance(identity, dict):
@@ -921,39 +1128,137 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                 goal = identity.get("goal")
                 phase = identity.get("phase")
                 if summary:
-                    prompt += f"- Summary: {summary}\n"
+                    prompt += f"Summary: {summary}\n"
                 if goal:
-                    prompt += f"- Goal: {goal}\n"
+                    prompt += f"Goal: {goal}\n"
                 if phase:
-                    prompt += f"- Phase: {phase}\n"
+                    prompt += f"Phase: {phase}\n"
 
             boundary = self.active_job.get("boundary")
             if isinstance(boundary, dict):
                 this_is = boundary.get("this_is")
                 this_is_not = boundary.get("this_is_not")
                 if this_is:
-                    prompt += f"- Boundary (This Is): {this_is}\n"
+                    prompt += f"This is: {this_is}\n"
                 if this_is_not:
-                    prompt += f"- Boundary (This Is NOT): {this_is_not}\n"
+                    prompt += f"This is not: {this_is_not}\n"
+                for df in (boundary.get("distinct_from") or []):
+                    if isinstance(df, dict):
+                        df_n = df.get("name", "")
+                        df_d = df.get("difference", "")
+                        if df_n:
+                            prompt += f"Distinct from: {df_n} — {df_d}\n"
+                    elif isinstance(df, str) and df.strip():
+                        prompt += f"Distinct from: {df.strip()}\n"
 
             decisions = self.active_job.get("decisions")
             if isinstance(decisions, list) and decisions:
-                prompt += "- Key Decisions:\n"
+                prompt += "Decisions in force:\n"
                 for d in decisions[-5:]:
                     d_text = d.get("text") if isinstance(d, dict) else str(d)
-                    prompt += f"  • {d_text}\n"
+                    prompt += f"- {d_text}\n"
+
+            open_questions = self.active_job.get("open_questions")
+            if isinstance(open_questions, list) and open_questions:
+                prompt += "Open questions:\n"
+                for q in open_questions[:5]:
+                    prompt += f"- {q}\n"
+
+            constraints = self.active_job.get("constraints")
+            if isinstance(constraints, list) and constraints:
+                prompt += "Constraints:\n"
+                for c in constraints[:5]:
+                    prompt += f"- {c}\n"
+
+            skills_list = self.active_job.get("skills")
+            if isinstance(skills_list, list) and skills_list:
+                prompt += "Skills:\n"
+                for s in skills_list:
+                    if isinstance(s, dict):
+                        s_name = s.get("name", "")
+                        s_uw = s.get("use_when") or "Declared project skill"
+                        prompt += f"- {s_name} — {s_uw}\n"
+                    elif isinstance(s, str):
+                        prompt += f"- {s}\n"
+            elif self.active_job.get("skill_name"):
+                prompt += f"Skills:\n- {self.active_job.get('skill_name')}\n"
 
             docs = self.active_job.get("documents")
             if isinstance(docs, list) and docs:
-                prompt += "- Job Documents:\n"
+                prompt += "Documents (read only when the step matches):\n"
                 for doc in docs[:6]:
                     if isinstance(doc, dict):
                         dp = doc.get("path", "")
                         dsumm = doc.get("summary", "")
                         drw = doc.get("read_when", "")
-                        prompt += f"  • {dp} ({dsumm}) [Read when: {drw}]\n"
+                        prompt += f"- {dp} ({dsumm}) [Read when: {drw}]\n"
 
-            prompt += "---\n"
+            # Attached jobs status lines
+            try:
+                attached_ids = self.jobs.focus_manager.get_attached()
+                active_worker_id = self.jobs.get_active_worker_job_id()
+                if attached_ids or active_worker_id:
+                    prompt += "Attached jobs (status only):\n"
+                    seen_att = set()
+                    if active_worker_id and active_worker_id != job_id:
+                        seen_att.add(active_worker_id)
+                        w_man = self.jobs.load_manifest(active_worker_id)
+                        w_name = (w_man.get("name") or w_man.get("job_name") or active_worker_id) if w_man else active_worker_id
+                        w_prog = w_man.get("progress", {}) if w_man else {}
+                        prompt += f"- {w_name} — running, {w_prog.get('completed_items', 0)}/{w_prog.get('total_items', 0)}\n"
+                    for att_id in attached_ids:
+                        if att_id not in seen_att and att_id != job_id:
+                            seen_att.add(att_id)
+                            a_man = self.jobs.load_manifest(att_id)
+                            a_name = (a_man.get("name") or a_man.get("job_name") or att_id) if a_man else att_id
+                            a_stat = a_man.get("status", "idle") if a_man else "attached"
+                            prompt += f"- {a_name} — {a_stat}\n"
+            except Exception:
+                pass
+
+            # Batch queue progress if component attached
+            prog = self.active_job.get("progress", {})
+            total = prog.get("total_items", 0)
+            done = prog.get("completed_items", 0)
+            pct = prog.get("percent", 0.0)
+            if total > 0:
+                prompt += f"Batch Queue: {done}/{total} items ({pct}%)\n"
+            if dirs.get("queue_file"):
+                prompt += f"- Queue State: {dirs.get('queue_file')}\n"
+
+            prompt += "If a similar memory or search result conflicts with this brief, follow the brief.\n---\n"
+        elif not self.active_integration_focus:
+            prompt += (
+                "\n\n---\n"
+                "CONVERSATION SCOPE: This conversation has no project job and no integration focus. "
+                "Do not continue another conversation's job, brief, notes, or files. "
+                "Stay in base desktop mode until this conversation is about a project. "
+                "If the user asks to continue a specific project, call focus_job for that project "
+                "before reading or writing its notes. If they start a new project, call create_job.\n"
+                "---"
+            )
+
+        # Inject integration skills and tool catalogs (PROJECT_JOBS.md Section 13.2)
+        active_ints: List[str] = []
+        if self.active_job:
+            active_ints = self.mcp_config.resolve_job_integrations(self.active_job)
+        elif self.active_integration_focus:
+            active_ints = [self.active_integration_focus]
+
+        for int_name in active_ints:
+            rec = self.mcp_config.get_integration(int_name)
+            server_name = rec.server if rec else int_name
+            if rec and rec.skill_body:
+                prompt += f"\n\n---\nINTEGRATION SKILL: {rec.name}\n{rec.skill_body}\n---"
+            try:
+                _, catalog_text, has_many = self.mcp_client.get_scoped_tool_schemas(server_name)
+                if has_many and catalog_text:
+                    prompt += f"\n\n---\n{catalog_text}\n---"
+            except Exception as e:
+                logger.debug("Failed resolving MCP tool catalog for '%s': %s", server_name, e)
+
+        if not self.active_job and self.active_integration_focus:
+            prompt += f"\n\n---\nACTIVE INTEGRATION FOCUS: {self.active_integration_focus}\n---"
 
         if self.active_skill:
             skill_name = self.active_skill.get("name", "unnamed-skill")
@@ -962,21 +1267,39 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         return prompt
 
     def _assemble_active_tools(self) -> List[Dict[str, Any]]:
-        """Return base tools or scoped tools unlocked by active skill and active job."""
+        """Return base tools or scoped tools unlocked by active skill, active job, and MCP integrations."""
         req_tools: List[str] = []
 
         if self.active_job:
-            req_tools.extend([
-                "init_batch_job",
-                "run_batch_job",
-                "step_batch_job",
-                "get_job_status",
-                "pause_batch_job",
-                "resume_batch_job",
-                "generate_batch_summary",
-                "load_job",
-                "close_job",
-            ])
+            # Batch tools unlocked when queue component is present or active
+            if self.active_job.get("components", {}).get("batch_queue") or self.active_job.get("directories", {}).get("queue_file"):
+                req_tools.extend([
+                    "init_batch_job",
+                    "run_batch_job",
+                    "step_batch_job",
+                    "get_job_status",
+                    "pause_batch_job",
+                    "resume_batch_job",
+                    "generate_batch_summary",
+                ])
+
+            # Unlock declared skills for the primary job
+            declared_skills = self.active_job.get("skills")
+            if isinstance(declared_skills, list):
+                for s in declared_skills:
+                    s_name = s.get("name") if isinstance(s, dict) else str(s)
+                    if s_name:
+                        s_obj = self.skills.load_skill(s_name)
+                        if s_obj:
+                            for t in (s_obj.get("tools_required") or []):
+                                if t not in req_tools:
+                                    req_tools.append(t)
+            elif self.active_job.get("skill_name"):
+                s_obj = self.skills.load_skill(self.active_job["skill_name"])
+                if s_obj:
+                    for t in (s_obj.get("tools_required") or []):
+                        if t not in req_tools:
+                            req_tools.append(t)
 
         if self.active_skill:
             for t in (self.active_skill.get("tools_required") or []):
@@ -989,9 +1312,38 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                     if t not in req_tools:
                         req_tools.append(t)
 
-        if req_tools:
-            return ToolRegistry.get_scoped_tools(req_tools)
-        return ToolRegistry.get_base_tools()
+        # Inject MCP integration tools (PROJECT_JOBS.md Section 13.2)
+        extra_mcp_tools: List[Dict[str, Any]] = []
+        active_ints: List[str] = []
+        if self.active_job:
+            active_ints = self.mcp_config.resolve_job_integrations(self.active_job)
+        elif self.active_integration_focus:
+            active_ints = [self.active_integration_focus]
+
+        for int_name in active_ints:
+            rec = self.mcp_config.get_integration(int_name)
+            server_name = rec.server if rec else int_name
+            try:
+                schemas, _, has_many = self.mcp_client.get_scoped_tool_schemas(server_name)
+                if has_many:
+                    if "call_mcp_tool" not in req_tools:
+                        req_tools.append("call_mcp_tool")
+                else:
+                    for sc in schemas:
+                        extra_mcp_tools.append(sc)
+            except Exception as e:
+                logger.debug("Failed discovering MCP tools for integration '%s': %s", int_name, e)
+
+        base_or_scoped = ToolRegistry.get_scoped_tools(req_tools) if req_tools else ToolRegistry.get_base_tools()
+        if extra_mcp_tools:
+            seen_names = {t["function"]["name"] for t in base_or_scoped}
+            for sc in extra_mcp_tools:
+                s_name = sc["function"]["name"]
+                if s_name not in seen_names:
+                    base_or_scoped.append(sc)
+                    seen_names.add(s_name)
+
+        return base_or_scoped
 
     def _resolve_max_steps(self, max_steps: Optional[int]) -> int:
         """Use the caller's cap, otherwise agent.max_steps from config."""
@@ -1383,7 +1735,8 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                 self._emit("on_thought", response.thinking)
                 turn_thoughts.append(response.thinking)
 
-            # Record assistant response
+            # Record assistant response. Secret values are stripped before they enter history.
+            self._redact_secret_tool_args(response.tool_calls)
             assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content}
             if response.has_tool_calls:
                 assistant_msg["tool_calls"] = [
@@ -1431,6 +1784,7 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                                 or (retry_response.content and not retry_response.content.startswith("Error communicating with"))
                             ):
                                 response = retry_response
+                                self._redact_secret_tool_args(response.tool_calls)
                                 assistant_msg = {"role": "assistant", "content": response.content}
                                 if response.has_tool_calls:
                                     assistant_msg["tool_calls"] = [
@@ -1597,8 +1951,29 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             include_trace=True,
         )
 
+    def _redact_secret_tool_args(self, tool_calls: Optional[List[Any]]) -> None:
+        """Drop set_secret values before tool calls are logged, shown, or stored."""
+        for tc in tool_calls or []:
+            if getattr(tc, "name", "") != "set_secret":
+                continue
+            arguments = getattr(tc, "arguments", None)
+            if not isinstance(arguments, dict) or "values" not in arguments:
+                continue
+            raw_values = arguments.get("values")
+            secret_values: Dict[str, str] = {}
+            if isinstance(raw_values, dict):
+                secret_values = {
+                    str(key): "" if val is None else str(val)
+                    for key, val in raw_values.items()
+                }
+            tc.secret_values = secret_values
+            redacted = {key: val for key, val in arguments.items() if key != "values"}
+            redacted["keys"] = sorted(secret_values)
+            tc.arguments = redacted
+
     def _dispatch_tool(self, tool_call: ToolCall) -> tuple[Dict[str, Any], bool]:
         """Dispatch a single tool call to the action or perception engine."""
+        self._redact_secret_tool_args([tool_call])
         name = tool_call.name
         args = tool_call.arguments
         logger.info("Dispatching tool '%s' with args: %s", name, args)
@@ -2108,10 +2483,14 @@ ACTIVE JOB MODE: {job_name} ({job_id})
                 # Automatically enter Job Mode and activate assigned skill
                 manifest = self.jobs.load_manifest(str(queue.output_dir))
                 self.active_job = manifest or queue.to_manifest_dict()
+                self.active_integration_focus = None
+                self.jobs.focus_manager.set_primary(queue.job_id)
                 if queue.skill_name:
                     skill_res = self.skills.load_skill(queue.skill_name)
                     if skill_res:
                         self.active_skill = skill_res
+                self._persist_scope_on_conversation(self.active_conversation_id)
+                self._emit("on_job_focus")
                 return {
                     "success": True,
                     "job_id": queue.job_id,
@@ -2126,63 +2505,360 @@ ACTIVE JOB MODE: {job_name} ({job_id})
             except Exception as e:
                 return {"success": False, "error": str(e)}, False
 
-        if name == "load_job":
-            job_id = args.get("job_id") or args.get("job_path") or args.get("job_id_or_path", "")
-            if not job_id:
-                return {"success": False, "error": "job_id or job_path is required."}, False
-            allowed, reason = self.gatekeeper.evaluate("load_job", {"job_id": job_id})
+        # Project Jobs & Scoped Working Memory Subsystem (PROJECT_JOBS.md)
+        if name == "create_job":
+            project_name = args.get("name", "")
+            if not project_name:
+                return {"success": False, "error": "Job 'name' is required."}, False
+            summary = args.get("summary")
+            goal = args.get("goal")
+            this_is = args.get("this_is")
+            this_is_not = args.get("this_is_not")
+            skills = args.get("skills")
+            output_dir = args.get("output_dir")
+
+            allowed, reason = self.gatekeeper.evaluate(
+                "create_job", {"name": project_name, "output_dir": output_dir}
+            )
             if not allowed:
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
 
-            queue = self.jobs.load_job(job_id)
-            if not queue:
-                return {"success": False, "error": f"Could not find or load job '{job_id}'."}, False
+            try:
+                brief = self.jobs.create_project_job(
+                    name=project_name,
+                    summary=summary,
+                    goal=goal,
+                    this_is=this_is,
+                    this_is_not=this_is_not,
+                    skills=skills if isinstance(skills, list) else None,
+                    output_dir=output_dir,
+                )
+                self.active_job = brief.to_dict()
+                self.active_integration_focus = None
+                self.jobs.focus_manager.set_primary(brief.job_id)
 
-            manifest = self.jobs.load_manifest(job_id)
-            self.active_job = manifest or queue.to_manifest_dict()
+                activated_skill = None
+                if brief.skills:
+                    first_sk = brief.skills[0].name
+                    sk_res = self.skills.load_skill(first_sk)
+                    if sk_res:
+                        self.active_skill = sk_res
+                        activated_skill = first_sk
 
-            # Activate assigned skill if present (or inherited from group.yaml / manifest)
-            skill_name = queue.skill_name
-            if not skill_name and isinstance(manifest, dict):
-                skill_info = manifest.get("skill")
-                if isinstance(skill_info, dict):
-                    skill_name = skill_info.get("name")
-                elif isinstance(skill_info, str):
-                    skill_name = skill_info
-                elif manifest.get("skills") and isinstance(manifest["skills"], list):
-                    first_skill = manifest["skills"][0]
-                    skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
+                logger.info("Created and focused project job '%s' (%s)", brief.name, brief.job_id)
+                self._persist_scope_on_conversation(self.active_conversation_id)
+                self._emit("on_job_focus")
+                return {
+                    "success": True,
+                    "job_id": brief.job_id,
+                    "name": brief.name,
+                    "status": brief.status,
+                    "focus": "primary",
+                    "job_dir": brief.directories.job_dir,
+                    "notes_dir": brief.directories.notes_dir,
+                    "artifacts_dir": brief.directories.artifacts_dir,
+                    "manifest_file": brief.directories.manifest_file,
+                    "activated_skill": activated_skill,
+                    "message": f"Project job '{brief.name}' ({brief.job_id}) created and set as primary focus.",
+                }, False
+            except Exception as e:
+                logger.error("Failed to create project job: %s", e)
+                return {"success": False, "error": str(e)}, False
+
+        if name in ("focus_job", "load_job"):
+            job_target = args.get("job_id_or_path") or args.get("job_id") or args.get("job_path") or ""
+            if not job_target:
+                return {"success": False, "error": "job_id_or_path is required."}, False
+
+            allowed, reason = self.gatekeeper.evaluate("focus_job", {"job_id": job_target})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            manifest = self.jobs.load_manifest(job_target)
+            if not manifest:
+                queue = self.jobs.load_job(job_target)
+                if queue:
+                    manifest = queue.to_manifest_dict()
+                else:
+                    return {"success": False, "error": f"Could not find or load job '{job_target}'."}, False
+
+            self.active_job = manifest
+            self.active_integration_focus = None
+            job_id_val = str(manifest.get("job_id") or job_target)
+            self.jobs.focus_manager.set_primary(job_id_val)
+
+            # Activate declared skill if present
+            skill_name = manifest.get("skill_name")
+            if not skill_name and isinstance(manifest.get("skill"), dict):
+                skill_name = manifest["skill"].get("name")
+            elif manifest.get("skills") and isinstance(manifest["skills"], list):
+                first_skill = manifest["skills"][0]
+                skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
+
             if skill_name:
                 skill_res = self.skills.load_skill(skill_name)
                 if skill_res:
                     self.active_skill = skill_res
 
-            logger.info("Loaded job '%s' (%s) into Job Mode with skill '%s'", queue.job_name, queue.job_id, skill_name)
+            job_title = str(manifest.get("name") or manifest.get("job_name") or "job")
+            logger.info("Focused primary job '%s' (%s) with skill '%s'", job_title, job_id_val, skill_name)
+            self._persist_scope_on_conversation(self.active_conversation_id)
+            self._emit("on_job_focus")
             return {
                 "success": True,
                 "status": "activated",
-                "job_id": queue.job_id,
-                "job_name": queue.job_name,
+                "focus": "primary",
+                "job_id": job_id_val,
+                "name": job_title,
                 "assigned_skill": skill_name,
-                "total_items": queue.total_items,
-                "completed_items": queue.completed_items,
-                "pending_items": queue.pending_items,
-                "output_dir": queue.output_dir,
-                "message": f"Job '{queue.job_name}' loaded into Job Mode. Assigned skill '{skill_name}' activated.",
+                "job_dir": manifest.get("directories", {}).get("job_dir"),
+                "message": f"Primary focus switched to '{job_title}' ({job_id_val}).",
             }, False
 
+        if name == "list_jobs":
+            group = args.get("group")
+            include_archived = bool(args.get("include_archived", False))
+            allowed, reason = self.gatekeeper.evaluate("list_jobs", {"group": group})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            jobs_list = self.jobs.list_jobs(group=group, include_archived=include_archived)
+            primary_id = self.jobs.focus_manager.get_primary()
+            return {
+                "success": True,
+                "count": len(jobs_list),
+                "primary": primary_id,
+                "jobs": jobs_list,
+            }, False
+
+        if name == "update_job_brief":
+            target = args.get("job_id") or (self.active_job.get("job_id") if self.active_job else None)
+            if not target and self.active_job:
+                target = self.active_job.get("directories", {}).get("job_dir")
+            if not target:
+                return {"success": False, "error": "No target job specified and no active primary job is focused."}, False
+
+            allowed, reason = self.gatekeeper.evaluate("update_job_brief", {"job_id": target})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            res = self.jobs.update_brief(
+                job_id_or_path=target,
+                summary=args.get("summary"),
+                goal=args.get("goal"),
+                phase=args.get("phase"),
+                this_is=args.get("this_is"),
+                this_is_not=args.get("this_is_not"),
+                add_distinct_from=args.get("add_distinct_from"),
+                add_decision=args.get("add_decision"),
+                add_open_question=args.get("add_open_question"),
+                remove_open_question=args.get("remove_open_question"),
+                add_constraint=args.get("add_constraint"),
+                add_skill=args.get("add_skill"),
+                add_document=args.get("add_document"),
+            )
+            # If target is active job, reload active_job manifest in memory
+            if self.active_job:
+                curr_id = self.active_job.get("job_id")
+                curr_dir = self.active_job.get("directories", {}).get("job_dir")
+                if target in (curr_id, curr_dir):
+                    updated_manifest = self.jobs.load_manifest(target)
+                    if updated_manifest:
+                        self.active_job = updated_manifest
+            self._emit("on_job_focus")
+            return res, False
+
+        if name == "read_job_document":
+            doc_path = args.get("path", "")
+            heading = args.get("heading")
+            if not doc_path:
+                return {"success": False, "error": "Document 'path' is required."}, False
+
+            target = (self.active_job.get("job_id") or self.active_job.get("directories", {}).get("job_dir")) if self.active_job else None
+            if not target:
+                return {"success": False, "error": "No active primary job. Call focus_job or create_job before reading job documents."}, False
+
+            allowed, reason = self.gatekeeper.evaluate("read_job_document", {"path": doc_path})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            res = self.jobs.read_document(target, relative_path=doc_path, heading=heading)
+            return res, False
+
         if name == "close_job":
-            if not self.active_job:
-                return {"success": True, "message": "No job is currently active. Operating in base kernel mode."}, False
-            prev_job_name = self.active_job.get("name") or self.active_job.get("job_name", "job")
+            if not self.active_job and not self.active_integration_focus:
+                return {
+                    "success": True,
+                    "message": "No job or integration is currently focused. Operating in base desktop mode.",
+                }, False
+            prev_focus = (
+                (self.active_job.get("name") or self.active_job.get("job_name", "job"))
+                if self.active_job
+                else f"Integration ({self.active_integration_focus})"
+            )
             self.active_job = None
             self.active_skill = None
-            logger.info("Closed active job '%s'. Returned to base kernel mode.", prev_job_name)
+            self.active_integration_focus = None
+            self.jobs.focus_manager.clear_all()
+            logger.info("Closed focus on '%s'. Returned to base desktop mode.", prev_focus)
+            self._persist_scope_on_conversation(self.active_conversation_id)
+            self._emit("on_job_focus")
             return {
                 "success": True,
                 "status": "closed",
-                "previous_job": prev_job_name,
-                "message": f"Job '{prev_job_name}' closed. Returned to base kernel mode.",
+                "previous_focus": prev_focus,
+                "message": f"Focus on '{prev_focus}' closed. Returned to base desktop mode.",
+            }, False
+
+        if name == "list_integrations":
+            allowed, reason = self.gatekeeper.evaluate("list_integrations", {})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            items = self.mcp_config.list_integrations_summary()
+            return {"success": True, "integrations": items, "count": len(items)}, False
+
+        if name == "list_mcp_servers":
+            allowed, reason = self.gatekeeper.evaluate("list_mcp_servers", {})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            servers = self.mcp_config.list_servers_public()
+            return {"success": True, "servers": servers, "count": len(servers)}, False
+
+        if name == "add_mcp_server":
+            server_name = (args.get("name") or "").strip()
+            if not server_name:
+                return {"success": False, "error": "name is required."}, False
+            if args.get("env") or args.get("headers"):
+                return {
+                    "success": False,
+                    "error": "put tokens in set_secret and reference them with env_from or headers_from",
+                }, False
+            command = args.get("command") if "command" in args else None
+            argv = args.get("args") if isinstance(args.get("args"), list) else None
+            url = args.get("url") if "url" in args else None
+            try:
+                allow_key = self.mcp_config.launch_allowlist_key(server_name, command, argv, url)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}, False
+            allowed, reason = self.gatekeeper.evaluate(
+                "add_mcp_server",
+                {"command": allow_key, "name": server_name},
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            try:
+                entry = self.mcp_config.upsert_server(
+                    name=server_name,
+                    command=command,
+                    args=argv,
+                    url=url,
+                    cwd=args.get("cwd") if "cwd" in args else None,
+                    env_from=args.get("env_from") if "env_from" in args else None,
+                    headers_from=args.get("headers_from") if "headers_from" in args else None,
+                )
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}, False
+            try:
+                self.mcp_client.close_server(server_name)
+            except Exception as exc:
+                logger.debug("Could not reset MCP session '%s': %s", server_name, exc)
+            return {"success": True, "server": entry}, False
+
+        if name == "remove_mcp_server":
+            server_name = (args.get("name") or "").strip()
+            if not server_name:
+                return {"success": False, "error": "name is required."}, False
+            try:
+                allow_key = f"remove_mcp_server:{server_name}"
+            except Exception:
+                allow_key = "remove_mcp_server"
+            allowed, reason = self.gatekeeper.evaluate(
+                "remove_mcp_server",
+                {"command": allow_key, "name": server_name},
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            try:
+                removed = self.mcp_config.remove_server(server_name)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}, False
+            try:
+                self.mcp_client.close_server(server_name)
+            except Exception:
+                pass
+            if not removed:
+                return {"success": False, "error": f"No MCP server named '{server_name}'."}, False
+            return {"success": True, "name": server_name, "removed": True}, False
+
+        if name == "set_secret":
+            secret_name = (args.get("name") or "").strip()
+            if not secret_name:
+                return {"success": False, "error": "name is required."}, False
+            values = getattr(tool_call, "secret_values", None)
+            if not isinstance(values, dict):
+                raw_values = args.get("values") if isinstance(args.get("values"), dict) else {}
+                values = {str(k): "" if v is None else str(v) for k, v in raw_values.items()}
+            key_names = sorted(values)
+            allowed, reason = self.gatekeeper.evaluate(
+                "set_secret",
+                {"command": f"set_secret:{secret_name}", "name": secret_name, "keys": key_names},
+            )
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+            try:
+                saved_keys = self.mcp_config.secrets.set_values(secret_name, values)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}, False
+            for entry in self.mcp_config.list_servers_public():
+                refs = list(entry.get("env_from") or []) + list(entry.get("headers_from") or [])
+                if secret_name in refs or entry.get("name") == secret_name:
+                    try:
+                        self.mcp_client.close_server(str(entry.get("name")))
+                    except Exception:
+                        pass
+            return {"success": True, "name": secret_name, "keys": saved_keys}, False
+
+        if name == "focus_integration":
+            target_int = (args.get("name") or "").strip()
+            if not target_int:
+                return {"success": False, "error": "name is required."}, False
+
+            allowed, reason = self.gatekeeper.evaluate("focus_integration", {"name": target_int})
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            # Clear primary job; set standalone integration focus (PROJECT_JOBS.md Section 13.2)
+            self.active_job = None
+            self.active_skill = None
+            self.active_integration_focus = target_int
+            if hasattr(self, "jobs") and self.jobs:
+                self.jobs.focus_manager.set_integration_focus(target_int)
+
+            rec = self.mcp_config.get_integration(target_int)
+            server_name = rec.server if rec else target_int
+            tool_list: List[Dict[str, Any]] = []
+            try:
+                tool_list = self.mcp_client.list_tools(server_name)
+            except Exception as e:
+                logger.debug("Failed querying tools for focused integration '%s': %s", target_int, e)
+
+            logger.info(
+                "Focused standalone integration '%s' (server: '%s', tools: %d)",
+                target_int,
+                server_name,
+                len(tool_list),
+            )
+            self._persist_scope_on_conversation(self.active_conversation_id)
+            self._emit("on_job_focus")
+            return {
+                "success": True,
+                "status": "activated",
+                "focus": "integration",
+                "name": target_int,
+                "server": server_name,
+                "tools_count": len(tool_list),
+                "description": rec.description if rec else "",
+                "message": f"Integration focus switched to '{target_int}' ({len(tool_list)} tools available).",
             }, False
 
         if name == "run_batch_job":
@@ -2319,6 +2995,61 @@ ACTIVE JOB MODE: {job_name} ({job_id})
         if name == "hotkey":
             keys = args.get("keys", [])
             res = self.inputs.hotkey(*keys)
+            return res, False
+
+        # --- Model Context Protocol (MCP) Dynamic Tool Dispatch (PROJECT_JOBS.md Section 13) ---
+        if name.startswith("mcp__"):
+            parts = name.split("__", 2)
+            if len(parts) < 3:
+                return {"success": False, "error": f"Invalid MCP tool name: '{name}'"}, False
+            server_name = parts[1]
+            remote_tool = parts[2]
+
+            annot = self.mcp_client.get_tool_annotation(server_name, remote_tool)
+            gate_details = {
+                "server": server_name,
+                "tool": remote_tool,
+                "mcp_target": name,
+                "annotations": annot,
+                "arguments": args,
+            }
+            allowed, reason = self.gatekeeper.evaluate(name, gate_details)
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            # Tag current task scope integration for episodic memory (PROJECT_JOBS.md Section 13.4)
+            if self.current_task_scope:
+                self.current_task_scope.integration = server_name
+
+            res = self.mcp_client.call_tool(server_name, remote_tool, args)
+            return res, False
+
+        if name == "call_mcp_tool":
+            server_name = (args.get("server") or "").strip()
+            remote_tool = (args.get("tool") or "").strip()
+            tool_args = args.get("arguments") or {}
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+            if not server_name or not remote_tool:
+                return {"success": False, "error": "server and tool are required."}, False
+
+            annot = self.mcp_client.get_tool_annotation(server_name, remote_tool)
+            gate_details = {
+                "server": server_name,
+                "tool": remote_tool,
+                "mcp_target": f"mcp__{server_name}__{remote_tool}",
+                "annotations": annot,
+                "arguments": tool_args,
+            }
+            allowed, reason = self.gatekeeper.evaluate("call_mcp_tool", gate_details)
+            if not allowed:
+                return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
+
+            # Tag current task scope integration for episodic memory (PROJECT_JOBS.md Section 13.4)
+            if self.current_task_scope:
+                self.current_task_scope.integration = server_name
+
+            res = self.mcp_client.call_tool(server_name, remote_tool, tool_args)
             return res, False
 
         return {"error": f"Unknown tool name '{name}'"}, False

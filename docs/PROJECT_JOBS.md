@@ -288,7 +288,7 @@ The default is one job. Several running queues are a real case (a long invention
 
 ### 7.3. Where focus is stored
 
-Focus is agent-wide, so the pill and the web app agree. It is stored beside the jobs, in a small pointer file such as `~/EidosWorkspace/jobs/focus.yaml`:
+The live pointer is shared by the pill and the web app, so both show the open conversation's scope. It is stored beside the jobs, in a small pointer file such as `~/EidosWorkspace/jobs/focus.yaml`:
 
 ```yaml
 primary: job_20261010_083000_a1b2
@@ -296,7 +296,7 @@ attached:
   - job_20261009_120000_cc11
 ```
 
-Conversation history does not own focus. Switching chats does not switch jobs. The agent can still notice that the conversation and the primary job are about different work, and offer to switch.
+The open conversation owns focus. `focus.yaml` mirrors that conversation so the pill and the web app match the chat that is open. Starting a new chat clears the job and any standalone integration, and the new conversation stays unscoped until the user makes it about a project. The previous conversation keeps the scope it had; switching back restores that scope. If the user then asks to continue a job, the agent calls `focus_job` or `create_job` for this conversation only. A running background worker can stay visible, but its brief is not loaded unless this conversation is focused on that job.
 
 ---
 
@@ -313,9 +313,9 @@ Base tools gain project focus, separate from the batch-runner skill:
 
 **Old system.** The base job tools are `create_job`, `focus_job`, `list_jobs`, `update_job_brief`, `close_job`, and `read_job_document`.
 
-**Updated job concept.** Add `list_integrations` and `focus_integration` to that base set. `list_integrations` returns the configured integrations (name, server, one-line use). `focus_integration` makes one integration the focus when no project job should open. `update_job_brief` is how a project job gains or drops an `integrations:` entry. The model cannot add an MCP server, change a server command, or read stored tokens.
+**Updated job concept.** Add `list_integrations` and `focus_integration` to that base set. `list_integrations` returns the configured integrations (name, server, one-line use). `focus_integration` makes one integration the focus when no project job should open. `update_job_brief` is how a project job gains or drops an `integrations:` entry. `list_mcp_servers`, `add_mcp_server`, and `remove_mcp_server` edit the server catalog. `set_secret` stores tokens. The model cannot read a secret back.
 
-**Updated job concept (groups).** `list_jobs` accepts a group name and returns the leaf jobs under that folder. `create_job` accepts the group and any navigation path inside it (`Gmail`, `Clients/acme`). The new directory is created under that group. The model still cannot edit `mcp.json` or retarget `group.yaml` at a server that is not already configured.
+**Updated job concept (groups).** `list_jobs` accepts a group name and returns the leaf jobs under that folder. `create_job` accepts the group and any navigation path inside it (`Gmail`, `Clients/acme`). The new directory is created under that group. Eidos may add a server to the catalog first. `group.yaml` still cannot name a server that is not already in `~/.eidos/mcp.json`.
 
 `init_batch_job`, `run_batch_job`, `step_batch_job`, `pause_batch_job`, `resume_batch_job`, and `generate_batch_summary` stay on the `batch-runner` skill. A job lists that skill when it has a queue.
 
@@ -494,7 +494,7 @@ Work in this order. Each phase is usable before the later ones.
 
 **Old system.** The list above is everything this document leaves for later.
 
-**Updated job concept.** Building Gmail, Calendar, or Schwab clients inside `eidos/integrations/` is also out of scope. Those apps stay outside this repo and expose an MCP server. The EidosBot work is the client, the integration record, and the memory tags in section 13. OptimalX stays the existing in-repo bridge.
+**Updated job concept.** Building clients for local apps or for Gmail, Calendar, or Schwab inside `eidos/integrations/` is also out of scope. Those apps stay outside this repo. A local app exposes an MCP server on this PC. A cloud app exposes a URL. The EidosBot work is the client, the integration record, and the memory tags in section 13. OptimalX stays the existing in-repo bridge.
 
 ---
 
@@ -502,10 +502,12 @@ Work in this order. Each phase is usable before the later ones.
 
 An integration is the connection to one outside app. A job is the project that uses it.
 
+The usual MCP server is local. It is a program on this PC that exposes tools Eidos can call. Eidos either starts that program from a command in the catalog, or connects to it at `127.0.0.1` while the app is already open. A VS Code bridge is this case: VS Code stays open on the project, the bridge serves diagnostics, tests, diffs, git, and the debugger, and Eidos calls those tools. A cloud server is the other case. The app stays on someone else's machines, and the catalog holds a remote URL. Gmail is that case. Same client either way. Most of the apps this user attaches run on this PC.
+
 | | Project job | Integration |
 | :--- | :--- | :--- |
 | Question it answers | What this project is | How to operate this app |
-| Example | The lease, the coil lantern, the IRA | Gmail, Calendar, Schwab, OptimalX |
+| Example | The lease, the coil lantern, the IRA | A local VS Code bridge, a local notes app, OptimalX. Gmail when the app is not on this PC |
 | Prompt contents while focused | Full brief | Skill body and that server's tools |
 | Files | `~/EidosWorkspace/jobs/<project>/` | None. Attachments are saved into the project job |
 | Memory tag | `job_id` | `integration` on the same episode |
@@ -539,9 +541,18 @@ integrations:
 
 **Updated job concept (groups).** A job under `jobs/Gmail/` inherits that binding from `group.yaml`. The brief lists an integration only when the job needs an extra one. A lantern firmware job stays under `jobs/Coding/` and adds Gmail on its own brief when it sends mail. It does not move under `jobs/Gmail/`.
 
-`~/.eidos/mcp.json` is the server list. The model cannot edit it. A remote server is a URL. A local server is a command, args, and env. Tokens stay in that env or in a secret file. They are not copied into `integration.yaml`, `job.yaml`, the prompt, or `documents`.
+`~/.eidos/mcp.json` is the server catalog. Eidos creates and edits it with `add_mcp_server` and `remove_mcp_server`. A local program Eidos should start is `command` and `args`. A local app that is already running, such as a VS Code extension bridge, is a `url` on `127.0.0.1`. A cloud app is a `url` on someone else's host. Tokens are not stored in that file. `set_secret` writes them to `~/.eidos/secrets/<name>.env` (mode `0600`). The catalog points at that file with `env_from` for the process environment or `headers_from` for HTTP headers. The client reads the secret file only when it starts or connects to the server. The value is not copied into `integration.yaml`, `job.yaml`, the prompt, tool results, the audit log, or episodic memory. `list_mcp_servers` returns the catalog with secret values removed. There is no tool that reads a secret back. A sandboxed shell still cannot write `~/.eidos/`.
 
-Gmail's server is Google's, at `https://gmailmcp.googleapis.com/mcp/v1`, over streamable HTTP, with Google OAuth. Calendar is a different server and a different integration. Schwab has no server to point at. A Schwab integration exists only after an API bridge or an MCP server is written in front of Schwab's API, outside this repo, the same way OptimalX was bridged inside the repo because OptimalX ships no MCP server.
+```json
+{
+  "mcpServers": {
+    "vscode": { "url": "http://127.0.0.1:47391/mcp" },
+    "notes": { "command": "notes-mcp", "args": [] }
+  }
+}
+```
+
+A cloud server is the exception, used when the app has no process on this PC. Gmail's server is Google's, at `https://gmailmcp.googleapis.com/mcp/v1`, over streamable HTTP, with Google OAuth. Calendar is a different server and a different integration. Schwab has no server to point at. A Schwab integration exists only after a local bridge, or an MCP server, is written in front of Schwab's API, outside this repo. OptimalX stays an in-repo bridge until it ships a server of its own. A local IDE bridge is a catalog entry. It is not a second editor, and it is not a client added under `eidos/integrations/`.
 
 Project files stay in the leaf job directory. For a Gmail client that is:
 
@@ -579,7 +590,7 @@ Every MCP call goes through the existing gatekeeper.
 | `destructiveHint` | Level 3, hard confirm |
 | anything else | Level 2, prompt, allowlist by server plus tool name |
 
-The server entry in `mcp.json` is trusted, because the user wrote it. The arguments the model fills in are checked like any other action. Calls are audited with the tool name and arguments.
+Adding or changing a server command or URL is Level 2, allowlisted by that command or URL. `set_secret` is Level 2, allowlisted by secret name. The secret values are not logged. Inline `env` and `headers` values are rejected on save. Calls are audited with the tool name and arguments, and secret values are omitted from that record.
 
 ### 13.4. Memory tags
 
@@ -594,7 +605,7 @@ Vector recall prefers the active `job_id` and does not replace a miss with anoth
 
 **Old system.** An outside app is a Python bridge and a list of tool schemas inside this repo. OptimalX is that pattern: `eidos/integrations/optimalx.py` plus the `optimalx` skill.
 
-**Updated job concept.** OptimalX keeps that bridge until it has an MCP server. The next app is its own process, with its own MCP server. EidosBot adds the client, the integration record, the skill, and the `job_id` / `integration` tags. It does not gain a Gmail client, a Calendar client, or a Schwab client in `eidos/integrations/`.
+**Updated job concept.** OptimalX keeps that bridge until it has an MCP server. The next app is a process on this PC, with its own MCP server. Eidos starts it, or connects to it on localhost, and calls its tools. EidosBot adds the catalog entry, the integration record, the skill, and the `job_id` / `integration` tags. It does not gain a VS Code client, a Gmail client, a Calendar client, or a Schwab client in `eidos/integrations/`. A cloud URL is the same attachment when that app does not run here.
 
 ---
 
@@ -648,6 +659,6 @@ Rules:
 - Inheritance walks upward from the job to the nearest `group.yaml`. The job receives that skill and that integration at focus time. The leaf file does not copy them.
 - `skills:` and `integrations:` on the leaf add extras. A client who also uses Calendar lists `calendar`. A coding project that sometimes sends mail stays under `jobs/Coding/` and lists `gmail`. It does not move under `jobs/Gmail/`.
 - A second mail server is a second group. Its clients never appear in the Gmail list.
-- `list_jobs(group)` returns leaf jobs under that group. `create_job` takes the group and the path inside it. Changing `group.yaml` changes what every child inherits. The model cannot point `group.yaml` at a server that is not already in `~/.eidos/mcp.json`.
+- `list_jobs(group)` returns leaf jobs under that group. `create_job` takes the group and the path inside it. Changing `group.yaml` changes what every child inherits. Eidos adds a server with `add_mcp_server` before a group or a brief names it. `group.yaml` cannot point at a server that is not already in `~/.eidos/mcp.json`.
 - `focus_integration` is still how the inbox is checked when no client job should open. The group folder is not that focus, and it does not load every client brief.
 - The pill shows the leaf and the group: `Job · Acme · Gmail`. Episodes store the leaf `job_id` and the integration that was actually used, inherited or added.

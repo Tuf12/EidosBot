@@ -5,7 +5,7 @@ This document defines the architectural design, dynamic capability scoping, gene
 
 **Old system.** In this document, a job is the batch queue (`queue.json`), and every specialized tool, including OptimalX, is a skill packaged inside EidosBot.
 
-**Updated job concept.** A job is the project specified in [PROJECT_JOBS.md](PROJECT_JOBS.md): the brief, the `notes/` and `artifacts/` files (images, text, PDFs, spreadsheets, generated reports), and the focus that survives the turn. The batch queue is a component that project can attach. An outside app is an integration attached to that same job. The skill still says how to do the procedure. Tools for a new outside app come from that app's MCP server, and only while the integration is attached. OptimalX stays a built-in skill because OptimalX does not ship an MCP server.
+**Updated job concept.** A job is the project specified in [PROJECT_JOBS.md](PROJECT_JOBS.md): the brief, the `notes/` and `artifacts/` files (images, text, PDFs, spreadsheets, generated reports), and the focus that survives the turn. The batch queue is a component that project can attach. An outside app is an integration attached to that same job. The skill still says how to do the procedure. Tools for a new app come from that app's MCP server, usually a process on this PC, and only while the integration is attached. OptimalX stays a built-in skill because OptimalX does not ship an MCP server.
 
 **Updated job concept (groups).** Related jobs live under a group folder such as `~/EidosWorkspace/jobs/Gmail/Clients/acme/` or `~/EidosWorkspace/jobs/Coding/notes-app/`. `group.yaml` in the group folder binds the skill and the MCP server. Child jobs inherit that binding. The skill does not list those directories. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
 
@@ -28,7 +28,7 @@ This document defines the architectural design, dynamic capability scoping, gene
 
 **Old system (mandate 2, last two bullets).** Every specialized capability is a skill whose tool schemas live in `ToolRegistry`, unlocked by `load_skill`.
 
-**Updated job concept.** In-repo capabilities stay skills: desktop GUI, browser, web research, batch runner, user memory, skill authoring. An outside app's tools are not added to `SPECIALIZED_TOOLS`. They are discovered from that app's MCP server when the project job attaches the integration, or when that integration is the focus and no project job is open. The integration's `SKILL.md` is still the procedure. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
+**Updated job concept.** In-repo capabilities stay skills: desktop GUI, browser, web research, batch runner, user memory, skill authoring. An outside app's tools are not added to `SPECIALIZED_TOOLS`. They are discovered from that app's MCP server, usually a process on this PC, when the project job attaches the integration, or when that integration is the focus and no project job is open. The integration's `SKILL.md` is still the procedure. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
 ---
 
@@ -205,7 +205,7 @@ All specialized tools are mapped to dedicated skills and are only available when
 
 **Old system.** OptimalX is a built-in skill whose tools are hand-written in this repo and unlocked by `load_skill`.
 
-**Updated job concept.** That skill stays, because OptimalX does not provide an MCP server. A project job lists it as an integration. New apps are not added as further built-in skills with schemas in `ToolRegistry`. They are external MCP servers, attached the way section 13 of [PROJECT_JOBS.md](PROJECT_JOBS.md) attaches Gmail.
+**Updated job concept.** That skill stays, because OptimalX does not provide an MCP server. A project job lists it as an integration. New apps are not added as further built-in skills with schemas in `ToolRegistry`. They are MCP servers on this PC, attached the way section 13 of [PROJECT_JOBS.md](PROJECT_JOBS.md) attaches a local IDE bridge. A cloud server uses that same attachment when the app is not installed here.
 
 #### 4. `batch-runner`
 - **Purpose:** Large-scale repetitive workflows (10 to 1,000+ items) using state-machine queues.

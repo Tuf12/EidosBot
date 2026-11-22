@@ -155,6 +155,330 @@ class ToolRegistry:
                 },
             },
         },
+        # --- Project Jobs & Scoped Working Memory Base Tools (PROJECT_JOBS.md) ---
+        {
+            "type": "function",
+            "function": {
+                "name": "create_job",
+                "description": (
+                    "Create a dedicated project job workspace (job.yaml, notes/, artifacts/, and notes/INDEX.md) "
+                    "and switch primary focus to it. Call this when starting or organizing an ongoing multi-turn project "
+                    "(e.g. business plan, resume, application, invention, app design) so working notes and documents remain scoped."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Human-readable project name (e.g. 'Tile Supply Store Business Plan', 'Jesse Marohn Resume 2026').",
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "One-line executive summary of what this project is.",
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "Immediate goal or deliverable for this project.",
+                        },
+                        "this_is": {
+                            "type": "string",
+                            "description": "Clear statement of what this project is.",
+                        },
+                        "this_is_not": {
+                            "type": "string",
+                            "description": "Clear statement of what this project is NOT.",
+                        },
+                        "skills": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of skills attached to this project (e.g. ['web-research']).",
+                        },
+                        "output_dir": {
+                            "type": "string",
+                            "description": "Optional custom directory path. If omitted, creates under ~/EidosWorkspace/jobs/<slug>.",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "focus_job",
+                "description": (
+                    "Switch primary working focus to an existing project job by ID, name, or directory path. "
+                    "Loads its brief into context, activates its declared skills, and sets the memory boundary."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id_or_path": {
+                            "type": "string",
+                            "description": "Job ID, folder name, or directory path of the job to focus.",
+                        },
+                    },
+                    "required": ["job_id_or_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_jobs",
+                "description": (
+                    "List all discovered project jobs and batch queues, their statuses, directories, and whether they are currently primary or running."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "group": {
+                            "type": "string",
+                            "description": "Optional subfolder group name to filter by (e.g. 'Teaching', 'Inventions').",
+                        },
+                        "include_archived": {
+                            "type": "boolean",
+                            "description": "Whether to include archived jobs (default: false).",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "update_job_brief",
+                "description": (
+                    "Update or append fields on the active project job brief (job.yaml). "
+                    "Use this to record new decisions, update goals, add boundary anchors, or register new depth documents in notes/."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "Target job ID. Defaults to the currently focused primary job.",
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Updated summary of the project.",
+                        },
+                        "goal": {
+                            "type": "string",
+                            "description": "Updated immediate goal.",
+                        },
+                        "phase": {
+                            "type": "string",
+                            "description": "Updated phase (e.g. 'concept', 'design', 'review', 'complete').",
+                        },
+                        "this_is": {
+                            "type": "string",
+                            "description": "Updated statement of what this project is.",
+                        },
+                        "this_is_not": {
+                            "type": "string",
+                            "description": "Updated statement of what this project is NOT.",
+                        },
+                        "add_distinct_from": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Existing alternative or prior art."},
+                                "difference": {"type": "string", "description": "How this project differs."},
+                            },
+                            "required": ["name", "difference"],
+                            "description": "Anti-collapse anchor distinguishing this project from existing things.",
+                        },
+                        "add_decision": {
+                            "type": "string",
+                            "description": "New key decision to append to the brief.",
+                        },
+                        "add_open_question": {
+                            "type": "string",
+                            "description": "Open question to track.",
+                        },
+                        "remove_open_question": {
+                            "type": "string",
+                            "description": "Open question that has been resolved.",
+                        },
+                        "add_constraint": {
+                            "type": "string",
+                            "description": "Constraint to enforce on the design.",
+                        },
+                        "add_skill": {
+                            "type": "string",
+                            "description": "Skill name to attach to this project.",
+                        },
+                        "add_document": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Relative path to file (e.g. 'notes/concept.md')."},
+                                "role": {"type": "string", "description": "Document role (e.g. 'concept', 'financials', 'spec')."},
+                                "summary": {"type": "string", "description": "One-line summary of document contents."},
+                                "read_when": {"type": "string", "description": "Trigger when this document should be read."},
+                            },
+                            "required": ["path"],
+                            "description": "Register a markdown depth document into the brief and notes/INDEX.md.",
+                        },
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_job_document",
+                "description": (
+                    "Read a depth document or specific heading from inside the active project job directory (e.g. 'notes/concept.md', 'notes/INDEX.md'). "
+                    "Only read depth documents when the current task step requires that specific document."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path relative to the job directory (e.g. 'notes/concept.md', 'notes/INDEX.md', 'notes/decisions.md').",
+                        },
+                        "heading": {
+                            "type": "string",
+                            "description": "Optional markdown heading (e.g. '## Market Research') to extract only that section.",
+                        },
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "close_job",
+                "description": "Clear primary focus and exit Job Mode, returning EidosBot to base desktop kernel mode.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_integrations",
+                "description": (
+                    "List configured outside app integrations (~/.eidos/integrations/) that can be attached "
+                    "to project jobs or focused directly (e.g. Gmail, Calendar, local tools)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "focus_integration",
+                "description": (
+                    "Focus an outside app integration directly when no project job is open (e.g. 'check my inbox' for Gmail). "
+                    "Loads that integration's skill and outside MCP server tools without creating or opening a project job."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the integration to focus (e.g. 'gmail').",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_mcp_servers",
+                "description": (
+                    "List MCP servers in ~/.eidos/mcp.json. Secret values are omitted. "
+                    "Use env_from or headers_from names to see which secret files a server uses."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_mcp_server",
+                "description": (
+                    "Create or update one MCP server in the catalog. The usual server is a program on this PC. "
+                    "Pass command and args when Eidos should start it. Pass a 127.0.0.1 url when the app is already open, "
+                    "such as a VS Code bridge. Pass a public url only when the app is not installed here. "
+                    "Do not put tokens in this call. Store them with set_secret, then set env_from "
+                    "(process environment) or headers_from (HTTP headers) to that secret name."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Server name, such as 'vscode' or 'notes'."},
+                        "command": {"type": "string", "description": "Executable for a local server Eidos starts."},
+                        "args": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Arguments for the local command.",
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "http://127.0.0.1:... when the app is already open on this PC, or a public URL when the app is not installed here.",
+                        },
+                        "cwd": {"type": "string", "description": "Working directory for a local server."},
+                        "env_from": {
+                            "type": "string",
+                            "description": "Secret name whose file is loaded into the process environment.",
+                        },
+                        "headers_from": {
+                            "type": "string",
+                            "description": "Secret name whose keys are sent as HTTP headers.",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "remove_mcp_server",
+                "description": "Remove an MCP server from the catalog. The secret file is left on disk.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Server name to remove."},
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "set_secret",
+                "description": (
+                    "Store tokens for an MCP server in ~/.eidos/secrets/<name>.env. "
+                    "The values are written to disk and are not returned, logged, or saved in memory. "
+                    "An empty string removes that key. Reference the name from add_mcp_server via env_from or headers_from."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Secret name, such as 'vscode'."},
+                        "values": {
+                            "type": "object",
+                            "description": "Keys and secret values. Values are not echoed back.",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                    "required": ["name", "values"],
+                },
+            },
+        },
     ]
 
     SPECIALIZED_TOOLS: Dict[str, Dict[str, Any]] = {
@@ -1024,6 +1348,34 @@ class ToolRegistry:
                         },
                     },
                     "required": ["name", "content"],
+                },
+            },
+        },
+        "call_mcp_tool": {
+            "type": "function",
+            "function": {
+                "name": "call_mcp_tool",
+                "description": (
+                    "Call an external tool from an attached MCP server when the server publishes more than 20 tools. "
+                    "Refer to the tool catalog in your system prompt for available tool names and parameter descriptions."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "server": {
+                            "type": "string",
+                            "description": "The MCP server name (e.g. 'gmail').",
+                        },
+                        "tool": {
+                            "type": "string",
+                            "description": "The tool name on that MCP server.",
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "description": "JSON object of arguments for the tool.",
+                        },
+                    },
+                    "required": ["server", "tool"],
                 },
             },
         },

@@ -107,7 +107,7 @@ To eliminate "prompt fatigue" from endless allowlist confirmation popups while m
 
 **Old system.** The writable example is the workspace or a batch-job folder.
 
-**Updated job concept.** The writable project directory is `~/EidosWorkspace/jobs/<project>/`, including `notes/` and `artifacts/`. Integration records and tokens under `~/.eidos/` stay outside that mount. The model does not get a writable path to `mcp.json`.
+**Updated job concept.** The writable project directory is `~/EidosWorkspace/jobs/<project>/`, including `notes/` and `artifacts/`. A sandboxed shell still has no writable path to `~/.eidos/`. Eidos edits the server catalog through `add_mcp_server`. Token files under `~/.eidos/secrets/` stay unreadable by the model.
 
 **Updated job concept (groups).** The writable tree includes group folders such as `~/EidosWorkspace/jobs/Gmail/` and `~/EidosWorkspace/jobs/Coding/`. `group.yaml` may name a skill and an integration that already exist. It cannot retarget a server.
 - **Elimination of Allowlist Fatigue:** Shell commands executed inside the sandbox are **auto-allowed** without interrupting the user, because even a rogue `rm -rf /` or recursive deletion physically fails at the kernel VFS layer with `Read-only file system`.
@@ -349,7 +349,7 @@ For full design specifications, see [OPTIMALX_INTEGRATION.md](OPTIMALX_INTEGRATI
 
 **Old system.** OptimalX is a first-party bridge compiled into EidosBot, with its own tool schemas.
 
-**Updated job concept.** This section stays the spec for that bridge, because OptimalX does not ship an MCP server. A project job lists OptimalX as an integration. New apps are separate processes with MCP servers, attached the same way, and are not added as further sections of in-repo tool schemas. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
+**Updated job concept.** This section stays the spec for that bridge, because OptimalX does not ship an MCP server. A project job lists OptimalX as an integration. New apps are processes on this PC with MCP servers, attached the same way. A localhost URL counts as local when the app is already open. A cloud URL is the same attachment when the app is not on this PC. They are not added as further sections of in-repo tool schemas. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
 ### 11.1. Synchronized Single Source of Truth
 - **Universal Mobile & Desktop Sync:** Notes created on the go in OptimalX Mobile sync over Tailscale WireGuard to OptimalX Desktop.

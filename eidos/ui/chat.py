@@ -148,39 +148,116 @@ def _resolve_local_file_path(target: str, workspace_dir: Optional[str] = None) -
             if cand_sub.exists():
                 return str(cand_sub.resolve())
 
-        # Recursive search in workspace by relative path suffix or filename
+        # Recursive search in workspace by relative path suffix, then filename.
+        # When several copies exist, open the one written most recently.
         if file_name:
+            suffix_hits: List[Path] = []
+            name_hits: List[Path] = []
             try:
                 for match in ws_p.rglob(file_name):
-                    if str(match).endswith(clean_sub) and match.is_file():
-                        return str(match.resolve())
+                    if not match.is_file():
+                        continue
+                    if str(match).endswith(clean_sub):
+                        suffix_hits.append(match)
+                    else:
+                        name_hits.append(match)
             except Exception:
                 pass
-
-            try:
-                for match in ws_p.rglob(file_name):
-                    if match.is_file():
-                        return str(match.resolve())
-            except Exception:
-                pass
+            best = _newest_file(suffix_hits) or _newest_file(name_hits)
+            if best:
+                return best
 
     return None
 
 
-# Autolink http(s), file://, absolute paths, and portfolio markdown refs.
+def _newest_file(paths: List[Path]) -> Optional[str]:
+    """Return the most recently modified file, if any still exist."""
+    newest: Optional[Path] = None
+    newest_mtime = -1.0
+    for path in paths:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= newest_mtime:
+            newest = path
+            newest_mtime = mtime
+    if newest is None:
+        return None
+    try:
+        return str(newest.resolve())
+    except OSError:
+        return str(newest)
+
+
+# Extensions Eidos commonly hands back in chat (notes, renders, source).
+_FILE_EXTS = (
+    r"(?i:png|jpe?g|gif|webp|bmp|svg|ico|mp4|mkv|mov|webm|avi|wav|mp3|flac|ogg|"
+    r"pdf|md|markdown|txt|rst|csv|json|yaml|yml|toml|log|py|pyw|js|ts|tsx|jsx|"
+    r"html|css|sh|blend|glb|gltf|scad|zip|gz|tar|docx|xlsx|pptx|odt|ods|stl|obj|fbx)"
+)
+
+# Autolink http(s), file://, home paths, ~/paths, workspace-relative files,
+# and bare filenames such as cockpit_demo.mp4.
 # Backslash is excluded so JSON tool dumps (path.md\n# Heading) do not
 # swallow the escaped newline into the href.
 _CHAT_AUTOLINK_RE = re.compile(
-    r'(?<![\w\'"])('
-    r'(?:https?://|file://)[^\s<"\'\)\\]+?'
-    r'|/(?:home|tmp|usr|opt|var)/[^\s<"\'\)\\]+?\.[A-Za-z0-9]+'
-    r'|portfolios/[A-Za-z0-9_\-]+\.md'
+    r'(?<![\w/])('
+    r'(?:https?://|file://)[^\s<"\'\)\\>]+?'
+    r'|~/(?:[^\s<"\'\)\\>])+?'
+    r'|/(?:home|tmp|usr|opt|var|mnt|media|run)(?:/[^\s<"\'\)\\>]+?)+/?'
+    r'|(?:jobs|notes|documents|artifacts|downloads|inbox|projects|portfolios|skills)/(?:[\w.-]+/)*[\w.-]*[A-Za-z0-9]/?'
+    r'|(?:[\w.-]+/)+[\w.-]+\.' + _FILE_EXTS +
+    r'|[A-Za-z0-9][\w.-]*\.' + _FILE_EXTS +
     r')([\.,;]?(?=\s|$|<|\'|"|\\))'
 )
 
 _INLINE_LINK_RE = re.compile(
-    r'^(?:https?://\S+|file://\S+|www\.\S+|/(?:home|tmp|usr|opt|var)/\S+|~/\S+|portfolios/[A-Za-z0-9_\-]+\.md)$'
+    r'^(?:https?://\S+|file://\S+|www\.\S+|/(?:home|tmp|usr|opt|var|mnt|media|run)/\S+|~/\S+|'
+    r'(?:jobs|notes|documents|artifacts|downloads|inbox|projects|portfolios|skills)/\S+)$'
 )
+
+_BARE_FILE_RE = re.compile(
+    rf"^[A-Za-z0-9][\w.\-()]*(\s+[\w.\-()]+)*\.{_FILE_EXTS}$"
+)
+
+_REL_FILE_RE = re.compile(
+    rf"^(?:[\w.-]+/)+[\w.-]+\.{_FILE_EXTS}$"
+)
+
+
+def _line_is_file_ref(line: str) -> bool:
+    """True when a whole line or inline-code span is a file or directory path."""
+    text = (line or "").strip().strip("'\"")
+    if not text or len(text) > 500:
+        return False
+    if any(tok in text for tok in ("|", ";", "`", "*", "=", "&&", " -", "\t")):
+        return False
+    if text.startswith("~/") and len(text) > 2:
+        return True
+    if text.startswith("/") and not text.startswith("//") and len(text) > 1:
+        return True
+    if _INLINE_LINK_RE.match(text) or _REL_FILE_RE.match(text) or _BARE_FILE_RE.match(text):
+        return True
+    return False
+
+
+def _is_path_list(code: str) -> bool:
+    """True when a fenced block is only file paths, not a script or command."""
+    lines = [ln.strip() for ln in (code or "").splitlines() if ln.strip()]
+    if not lines or len(lines) > 40:
+        return False
+    return all(_line_is_file_ref(ln) for ln in lines)
+
+
+def _inline_target_is_link(target: str) -> bool:
+    """True when backtick text should open as a file or URL."""
+    text = (target or "").strip().strip("'\"")
+    if not text or len(text) > 500:
+        return False
+    if _INLINE_LINK_RE.match(text):
+        return True
+    return _line_is_file_ref(text)
 
 
 def _clean_chat_link_target(url: str) -> str:
@@ -203,6 +280,10 @@ def linkify_escaped_text(text: str, color: str = "#8be9fd") -> str:
     def repl(match: re.Match) -> str:
         url = match.group(1)
         trailing = match.group(2) or ""
+        # A path token can absorb a sentence period. Keep that period outside the href.
+        if url.endswith(".") and not url.endswith("/."):
+            url = url[:-1]
+            trailing = "." + trailing
         return (
             f"<a href='{url}' style='color: {color}; text-decoration: underline;'>"
             f"{url}</a>{trailing}"
@@ -219,7 +300,7 @@ def open_chat_link(url: str, workspace_dir: Optional[str] = None) -> bool:
     - Local file paths (absolute /home/..., relative portfolios/item_114.md, ~)
     - File URLs (file://...)
     """
-    clean = _clean_chat_link_target(url)
+    clean = _clean_chat_link_target(urllib.parse.unquote(url or ""))
     if not clean:
         return False
 
@@ -272,6 +353,8 @@ def markdown_to_chat_html(text: str) -> str:
     def replace_code_block(match):
         lang = (match.group(1) or "").strip()
         code = textwrap.dedent(match.group(2).strip("\n"))
+        if _is_path_list(code):
+            return "\n".join(line.strip() for line in code.splitlines() if line.strip())
         escaped_code = html.escape(code, quote=False)
         display_lang = lang.upper() if lang else "CODE"
         header_table = (
@@ -306,7 +389,7 @@ def markdown_to_chat_html(text: str) -> str:
     def replace_inline_code(match):
         code = match.group(1)
         target = code.strip()
-        linkable = bool(_INLINE_LINK_RE.match(target))
+        linkable = _inline_target_is_link(target)
         escaped = html.escape(code, quote=False)
         color = "#8be9fd" if linkable else "#ff79c6"
         deco = " text-decoration: underline;" if linkable else ""
@@ -315,7 +398,10 @@ def markdown_to_chat_html(text: str) -> str:
             f"padding: 1px 4px; font-family: monospace; font-size: 12px;{deco}'>{escaped}</code>"
         )
         if linkable:
-            href = html.escape(target, quote=True)
+            href_target = target
+            if any(ch.isspace() for ch in href_target):
+                href_target = urllib.parse.quote(href_target, safe="/:~")
+            href = html.escape(href_target, quote=True)
             inner = (
                 f"<a href=\"{href}\" style='color: #8be9fd; text-decoration: underline; font-weight: bold;'>"
                 f"{inner}</a>"
@@ -706,11 +792,15 @@ def parse_markdown_segments(text: str) -> List[Dict[str, str]]:
         lang = (match.group(1) or "").strip()
         raw_code = match.group(2)
         clean_code = textwrap.dedent(raw_code.strip("\n"))
-        segments.append({
-            "type": "code",
-            "lang": lang,
-            "code": clean_code
-        })
+        if _is_path_list(clean_code):
+            lines = "\n".join(line.strip() for line in clean_code.splitlines() if line.strip())
+            segments.append({"type": "text", "content": lines + "\n"})
+        else:
+            segments.append({
+                "type": "code",
+                "lang": lang,
+                "code": clean_code
+            })
         last_idx = end
 
     if last_idx < len(text):
@@ -1080,6 +1170,9 @@ class MessageBubble(QFrame):
             lbl = ChatContentLabel(self.content_container)
             lbl.setStyleSheet("color: #f8f8f2; font-family: monospace; font-size: 11px;")
             lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setOpenExternalLinks(False)
+            lbl.linkActivated.connect(self._handle_link_clicked)
+            lbl.linkHovered.connect(self._handle_link_hovered)
             lbl.setText(soften_long_tokens(self._tool_markup(text or "")))
             self.content_label = lbl
             self.content_layout.addWidget(lbl)

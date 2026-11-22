@@ -339,6 +339,16 @@ class StatusPill(QWidget):
         self.status_label.setStyleSheet("color: #50fa7b; font-weight: bold; font-size: 13px;")
         top_bar.addWidget(self.status_label)
 
+        # Project Job Scope Tag Label (PROJECT_JOBS.md Phase 13.6)
+        self.job_scope_label = QLabel("")
+        self.job_scope_label.setStyleSheet(
+            "QLabel { background-color: rgba(139, 233, 253, 0.15); color: #8be9fd; "
+            "border: 1px solid rgba(139, 233, 253, 0.4); border-radius: 4px; "
+            "padding: 1px 6px; font-size: 11px; font-weight: bold; }"
+        )
+        self.job_scope_label.setVisible(False)
+        top_bar.addWidget(self.job_scope_label)
+
         # Detailed message / active task
         self.details_label = ElidedLabel("EidosBot Idle")
         self.details_label.setStyleSheet("color: #f8f8f2; font-size: 12px;")
@@ -878,6 +888,15 @@ class StatusPill(QWidget):
     @pyqtSlot(str, dict)
     def add_tool_end_message(self, tool_name: str, result: dict):
         """Append tool result event to chat."""
+        if (
+            tool_name == "share_file"
+            and isinstance(result, dict)
+            and result.get("success")
+            and result.get("path")
+        ):
+            path = str(result.get("path"))
+            self.chat_history.add_message("tool", f"Open file:\n{path}", title="File")
+            return
         res_str = json.dumps(result, indent=2) if result else "{}"
         if len(res_str) > 500:
             res_str = res_str[:497] + "..."
@@ -981,6 +1000,49 @@ class StatusPill(QWidget):
             return
         closing_role = "error" if outcome not in ("success", "") else "assistant"
         self.chat_history.add_message(closing_role, visible, message_id=message_id)
+
+    @pyqtSlot(object, object)
+    def update_job_scope(
+        self,
+        primary: Optional[Dict[str, Any]],
+        running: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Update visible project job and running worker scope tags (PROJECT_JOBS.md Section 10)."""
+        if not primary and not running:
+            self.job_scope_label.setVisible(False)
+            self.job_scope_label.setText("")
+            return
+
+        parts: List[str] = []
+        if primary and isinstance(primary, dict):
+            if primary.get("integration_focus"):
+                parts.append(f"Integration · {primary['integration_focus']}")
+            else:
+                j_name = primary.get("name") or primary.get("job_name", "Job")
+                j_int = primary.get("integration")
+                if j_int:
+                    parts.append(f"Job · {j_name} · {j_int}")
+                else:
+                    parts.append(f"Job · {j_name}")
+
+        if running and isinstance(running, list):
+            for r in running:
+                if isinstance(r, dict):
+                    r_name = r.get("name") or r.get("job_id", "Worker")
+                    done = r.get("completed_items", 0)
+                    total = r.get("total_items", 0)
+                    prog_str = f" {done}/{total}" if total else ""
+                    parts.append(f"Running · {r_name}{prog_str}")
+
+        tag_text = " | ".join(parts)
+        self.job_scope_label.setText(tag_text)
+        tooltip = ""
+        if primary and isinstance(primary, dict):
+            tooltip = f"Primary Job: {primary.get('name')}\nID: {primary.get('job_id')}"
+            if primary.get("path"):
+                tooltip += f"\nPath: {primary.get('path')}"
+        self.job_scope_label.setToolTip(tooltip)
+        self.job_scope_label.setVisible(True)
 
     @pyqtSlot(bool)
     def set_task_running(self, running: bool):

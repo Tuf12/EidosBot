@@ -79,17 +79,19 @@ class RiskClassifier:
             "web_search", "web_fetch", "speak", "speak_aloud",
             "browser_open", "browser_extract", "browser_screenshot", "browser_close",
             "list_skills", "load_skill", "close_skill", "get_job_status", "share_file",
-            "load_job", "close_job",
+            "load_job", "close_job", "focus_job", "list_jobs", "read_job_document",
+            "list_integrations", "focus_integration", "list_mcp_servers",
             "optimalx_search_notes", "optimalx_read_note", "optimalx_list_folders",
             "optimalx_read_notex_doc", "optimalx_list_notex_docs", "optimalx_list_pending_reviews",
         ):
-            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection, vocal feedback, web research, or OptimalX query"
+            return RiskLevel.LEVEL_0_PASSIVE, "Read-only inspection, vocal feedback, web research, job/integration focus, or OptimalX query"
 
         if action_type in (
             "click", "double_click", "move_mouse", "scroll", "type_text",
             "press_key", "hotkey", "drag", "click_element",
             "browser_click", "browser_type", "browser_evaluate",
             "create_skill", "update_skill",
+            "create_job", "update_job_brief",
             "init_batch_job", "run_batch_job", "step_batch_job", "pause_batch_job", "resume_batch_job",
             "generate_batch_summary",
             "open_in_browser",
@@ -118,6 +120,39 @@ class RiskClassifier:
                     return RiskLevel.LEVEL_0_PASSIVE, "Download file into user workspace"
                 return RiskLevel.LEVEL_1_UI, f"Download file to {dest}"
             return RiskLevel.LEVEL_2_SHELL, "Filesystem modification"
+
+        if action_type in ("add_mcp_server", "remove_mcp_server", "set_secret"):
+            label = details.get("command") or action_type
+            return RiskLevel.LEVEL_2_SHELL, f"MCP catalog change: {label}"
+
+        if action_type.startswith("mcp__") or action_type == "call_mcp_tool":
+            server_name = details.get("server", "")
+            tool_name = details.get("tool", "")
+            if action_type.startswith("mcp__"):
+                parts = action_type.split("__", 2)
+                if len(parts) >= 2 and not server_name:
+                    server_name = parts[1]
+                if len(parts) >= 3 and not tool_name:
+                    tool_name = parts[2]
+
+            annotations = details.get("annotations") or {}
+            is_read_only = bool(details.get("readOnlyHint") or annotations.get("readOnlyHint"))
+            is_destructive = bool(details.get("destructiveHint") or annotations.get("destructiveHint"))
+
+            if is_read_only:
+                return (
+                    RiskLevel.LEVEL_0_PASSIVE,
+                    f"MCP read-only tool [{server_name}] {tool_name}",
+                )
+            if is_destructive:
+                return (
+                    RiskLevel.LEVEL_3_DESTRUCTIVE,
+                    f"MCP destructive tool [{server_name}] {tool_name}",
+                )
+            return (
+                RiskLevel.LEVEL_2_SHELL,
+                f"MCP external tool execution: [{server_name}] {tool_name}",
+            )
 
         # Default fallback: treat unknown actions as Level 2
         return RiskLevel.LEVEL_2_SHELL, f"Unknown action type '{action_type}'"

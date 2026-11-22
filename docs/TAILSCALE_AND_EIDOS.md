@@ -103,7 +103,7 @@ There is **no requirement** to use MCP for home login. If you later attach Tails
 
 1. Ship **CLI wrapper tools** in-repo under `eidos/integrations/tailscale.py` (mirroring OptimalX bridge style).
 2. Defer **Admin API MCP** until [PROJECT_JOBS.md](PROJECT_JOBS.md) Phase 14: attach as named integration with Gatekeeper per tool, **read-only profile** by default (`TAILSCALE_READONLY` equivalent).
-3. Never put **auth keys or API OAuth secrets** in `mcp.json` editable by the model; integration records stay user-owned under `~/.eidos/integrations/`.
+3. Never put **auth keys or API OAuth secrets** in `mcp.json`. Store them with `set_secret` and reference that file from `env_from` or `headers_from`. Integration records stay under `~/.eidos/integrations/`.
 
 **Routing note:** MCP does not replace WireGuard. An MCP server running **on the same PC** still administers Tailscale; your phone still uses the **Tailscale app** to join the tailnet. An MCP server running **on a VPS** could manage ACLs or auth keys in the cloud—that is a different threat model and usually unnecessary for a single Mint box.
 

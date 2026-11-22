@@ -160,6 +160,12 @@ class ScopeResolver:
                     integration = first_int.strip()
             elif isinstance(raw_integration, str) and raw_integration.strip():
                 integration = raw_integration.strip()
+            elif active_job.get("integrations") and isinstance(active_job["integrations"], list):
+                first_int = active_job["integrations"][0]
+                if isinstance(first_int, dict) and first_int.get("name"):
+                    integration = str(first_int["name"]).strip()
+                elif isinstance(first_int, str) and first_int.strip():
+                    integration = first_int.strip()
 
         return TaskScope(
             project_name=project_name,

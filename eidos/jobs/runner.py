@@ -14,8 +14,24 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import uuid
 import yaml
 
+from eidos.jobs.focus import JobFocusManager
 from eidos.jobs.summary import RankingSummaryGenerator
-from eidos.jobs.types import JobQueue, JobSettings, QueueItem
+from eidos.jobs.types import (
+    JobBoundary,
+    JobDecision,
+    JobDocument,
+    JobIdentity,
+    JobIntegrationRef,
+    JobProgress,
+    JobQueue,
+    JobSettings,
+    JobSkillRef,
+    ProjectBrief,
+    ProjectDirectories,
+    QueueItem,
+    generate_notes_index,
+    sync_notes_index,
+)
 from eidos.skills.manager import SkillManager
 
 logger = logging.getLogger(__name__)
@@ -39,6 +55,7 @@ class BatchJobRunner:
         )
         self.default_processor = default_processor
         self.summary_generator = summary_generator or RankingSummaryGenerator()
+        self.focus_manager = JobFocusManager(self.default_jobs_dir)
         self.active_job: Optional[JobQueue] = None
         self.milestone_listeners: List[Callable[[JobQueue, QueueItem], None]] = []
 
@@ -175,7 +192,7 @@ class BatchJobRunner:
         return None
 
     def save_queue(self, queue: JobQueue, queue_path: Optional[Union[str, Path]] = None) -> None:
-        """Atomically persist queue state to queue.json and job.yaml manifest."""
+        """Atomically persist queue state to queue.json and update progress in job.yaml manifest."""
         dest_path = (
             Path(os.path.abspath(os.path.expanduser(queue_path)))
             if queue_path
@@ -197,15 +214,47 @@ class BatchJobRunner:
             logger.error("Failed to atomically save queue to %s: %s", dest_path, e)
             raise
 
-        # Atomically save job.yaml manifest
+        # Atomically update or create job.yaml manifest (Phase 13.1: Durable Brief)
         yaml_dest = dest_path.parent / "job.yaml"
-        skill_meta = None
-        if self.skills_manager and queue.skill_name:
+        progress_dict = {
+            "total_items": queue.total_items,
+            "completed_items": queue.completed_items,
+            "failed_items": queue.failed_items,
+            "skipped_items": queue.skipped_items,
+            "pending_items": queue.get_pending_count(),
+            "percent": queue.get_progress_percent(),
+        }
+
+        existing_manifest_data = None
+        if yaml_dest.is_file():
             try:
-                skill_meta = self.skills_manager.load_skill(queue.skill_name)
-            except Exception:
-                pass
-        manifest_data = queue.to_manifest_dict(skill_meta=skill_meta)
+                with open(yaml_dest, "r", encoding="utf-8") as yf:
+                    loaded = yaml.safe_load(yf)
+                    if isinstance(loaded, dict):
+                        existing_manifest_data = loaded
+            except Exception as e:
+                logger.debug("Failed reading existing job.yaml at %s: %s", yaml_dest, e)
+
+        if existing_manifest_data is not None:
+            # Durable brief: preserve identity, boundary, decisions, open_questions, constraints,
+            # skills, integrations, documents, directories. Update only progress, status, updated_at, component pointer.
+            existing_manifest_data["progress"] = progress_dict
+            existing_manifest_data["status"] = queue.status
+            existing_manifest_data["updated_at"] = queue.updated_at
+            components = existing_manifest_data.setdefault("components", {})
+            if isinstance(components, dict):
+                components["batch_queue"] = dest_path.name
+            manifest_data = existing_manifest_data
+        else:
+            skill_meta = None
+            if self.skills_manager and queue.skill_name:
+                try:
+                    skill_meta = self.skills_manager.load_skill(queue.skill_name)
+                except Exception:
+                    pass
+            brief = ProjectBrief.from_queue(queue, skill_meta=skill_meta)
+            manifest_data = brief.to_dict()
+
         tmp_y_fd, tmp_y_path = tempfile.mkstemp(
             prefix="job_manifest_", suffix=".tmp", dir=str(dest_path.parent)
         )
@@ -217,6 +266,382 @@ class BatchJobRunner:
             if os.path.exists(tmp_y_path):
                 os.remove(tmp_y_path)
             logger.warning("Failed to save job.yaml manifest to %s: %s", yaml_dest, e)
+
+    def save_brief(self, brief: ProjectBrief) -> Path:
+        """Atomically persist ProjectBrief to job.yaml and synchronize notes/INDEX.md."""
+        job_dir = Path(os.path.abspath(os.path.expanduser(brief.directories.job_dir)))
+        job_dir.mkdir(parents=True, exist_ok=True)
+        manifest_file = job_dir / "job.yaml"
+        manifest_data = brief.to_dict()
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            prefix="brief_", suffix=".tmp", dir=str(job_dir)
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                yaml.dump(manifest_data, f, sort_keys=False, allow_unicode=True)
+            os.replace(tmp_path, manifest_file)
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            logger.error("Failed to atomically save brief to %s: %s", manifest_file, e)
+            raise
+
+        # Synchronize notes/INDEX.md with documents list
+        sync_notes_index(job_dir, documents=brief.documents, job_name=brief.name)
+        return manifest_file
+
+    def load_brief(self, job_id_or_path: str) -> Optional[ProjectBrief]:
+        """Load and parse durable ProjectBrief from job.yaml or queue manifest."""
+        manifest_data = self.load_manifest(job_id_or_path)
+        if not manifest_data:
+            return None
+        try:
+            return ProjectBrief.from_dict(manifest_data)
+        except Exception as e:
+            logger.warning("Failed to parse ProjectBrief from manifest %s: %s", job_id_or_path, e)
+            return None
+
+    def create_project_job(
+        self,
+        name: str,
+        summary: Optional[str] = None,
+        goal: Optional[str] = None,
+        this_is: Optional[str] = None,
+        this_is_not: Optional[str] = None,
+        output_dir: Optional[str] = None,
+        skills: Optional[List[str]] = None,
+    ) -> ProjectBrief:
+        """Create a new project job with a durable brief, notes/, artifacts/, and notes/INDEX.md."""
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        short_id = uuid.uuid4().hex[:4]
+        job_id = f"job_{ts}_{short_id}"
+
+        if output_dir:
+            out_path = Path(os.path.abspath(os.path.expanduser(output_dir)))
+        else:
+            if "/" in name:
+                parts = [self._slugify(part) for part in name.split("/") if part.strip()]
+                out_path = self.default_jobs_dir / Path(*parts)
+            else:
+                slug = self._slugify(name)
+                out_path = self.default_jobs_dir / f"{job_id}_{slug}"
+
+        out_path.mkdir(parents=True, exist_ok=True)
+        notes_dir = out_path / "notes"
+        artifacts_dir = out_path / "artifacts"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        skill_refs = [JobSkillRef(name=s) for s in (skills or [])]
+
+        brief = ProjectBrief(
+            job_id=job_id,
+            name=name,
+            status="active",
+            focus="primary",
+            identity=JobIdentity(summary=summary, goal=goal, phase="concept"),
+            boundary=JobBoundary(this_is=this_is, this_is_not=this_is_not),
+            skills=skill_refs,
+            directories=ProjectDirectories(
+                job_dir=str(out_path),
+                notes_dir=str(notes_dir),
+                artifacts_dir=str(artifacts_dir),
+                manifest_file=str(out_path / "job.yaml"),
+                project_root=str(out_path),
+                output_dir=str(out_path),
+            ),
+        )
+        self.save_brief(brief)
+        logger.info("Created durable project job '%s' (%s) at %s", name, job_id, out_path)
+        return brief
+
+    def list_jobs(self, group: Optional[str] = None, include_archived: bool = False) -> List[Dict[str, Any]]:
+        """List all discovered project jobs and batch queues under default_jobs_dir or group folder."""
+        search_root = self.default_jobs_dir
+        if group and group.strip():
+            cand_group = self.default_jobs_dir / group.strip()
+            if cand_group.is_dir():
+                search_root = cand_group
+
+        primary_target = self.focus_manager.get_primary()
+        attached_list = self.focus_manager.get_attached()
+        active_worker_id = self.get_active_worker_job_id()
+
+        results: List[Dict[str, Any]] = []
+        seen_dirs = set()
+
+        if not search_root.exists():
+            return []
+
+        cand_manifests = list(search_root.rglob("job.yaml")) + list(search_root.rglob("queue.json"))
+        for item_path in cand_manifests:
+            job_dir = item_path.parent
+            try:
+                dir_str = str(job_dir.resolve())
+            except Exception:
+                dir_str = str(job_dir)
+            if dir_str in seen_dirs:
+                continue
+            seen_dirs.add(dir_str)
+
+            manifest = self.load_manifest(dir_str)
+            if not manifest:
+                continue
+
+            status = manifest.get("status", "active")
+            if not include_archived and status == "archived":
+                continue
+
+            job_id = str(manifest.get("job_id") or f"job_{job_dir.name}")
+            job_name = str(manifest.get("name") or manifest.get("job_name") or job_dir.name)
+
+            is_primary = False
+            if primary_target:
+                clean_pt = primary_target.strip().lower()
+                if (
+                    clean_pt == job_id.lower()
+                    or clean_pt == job_name.lower()
+                    or clean_pt == dir_str.lower()
+                    or clean_pt == job_dir.name.lower()
+                ):
+                    is_primary = True
+
+            is_attached = (job_id in attached_list) or (dir_str in attached_list)
+            is_worker_running = bool(active_worker_id and (active_worker_id == job_id or active_worker_id == dir_str))
+
+            skills_list: List[str] = []
+            if manifest.get("skills") and isinstance(manifest["skills"], list):
+                for s in manifest["skills"]:
+                    s_name = s.get("name") if isinstance(s, dict) else str(s)
+                    if s_name:
+                        skills_list.append(s_name)
+            elif manifest.get("skill_name"):
+                skills_list.append(str(manifest["skill_name"]))
+
+            prog = manifest.get("progress") or {}
+
+            results.append({
+                "job_id": job_id,
+                "name": job_name,
+                "status": status,
+                "is_primary": is_primary,
+                "is_attached": is_attached,
+                "is_worker_running": is_worker_running,
+                "path": str(job_dir),
+                "skills": skills_list,
+                "total_items": prog.get("total_items", 0),
+                "completed_items": prog.get("completed_items", 0),
+                "percent": prog.get("percent", 0.0),
+            })
+
+        results.sort(key=lambda x: (not x["is_primary"], not x["is_worker_running"], x["name"].lower()))
+        return results
+
+    def read_document(
+        self,
+        job_id_or_path: str,
+        relative_path: str,
+        heading: Optional[str] = None,
+        max_chars: int = 15000,
+    ) -> Dict[str, Any]:
+        """Read a document or specific markdown heading from inside the project job directory."""
+        job_dir = self._resolve_job_dir(job_id_or_path)
+        if not job_dir:
+            return {"success": False, "error": f"Job directory for '{job_id_or_path}' could not be resolved."}
+
+        # Resolve document file path safely
+        target_path: Optional[Path] = None
+        clean_rel = relative_path.strip().lstrip("/")
+        cands = [
+            job_dir / clean_rel,
+            job_dir / "notes" / clean_rel,
+            job_dir / "artifacts" / clean_rel,
+        ]
+        for c in cands:
+            if c.is_file():
+                target_path = c.resolve()
+                break
+
+        if not target_path or not target_path.is_file():
+            return {
+                "success": False,
+                "error": f"Document '{relative_path}' not found in job '{job_dir.name}'. Checked job root, notes/, and artifacts/.",
+            }
+
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            return {"success": False, "error": f"Failed reading document '{target_path}': {e}"}
+
+        # If heading requested, extract section under heading
+        if heading and heading.strip():
+            clean_heading = heading.strip().lstrip("#").strip().lower()
+            lines = content.splitlines()
+            extracted_lines: List[str] = []
+            capturing = False
+            target_level = 0
+
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    heading_text = stripped.lstrip("#").strip()
+                    level = len(stripped) - len(stripped.lstrip("#"))
+                    if not capturing:
+                        if clean_heading in heading_text.lower():
+                            capturing = True
+                            target_level = level
+                            extracted_lines.append(line)
+                    else:
+                        if level <= target_level:
+                            break
+                        extracted_lines.append(line)
+                elif capturing:
+                    extracted_lines.append(line)
+
+            if extracted_lines:
+                extracted_content = "\n".join(extracted_lines)
+                return {
+                    "success": True,
+                    "path": str(target_path),
+                    "relative_path": str(target_path.relative_to(job_dir)),
+                    "heading": heading,
+                    "content": extracted_content[:max_chars],
+                    "truncated": len(extracted_content) > max_chars,
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": f"Heading '{heading}' not found in document '{target_path.name}'.",
+                    "available_headings": [l.strip() for l in lines if l.strip().startswith("#")][:10],
+                }
+
+        truncated = len(content) > max_chars
+        return {
+            "success": True,
+            "path": str(target_path),
+            "relative_path": str(target_path.relative_to(job_dir)),
+            "content": content[:max_chars],
+            "truncated": truncated,
+        }
+
+    def update_brief(
+        self,
+        job_id_or_path: str,
+        summary: Optional[str] = None,
+        goal: Optional[str] = None,
+        phase: Optional[str] = None,
+        this_is: Optional[str] = None,
+        this_is_not: Optional[str] = None,
+        add_distinct_from: Optional[Union[Dict[str, str], str]] = None,
+        add_decision: Optional[Union[Dict[str, str], str]] = None,
+        add_open_question: Optional[str] = None,
+        remove_open_question: Optional[str] = None,
+        add_constraint: Optional[str] = None,
+        add_skill: Optional[Union[Dict[str, str], str]] = None,
+        add_document: Optional[Union[Dict[str, str], str]] = None,
+    ) -> Dict[str, Any]:
+        """Patch identity, boundary, decisions, questions, constraints, skills, or documents on a brief."""
+        brief = self.load_brief(job_id_or_path)
+        if not brief:
+            return {"success": False, "error": f"Could not find or load brief for '{job_id_or_path}'."}
+
+        updated_fields: List[str] = []
+
+        if summary is not None:
+            brief.identity.summary = summary.strip()
+            updated_fields.append("identity.summary")
+        if goal is not None:
+            brief.identity.goal = goal.strip()
+            updated_fields.append("identity.goal")
+        if phase is not None:
+            brief.identity.phase = phase.strip()
+            updated_fields.append("identity.phase")
+
+        if this_is is not None:
+            brief.boundary.this_is = this_is.strip()
+            updated_fields.append("boundary.this_is")
+        if this_is_not is not None:
+            brief.boundary.this_is_not = this_is_not.strip()
+            updated_fields.append("boundary.this_is_not")
+
+        if add_distinct_from:
+            from eidos.jobs.types import DistinctFrom
+            if isinstance(add_distinct_from, dict):
+                df = DistinctFrom(name=add_distinct_from.get("name", ""), difference=add_distinct_from.get("difference", ""))
+            else:
+                df = DistinctFrom.model_validate(add_distinct_from)
+            brief.boundary.distinct_from.append(df)
+            updated_fields.append("boundary.distinct_from")
+
+        if add_decision:
+            from eidos.jobs.types import JobDecision
+            if isinstance(add_decision, dict):
+                jd = JobDecision(
+                    id=add_decision.get("id") or f"d_{uuid.uuid4().hex[:4]}",
+                    text=add_decision.get("text", ""),
+                )
+            else:
+                jd = JobDecision(text=str(add_decision))
+            brief.decisions.append(jd)
+            updated_fields.append("decisions")
+
+        if add_open_question and add_open_question.strip():
+            brief.open_questions.append(add_open_question.strip())
+            updated_fields.append("open_questions")
+
+        if remove_open_question and remove_open_question.strip():
+            clean_rm = remove_open_question.strip().lower()
+            brief.open_questions = [q for q in brief.open_questions if clean_rm not in q.lower()]
+            updated_fields.append("open_questions")
+
+        if add_constraint and add_constraint.strip():
+            brief.constraints.append(add_constraint.strip())
+            updated_fields.append("constraints")
+
+        if add_skill:
+            from eidos.jobs.types import JobSkillRef
+            if isinstance(add_skill, dict):
+                sk = JobSkillRef(name=add_skill.get("name", ""), use_when=add_skill.get("use_when"))
+            else:
+                sk = JobSkillRef(name=str(add_skill))
+            if not any(s.name == sk.name for s in brief.skills):
+                brief.skills.append(sk)
+                updated_fields.append("skills")
+
+        if add_document:
+            from eidos.jobs.types import JobDocument
+            if isinstance(add_document, dict):
+                doc = JobDocument(
+                    path=add_document.get("path", ""),
+                    role=add_document.get("role"),
+                    summary=add_document.get("summary"),
+                    read_when=add_document.get("read_when"),
+                )
+            else:
+                doc = JobDocument(path=str(add_document))
+            existing_idx = None
+            for i, existing in enumerate(brief.documents):
+                if existing.path == doc.path:
+                    existing_idx = i
+                    break
+            if existing_idx is not None:
+                brief.documents[existing_idx] = doc
+            else:
+                brief.documents.append(doc)
+            updated_fields.append("documents")
+
+        brief.updated_at = datetime.now(timezone.utc).isoformat()
+        self.save_brief(brief)
+
+        return {
+            "success": True,
+            "job_id": brief.job_id,
+            "name": brief.name,
+            "updated_fields": updated_fields,
+            "manifest_file": str(Path(brief.directories.job_dir) / "job.yaml"),
+        }
 
     def load_manifest(self, job_id_or_path: str) -> Optional[Dict[str, Any]]:
         """Load lean manifest dict from job.yaml or queue, inheriting from group.yaml if present."""
@@ -386,6 +811,13 @@ class BatchJobRunner:
                 out_path = self.default_jobs_dir / f"{job_id}_{slug}"
 
         out_path.mkdir(parents=True, exist_ok=True)
+        notes_dir = out_path / "notes"
+        artifacts_dir = out_path / "artifacts"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        index_file = notes_dir / "INDEX.md"
+        if not index_file.is_file():
+            sync_notes_index(out_path, documents=[], job_name=job_name)
 
         # Parse and normalize input items
         raw_items: List[Any] = []
@@ -558,14 +990,22 @@ class BatchJobRunner:
         queue.updated_at = datetime.now(timezone.utc).isoformat()
         self.save_queue(queue)
 
-        # Prepare execution context
+        # Prepare execution context with parent brief identity and boundary (PROJECT_JOBS.md Phase 13.5)
         skill_info = self.skills.load_skill(queue.skill_name)
+        manifest = self.load_manifest(str(queue.output_dir)) or {}
         context = {
             "job_id": queue.job_id,
             "job_name": queue.job_name,
             "skill_name": queue.skill_name,
             "skill": skill_info,
             "output_dir": queue.output_dir,
+            "identity": manifest.get("identity"),
+            "boundary": manifest.get("boundary"),
+            "decisions": manifest.get("decisions"),
+            "constraints": manifest.get("constraints"),
+            "open_questions": manifest.get("open_questions"),
+            "skills": manifest.get("skills"),
+            "manifest": manifest,
         }
 
         # Process the item

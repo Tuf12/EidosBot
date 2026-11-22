@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Cloud, Cpu, RefreshCw, SlidersHorizontal, X } from 'lucide-react';
+import { Cloud, Cpu, RefreshCw, Settings, X } from 'lucide-react';
 import { CloudProvider, ModelPreference, ModelSettings } from '../types/gateway';
 
 interface ModelSettingsModalProps {
@@ -168,10 +168,10 @@ export function ModelSettingsModal({ isOpen, token, onClose }: ModelSettingsModa
         <div className="flex items-center justify-between p-4 border-b border-[#44475a] bg-[#282a36]/50">
           <div className="flex items-center gap-2.5 min-w-0">
             <div className="w-8 h-8 rounded-lg bg-[#8be9fd]/15 border border-[#8be9fd]/40 flex items-center justify-center text-[#8be9fd] shrink-0">
-              <SlidersHorizontal className="w-4 h-4" />
+              <Settings className="w-4 h-4" />
             </div>
             <div className="min-w-0">
-              <h2 className="text-sm font-bold text-[#f8f8f2]">AI Model</h2>
+              <h2 className="text-sm font-bold text-[#f8f8f2]">AI Model Settings</h2>
               <p className="text-[11px] text-[#8be9fd] truncate">
                 {settings?.summary || 'Choose which model answers while you are away'}
               </p>

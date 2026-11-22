@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { AgentState, BackgroundActivity, ChatAction, ChatMessage, ConfirmationRecord, InboundWSEvent, OutboundWSMessage, SharedFile } from '../types/gateway';
+import { AgentState, BackgroundActivity, ChatAction, ChatMessage, ConfirmationRecord, InboundWSEvent, JobFocusState, OutboundWSMessage, SharedFile } from '../types/gateway';
 
 /** Turn gateway tool events into the action chips shown on an assistant message. */
 function normalizeActions(raw: any): ChatAction[] {
@@ -190,6 +190,7 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
+  const [jobFocus, setJobFocus] = useState<JobFocusState | null>(null);
   const [backgroundWork, setBackgroundWork] = useState<BackgroundActivity>({
     active: false,
     task: '',
@@ -477,6 +478,13 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
               const loaded = data.messages.map((m: any, i: number) => mapHistoryMessage(m, i));
               setMessages((prev) => mergeHistoryWithLiveTail(loaded, prev));
             }
+          } else if (ev === 'job_focus') {
+            setJobFocus({
+              primary: data.primary || null,
+              integrations: data.integrations || [],
+              integration_focus: data.integration_focus || null,
+              running: data.running || [],
+            });
           } else if (ev === 'task_start') {
             // One user bubble and one open reply. A repeated start for this turn is ignored.
             const goal = (data.goal || '').trim();
@@ -920,6 +928,7 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
     stateDetails,
     isKilled,
     backgroundWork,
+    jobFocus,
     confirmations,
     messages,
     sharedFiles,

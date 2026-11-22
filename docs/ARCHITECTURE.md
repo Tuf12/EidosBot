@@ -232,7 +232,7 @@ Every interaction cycle executes through a six-stage pipeline:
 
 **Old system.** `eidos/jobs/` is the batch runner plus the project brief. Outside apps are reached by skills compiled into this repo.
 
-**Updated job concept.** `eidos/jobs/` still owns the project brief, focus, and the batch-queue component. The job directory `~/EidosWorkspace/jobs/<project>/` keeps `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). An outside app is an integration under `~/.eidos/integrations/<name>/`. Its tools come from that app's MCP server, loaded only while the integration is attached to the primary job or is the focus by itself. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
+**Updated job concept.** `eidos/jobs/` still owns the project brief, focus, and the batch-queue component. The job directory `~/EidosWorkspace/jobs/<project>/` keeps `notes/` and `artifacts/` (images, text, PDFs, spreadsheets, generated reports). An outside app is an integration under `~/.eidos/integrations/<name>/`. Its tools come from that app's MCP server on this PC (a process Eidos starts, or a localhost server the app already has open), loaded only while the integration is attached to the primary job or is the focus by itself. A cloud URL is the same attachment when the app is not installed here. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 13.
 
 **Updated job concept (groups).** The job directory may sit under a group: `~/EidosWorkspace/jobs/Gmail/Clients/acme/` or `~/EidosWorkspace/jobs/Coding/notes-app/`. `group.yaml` binds the skill and the server for every leaf job under that folder. See [PROJECT_JOBS.md](PROJECT_JOBS.md) section 14.
 
@@ -282,7 +282,7 @@ Because **OptimalX Desktop** and **OptimalX Mobile** are personally developed by
 
 **Old system.** OptimalX is wired as an in-repo bridge (`eidos/integrations/optimalx.py`) with hand-written tool schemas.
 
-**Updated job concept.** That bridge stays for OptimalX, because OptimalX does not ship an MCP server. A new app is a separate process that exposes an MCP server. EidosBot keeps the project job, the skill for how to use the app, and the memory tags. The server supplies the tools. Gmail is the reference case: Google's remote server at `https://gmailmcp.googleapis.com/mcp/v1`, attached to a project job such as a lease. It is not opened as a job named Gmail. Files that arrive through Gmail are saved into that project job's `artifacts/`.
+**Updated job concept.** That bridge stays for OptimalX, because OptimalX does not ship an MCP server. A new app is a process on this PC that exposes an MCP server. Eidos starts that process, or connects to it on `127.0.0.1` while the app is open. The reference case is a local IDE bridge: VS Code stays open on the project, and Eidos calls its diagnostics, tests, diffs, git, and debugger through the bridge. EidosBot keeps the project job, the skill for how to use the app, and the memory tags. The server supplies the tools. A cloud server, such as Gmail at `https://gmailmcp.googleapis.com/mcp/v1`, is the same attachment when the app is not installed here. It is not opened as a job named Gmail. Files that arrive through an app are saved into that project job's `artifacts/`.
 
 
 

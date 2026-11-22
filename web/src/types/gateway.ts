@@ -85,6 +85,33 @@ export interface InboundWSEvent {
   background_active?: boolean;
   active?: boolean;
   task?: string;
+  primary?: PrimaryJobInfo | null;
+  integrations?: Array<{ name: string }>;
+  integration_focus?: string | null;
+  running?: RunningJobInfo[];
+}
+
+export interface PrimaryJobInfo {
+  job_id: string;
+  name: string;
+  phase?: string;
+  status?: string;
+  path?: string;
+}
+
+export interface RunningJobInfo {
+  job_id: string;
+  name: string;
+  status?: string;
+  completed_items?: number;
+  total_items?: number;
+}
+
+export interface JobFocusState {
+  primary: PrimaryJobInfo | null;
+  integrations?: Array<{ name: string }>;
+  integration_focus?: string | null;
+  running?: RunningJobInfo[];
 }
 
 export interface BackgroundActivity {
@@ -138,7 +165,8 @@ export interface OutboundWSMessage {
     | 'get_conversations'
     | 'get_history'
     | 'sync'
-    | 'edit_retry';
+    | 'edit_retry'
+    | 'get_job_focus';
   prompt?: string;
   id?: string;
   message_index?: number;

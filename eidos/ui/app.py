@@ -50,6 +50,7 @@ class UIController(QObject):
     signal_task_running = pyqtSignal(bool)
     signal_sync_conversation = pyqtSignal(str, str, list)
     signal_remote_model_changed = pyqtSignal(str)
+    signal_job_focus_changed = pyqtSignal(object, object)
 
     def __init__(
         self,
@@ -144,6 +145,7 @@ class UIController(QObject):
         self.signal_task_running.connect(self.pill.set_task_running)
         self.signal_sync_conversation.connect(self._apply_conversation_sync)
         self.signal_remote_model_changed.connect(self._on_remote_model_changed)
+        self.signal_job_focus_changed.connect(self.pill.update_job_scope)
 
     @pyqtSlot(str, str, list)
     def _apply_conversation_sync(self, conv_id: str, title: str, messages: list):
@@ -685,6 +687,40 @@ class UIController(QObject):
             "on_background_activity",
             lambda active, task, details: self.pill.signal_set_background_activity.emit(active, task, details),
         )
+
+        # Project Job Focus synchronization (PROJECT_JOBS.md Phase 13.6 & Phase 14)
+        def _sync_job_focus():
+            primary = None
+            if getattr(agent_loop, "active_job", None) and isinstance(agent_loop.active_job, dict):
+                primary = {
+                    "name": agent_loop.active_job.get("name") or agent_loop.active_job.get("job_name", "Job"),
+                    "job_id": agent_loop.active_job.get("job_id", ""),
+                    "path": agent_loop.active_job.get("directories", {}).get("job_dir"),
+                }
+                mcp_cfg = getattr(agent_loop, "mcp_config", None)
+                ints = mcp_cfg.resolve_job_integrations(agent_loop.active_job) if mcp_cfg else []
+                if ints:
+                    primary["integration"] = ints[0]
+            elif getattr(agent_loop, "active_integration_focus", None):
+                primary = {
+                    "integration_focus": agent_loop.active_integration_focus,
+                }
+            running = []
+            if getattr(agent_loop, "jobs", None):
+                w_id = agent_loop.jobs.get_active_worker_job_id()
+                if w_id:
+                    w_man = agent_loop.jobs.load_manifest(w_id)
+                    w_name = (w_man.get("name") or w_man.get("job_name") or w_id) if w_man else w_id
+                    w_prog = (w_man.get("progress") if w_man else None) or {}
+                    running.append({
+                        "name": w_name,
+                        "completed_items": int(w_prog.get("completed_items", 0)),
+                        "total_items": int(w_prog.get("total_items", 0)),
+                    })
+            self.signal_job_focus_changed.emit(primary, running)
+
+        agent_loop.register_callback("on_job_focus", _sync_job_focus)
+        _sync_job_focus()
 
         # Restore persistent conversation into chat UI on startup
         if getattr(agent_loop, "conversation_store", None) and getattr(agent_loop, "active_conversation_id", None):

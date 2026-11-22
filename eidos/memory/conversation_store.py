@@ -182,6 +182,71 @@ class ConversationStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_fork_message_parent ON ForkMessage(parentId);"
             )
+            self._ensure_scope_columns()
+            self._conn.commit()
+
+    def _ensure_scope_columns(self) -> None:
+        """Add per-conversation job scope columns on existing databases."""
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(Conversation)").fetchall()
+        }
+        if "jobId" not in columns:
+            self._conn.execute("ALTER TABLE Conversation ADD COLUMN jobId TEXT")
+        if "integrationFocus" not in columns:
+            self._conn.execute("ALTER TABLE Conversation ADD COLUMN integrationFocus TEXT")
+
+    def get_conversation_scope(self, conversation_id: str) -> Optional[Dict[str, Any]]:
+        """Return the job scope bound to a conversation.
+
+        ``bound`` is false until this conversation has been given an explicit scope.
+        An explicit empty scope (new chat) is bound with no job and no integration.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                SELECT jobId, integrationFocus
+                FROM Conversation
+                WHERE id = ?
+                """,
+                (conversation_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            job_raw = row["jobId"]
+            integration_raw = row["integrationFocus"]
+            return {
+                "bound": job_raw is not None or integration_raw is not None,
+                "job_id": job_raw.strip() if isinstance(job_raw, str) and job_raw.strip() else None,
+                "integration_focus": (
+                    integration_raw.strip()
+                    if isinstance(integration_raw, str) and integration_raw.strip()
+                    else None
+                ),
+            }
+
+    def set_conversation_scope(
+        self,
+        conversation_id: str,
+        job_id: Optional[str] = None,
+        integration_focus: Optional[str] = None,
+    ) -> None:
+        """Bind a job or standalone integration to this conversation.
+
+        Empty values are stored explicitly so a new chat stays unscoped instead of
+        inheriting another conversation's focus. Does not bump updatedAt.
+        """
+        job_val = str(job_id).strip() if job_id else ""
+        integration_val = "" if job_val else (str(integration_focus).strip() if integration_focus else "")
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE Conversation
+                SET jobId = ?, integrationFocus = ?
+                WHERE id = ?
+                """,
+                (job_val, integration_val, conversation_id),
+            )
             self._conn.commit()
 
     def create_conversation(

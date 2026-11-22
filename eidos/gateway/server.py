@@ -1506,6 +1506,41 @@ class RemoteGatewayServer:
         if not path.is_file():
             return web.json_response({"ok": False, "error": "File is no longer on disk"}, status=404)
         download = request.query.get("download", "").lower() in ("1", "true", "yes")
+        want_text = request.query.get("text", "").lower() in ("1", "true", "yes") or request.query.get("format") == "text"
+        if want_text:
+            if path.suffix.lower() == ".pdf":
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "pdftotext", str(path), "-",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+                    if proc.returncode == 0 and stdout:
+                        extracted = stdout.decode("utf-8", errors="replace").strip()
+                        return web.Response(
+                            text=extracted,
+                            content_type="text/plain",
+                            charset="utf-8",
+                            headers={"Cache-Control": "no-cache"},
+                        )
+                    return web.json_response({"ok": False, "error": "Could not extract text from this PDF"}, status=422)
+                except Exception as exc:
+                    logger.debug("PDF text extraction failed for %s: %s", path, exc)
+                    return web.json_response({"ok": False, "error": f"PDF text extraction failed: {exc}"}, status=500)
+            else:
+                try:
+                    content = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+                    return web.Response(
+                        text=content,
+                        content_type="text/plain",
+                        charset="utf-8",
+                        headers={"Cache-Control": "no-cache"},
+                    )
+                except Exception as exc:
+                    logger.debug("Text read failed for %s: %s", path, exc)
+                    return web.json_response({"ok": False, "error": f"Could not read file text: {exc}"}, status=500)
+
         return web.FileResponse(
             path,
             headers={
@@ -2010,6 +2045,82 @@ class RemoteGatewayServer:
         else:
             self.broadcast_event("log", {"message": f"Background activity finished: {task}"})
 
+    def _on_job_focus_changed(self):
+        """Observer callback when primary job focus or job manifest updates."""
+        self.broadcast_job_focus()
+
+    def get_job_focus_payload(self) -> Dict[str, Any]:
+        """Construct the job_focus payload for WebSocket broadcast (PROJECT_JOBS.md Section 10)."""
+        active_job = getattr(self.agent_loop, "active_job", None)
+        jobs_runner = getattr(self.agent_loop, "jobs", None)
+
+        primary_info: Optional[Dict[str, Any]] = None
+        if active_job and isinstance(active_job, dict):
+            identity = active_job.get("identity") or {}
+            dirs = active_job.get("directories") or {}
+            primary_info = {
+                "job_id": str(active_job.get("job_id") or ""),
+                "name": str(active_job.get("name") or active_job.get("job_name") or "Unnamed Job"),
+                "phase": str(identity.get("phase") if isinstance(identity, dict) else active_job.get("phase") or "concept"),
+                "status": str(active_job.get("status") or "active"),
+                "path": str(dirs.get("job_dir") or dirs.get("output_dir") or ""),
+            }
+
+        integrations: List[Dict[str, Any]] = []
+        if active_job and isinstance(active_job, dict):
+            raw_ints = active_job.get("integrations") or []
+            for i in raw_ints:
+                if isinstance(i, dict) and i.get("name"):
+                    integrations.append({"name": str(i["name"])})
+                elif isinstance(i, str) and i.strip():
+                    integrations.append({"name": i.strip()})
+            if not integrations and active_job.get("integration"):
+                integrations.append({"name": str(active_job["integration"])})
+
+            # Check for inherited group integrations
+            mcp_cfg = getattr(self.agent_loop, "mcp_config", None)
+            if mcp_cfg:
+                for rname in mcp_cfg.resolve_job_integrations(active_job):
+                    if not any(item["name"] == rname for item in integrations):
+                        integrations.append({"name": rname})
+
+        int_focus: Optional[str] = None
+        if not primary_info:
+            int_focus = getattr(self.agent_loop, "active_integration_focus", None)
+            if not int_focus and jobs_runner and hasattr(jobs_runner, "focus_manager"):
+                int_focus = jobs_runner.focus_manager.get_integration_focus()
+
+        running: List[Dict[str, Any]] = []
+        if jobs_runner:
+            active_worker_id = jobs_runner.get_active_worker_job_id()
+            if active_worker_id:
+                w_man = jobs_runner.load_manifest(active_worker_id)
+                w_prog = (w_man.get("progress") if w_man else None) or {}
+                running.append({
+                    "job_id": active_worker_id,
+                    "name": str((w_man.get("name") or w_man.get("job_name") or active_worker_id) if w_man else active_worker_id),
+                    "status": "in_progress",
+                    "completed_items": int(w_prog.get("completed_items", 0)),
+                    "total_items": int(w_prog.get("total_items", 0)),
+                })
+
+        return {
+            "primary": primary_info,
+            "integrations": integrations,
+            "integration_focus": int_focus,
+            "running": running,
+        }
+
+    def broadcast_job_focus(self) -> None:
+        """Broadcast current job focus state to all connected WebSocket clients."""
+        self.broadcast_event("job_focus", self.get_job_focus_payload())
+
+    async def _handle_get_job_focus(self, request: web.Request) -> web.Response:
+        """GET /api/jobs/focus - return current primary job and running workers."""
+        if not self._verify_auth(request):
+            return web.Response(text="Unauthorized", status=401)
+        return web.json_response(self.get_job_focus_payload())
+
     # =========================================================================
     # WebSocket Event Stream & Bidirectional Dispatch
     # =========================================================================
@@ -2052,6 +2163,12 @@ class RemoteGatewayServer:
                     "timestamp": c["timestamp"],
                 } for cid, c in self._pending_confirmations.items()]
                 await ws.send_json({"event": "confirmations_list", "confirmations": items})
+
+        # Send initial job focus state (PROJECT_JOBS.md Phase 13.6)
+        try:
+            await ws.send_json({"event": "job_focus", **self.get_job_focus_payload()})
+        except Exception as e:
+            logger.debug("Failed sending initial job_focus to client: %s", e)
 
         try:
             async for msg in ws:
@@ -2154,6 +2271,8 @@ class RemoteGatewayServer:
                                 "details": self.current_task,
                                 "killed": is_killed,
                             })
+                        elif msg_type in ("get_job_focus", "get_focus"):
+                            await ws.send_json({"event": "job_focus", **self.get_job_focus_payload()})
                         elif msg_type == "get_confirmations":
                             with self._confirm_lock:
                                 items = [{
@@ -2414,6 +2533,7 @@ class RemoteGatewayServer:
                 self.agent_loop.register_callback("on_conversation_title_changed", self._on_conversation_title_changed)
                 self.agent_loop.register_callback("on_conversation_changed", self._on_conversation_changed)
                 self.agent_loop.register_callback("on_background_activity", self._on_agent_background_activity)
+                self.agent_loop.register_callback("on_job_focus", self._on_job_focus_changed)
             except Exception as e:
                 logger.debug("Could not register all agent callbacks: %s", e)
 
@@ -2426,6 +2546,7 @@ class RemoteGatewayServer:
             self._app.router.add_get("/api/tags", self._handle_proxy_ollama_tags)
             self._app.router.add_post("/v1/chat/completions", self._handle_proxy_openai_chat)
             self._app.router.add_get("/api/status", self._handle_status)
+            self._app.router.add_get("/api/jobs/focus", self._handle_get_job_focus)
             self._app.router.add_get("/api/models", self._handle_get_models)
             self._app.router.add_post("/api/models", self._handle_post_models)
             self._app.router.add_get("/api/history", self._handle_history)
