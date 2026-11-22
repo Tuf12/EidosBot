@@ -1394,6 +1394,97 @@ class MessageBubble(QFrame):
         menu.exec(event.globalPos())
 
 
+def _is_file_action(title: Optional[str], content: str) -> bool:
+    """File hand-offs stay in the chat. Their path is the thing the user clicks."""
+    if (title or "").strip().lower() == "file":
+        return True
+    return (content or "").lstrip().startswith("Open file:")
+
+
+class ActionGroupWidget(QFrame):
+    """One collapsible block for the action rows in a turn.
+
+    Collapsed, the chat shows a single header. Expanded, the action bubbles
+    are listed underneath it.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._expanded = False
+        self.bubbles: List[MessageBubble] = []
+        self.setObjectName("ActionGroup")
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setStyleSheet(
+            "QFrame#ActionGroup { background-color: #191a21; border: 1px solid #44475a; "
+            "border-radius: 8px; margin: 2px 10px; }\n"
+            f"{GLOBAL_TOOLTIP_STYLE}"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.header = QPushButton(self)
+        self.header.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.header.setFlat(True)
+        self.header.setMinimumWidth(0)
+        self.header.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.header.setStyleSheet(
+            "QPushButton { background-color: transparent; color: #50fa7b; border: none; "
+            "text-align: left; padding: 6px 10px; font-size: 12px; font-weight: 600; } "
+            "QPushButton:hover { color: #f8f8f2; }"
+        )
+        self.header.clicked.connect(self.toggle)
+        layout.addWidget(self.header)
+
+        self.body = QWidget(self)
+        self.body.setMinimumWidth(0)
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(6, 0, 6, 6)
+        self.body_layout.setSpacing(4)
+        self.body.setVisible(False)
+        layout.addWidget(self.body)
+        self._refresh_header()
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def toggle(self) -> None:
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded: bool) -> None:
+        self._expanded = bool(expanded)
+        self.body.setVisible(self._expanded)
+        self._refresh_header()
+
+    def add_bubble(self, bubble: MessageBubble) -> None:
+        self.bubbles.append(bubble)
+        self.body_layout.addWidget(bubble)
+        self._refresh_header()
+
+    def remove_bubble(self, bubble: MessageBubble) -> None:
+        if bubble in self.bubbles:
+            self.bubbles.remove(bubble)
+        self.body_layout.removeWidget(bubble)
+        self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        count = len(self.bubbles)
+        arrow = "▼" if self._expanded else "▶"
+        latest = ""
+        if self.bubbles:
+            title = (self.bubbles[-1].title or "action").replace(" (Completed)", "").strip()
+            if len(title) > 42:
+                title = title[:39] + "..."
+            latest = f"  ·  {title}"
+        self.header.setText(f"{arrow}  Actions ({count}){latest}")
+        names = [(bubble.title or "action").strip() for bubble in self.bubbles]
+        self.header.setToolTip("Show actions" if not self._expanded else "Hide actions")
+        if names:
+            self.header.setToolTip(self.header.toolTip() + "\n" + "\n".join(names))
+
+
 class ChatHistoryWidget(QScrollArea):
     """Scrollable chat history container hosting MessageBubble elements."""
 
@@ -1408,6 +1499,7 @@ class ChatHistoryWidget(QScrollArea):
         super().__init__(parent)
         self._message_count = 0
         self.bubbles: list[MessageBubble] = []
+        self._action_group: Optional[ActionGroupWidget] = None
         self._init_ui()
 
     def _init_ui(self):
@@ -1481,13 +1573,44 @@ class ChatHistoryWidget(QScrollArea):
         title: Optional[str] = None,
         message_id: Optional[str] = None,
     ) -> MessageBubble:
-        """Add a new message bubble to the chat history and auto-scroll to bottom."""
+        """Add a new message bubble to the chat history and auto-scroll to bottom.
+
+        Tool actions in one turn share a single collapsed block. A reply, error,
+        or new user message ends that block. A shared file stays in the chat
+        so its path can be opened without expanding the block.
+        """
         if self.welcome_widget and self.welcome_widget.isVisible():
             self.welcome_widget.hide()
 
         # Remove bottom spacer before adding widget
         self.layout_messages.removeItem(self.spacer)
 
+        if role in ("user", "assistant", "error"):
+            self._action_group = None
+
+        bubble = self._create_bubble(role, content, title, message_id)
+        if role == "tool" and not _is_file_action(title, content):
+            self._ensure_action_group().add_bubble(bubble)
+        else:
+            self.layout_messages.addWidget(bubble)
+
+        self._fit_container_width()
+        self._message_count = len(self.bubbles)
+
+        # Re-add bottom spacer
+        self.layout_messages.addItem(self.spacer)
+
+        # Auto-scroll to bottom
+        QTimer.singleShot(50, self.scroll_to_bottom)
+        return bubble
+
+    def _create_bubble(
+        self,
+        role: str,
+        content: str,
+        title: Optional[str],
+        message_id: Optional[str],
+    ) -> MessageBubble:
         bubble = MessageBubble(
             role=role,
             content=content,
@@ -1501,18 +1624,17 @@ class ChatHistoryWidget(QScrollArea):
         bubble.signal_copy_to_input.connect(self.signal_copy_to_input.emit)
         bubble.signal_delete_requested.connect(self._handle_bubble_delete)
         bubble.signal_link_clicked.connect(self.signal_link_clicked.emit)
-
         self.bubbles.append(bubble)
-        self.layout_messages.addWidget(bubble)
-        self._fit_container_width()
-        self._message_count = len(self.bubbles)
-
-        # Re-add bottom spacer
-        self.layout_messages.addItem(self.spacer)
-
-        # Auto-scroll to bottom
-        QTimer.singleShot(50, self.scroll_to_bottom)
         return bubble
+
+    def _ensure_action_group(self) -> ActionGroupWidget:
+        """Reuse the open action block, or start one at the bottom of the chat."""
+        if self._action_group is not None:
+            return self._action_group
+        group = ActionGroupWidget(self.container)
+        self._action_group = group
+        self.layout_messages.addWidget(group)
+        return group
 
     def _handle_bubble_retry(self, text: str):
         """Dispatch retry request, finding preceding user prompt if sender is assistant/error."""
@@ -1539,7 +1661,18 @@ class ChatHistoryWidget(QScrollArea):
         msg_id = getattr(bubble, "message_id", "")
         if bubble in self.bubbles:
             self.bubbles.remove(bubble)
-        self.layout_messages.removeWidget(bubble)
+        host = bubble.parentWidget()
+        while host is not None and not isinstance(host, ActionGroupWidget):
+            host = host.parentWidget()
+        if isinstance(host, ActionGroupWidget):
+            host.remove_bubble(bubble)
+            if not host.bubbles:
+                if self._action_group is host:
+                    self._action_group = None
+                self.layout_messages.removeWidget(host)
+                host.deleteLater()
+        else:
+            self.layout_messages.removeWidget(bubble)
         bubble.deleteLater()
         self._message_count = len(self.bubbles)
         if len(self.bubbles) == 0 and self.welcome_widget:
@@ -1548,6 +1681,7 @@ class ChatHistoryWidget(QScrollArea):
 
     def clear_messages(self):
         """Remove all message bubbles and restore welcome card."""
+        self._action_group = None
         for b in self.bubbles:
             b.deleteLater()
         self.bubbles.clear()
