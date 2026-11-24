@@ -10,6 +10,17 @@ from eidos.safety.risk_classifier import RiskClassifier, RiskLevel
 
 logger = logging.getLogger(__name__)
 
+
+def run_was_cancelled(agent: Any) -> bool:
+    """True when the user stopped the task or tripped the kill switch."""
+    if agent is None:
+        return False
+    kill = getattr(agent, "kill_switch", None)
+    if kill is not None and getattr(kill, "is_triggered", lambda: False)():
+        return True
+    stop = getattr(agent, "is_stop_requested", None)
+    return bool(callable(stop) and stop())
+
 PROFILE_MEMORY_ACTIONS = frozenset({
     "update_user_profile",
     "add_workflow_rule",

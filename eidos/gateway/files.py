@@ -38,6 +38,10 @@ _EXTRA_MIME = {
     ".rst": "text/plain",
     ".sh": "text/plain",
     ".txt": "text/plain",
+    ".mp4": "video/mp4",
+    ".m4v": "video/mp4",
+    ".webm": "video/webm",
+    ".ogv": "video/ogg",
 }
 
 
@@ -65,6 +69,27 @@ def safe_filename(name: str) -> str:
     base = os.path.basename(name or "").replace("\x00", "").strip()
     base = re.sub(r"[^\w.\- ()]", "_", base).strip("._ ")
     return (base or "file")[:180]
+
+
+def attachment_prompt(
+    message: str,
+    records: List[Dict[str, Any]],
+    observation: str = "",
+) -> str:
+    """User-visible prompt that also tells the agent where the uploads landed."""
+    lines: List[str] = []
+    text = (message or "").strip()
+    lines.append(text or "Please read the attached files and respond.")
+    if records:
+        lines.append("")
+        lines.append("Attached files:")
+        for rec in records:
+            lines.append(f"- {rec.get('name')}: {rec.get('path')}")
+    extra = (observation or "").strip()
+    if extra:
+        lines.append("")
+        lines.append(extra)
+    return "\n".join(lines)
 
 
 class SharedFileRegistry:

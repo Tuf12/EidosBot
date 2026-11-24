@@ -29,3 +29,11 @@ These 4 modules systematically complete the four cognitive capabilities required
 **Updated job concept.** Surroundings also mean the primary project job and any attached integration. Vector hits from another job are dropped. A shared entity may still surface that other job's episode. The other job's files and tools stay unloaded. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 13.
 
 **Updated job concept (groups).** The integration in scope may be inherited from the group folder above the leaf job. See [PROJECT_JOBS.md](../PROJECT_JOBS.md) section 14.
+
+---
+
+## Other specifications
+
+| Document | Title | Component Target | Core Focus |
+|---|---|---|---|
+| [`SPEC_LIVE_CONVERSATION.md`](SPEC_LIVE_CONVERSATION.md) | **Live Conversation (Hands-Free Voice)** | `eidos/voice/live_conversation.py`, desktop pill, web chat | Hands-free turns on the existing Parakeet and Kokoro path, shared by the desktop app and the web app, with the first sentence spoken while the task is still running. |

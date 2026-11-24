@@ -21,7 +21,7 @@ import uuid
 
 from aiohttp import web, WSMsgType
 
-from eidos.gateway.files import SharedFileRegistry, content_disposition
+from eidos.gateway.files import SharedFileRegistry, attachment_prompt, content_disposition, guess_mime
 from eidos.gateway.model_settings import apply_model_settings, describe_model_settings
 from eidos.gateway.llm_proxy import (
     handle_llm_health,
@@ -29,6 +29,7 @@ from eidos.gateway.llm_proxy import (
     handle_proxy_tags,
 )
 from eidos.perception.screen import ScreenCapture
+from eidos.safety.gatekeeper import run_was_cancelled
 from eidos.safety.risk_classifier import RiskLevel
 from eidos.gateway.tts_live import MAX_TEXT_CHARS, LiveTtsHub, valid_session_id
 from eidos.voice.voices import DEFAULT_VOICE_ID, list_voices
@@ -1541,14 +1542,19 @@ class RemoteGatewayServer:
                     logger.debug("Text read failed for %s: %s", path, exc)
                     return web.json_response({"ok": False, "error": f"Could not read file text: {exc}"}, status=500)
 
-        return web.FileResponse(
-            path,
-            headers={
-                "Content-Disposition": content_disposition(str(record.get("name") or path.name), download),
-                "Cache-Control": "no-cache",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
+        headers = {
+            "Content-Disposition": content_disposition(str(record.get("name") or path.name), download),
+            "Cache-Control": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        }
+        # A stored application/octet-stream would block playback under nosniff.
+        mime = guess_mime(str(path))
+        stored = str(record.get("mime") or "")
+        if stored and stored != "application/octet-stream":
+            mime = stored
+        if mime and mime != "application/octet-stream":
+            headers["Content-Type"] = mime
+        return web.FileResponse(path, headers=headers)
 
     async def _handle_upload_files(self, request: web.Request) -> web.Response:
         """Accept files from the web app, save them, and start a task that can read them."""
@@ -1592,22 +1598,10 @@ class RemoteGatewayServer:
         if not saved:
             return web.json_response({"ok": False, "error": "No file was uploaded"}, status=400)
 
-        prompt = self._attachment_prompt(message, saved)
+        prompt = attachment_prompt(message, saved)
         self.dispatch_task(prompt, speak_on_host=False)
         public = [{key: value for key, value in rec.items() if key != "already_shared"} for rec in saved]
         return web.json_response({"ok": True, "files": public, "prompt": prompt})
-
-    @staticmethod
-    def _attachment_prompt(message: str, records: List[Dict[str, Any]]) -> str:
-        """User-visible prompt that also tells the agent where the uploads landed."""
-        lines: List[str] = []
-        text = (message or "").strip()
-        lines.append(text or "Please read the attached files and respond.")
-        lines.append("")
-        lines.append("Attached files:")
-        for rec in records:
-            lines.append(f"- {rec.get('name')}: {rec.get('path')}")
-        return "\n".join(lines)
 
     # =========================================================================
     # Task Dispatch & Agent Controls
@@ -1701,12 +1695,7 @@ class RemoteGatewayServer:
                 self.agent_loop.voice.stop_speaking()
             except Exception:
                 pass
-        # Unblock any pending confirmations as denied
-        with self._confirm_lock:
-            for cid, record in list(self._pending_confirmations.items()):
-                record["approved"] = False
-                record["allowlist"] = False
-                record["event"].set()
+        self._abandon_pending_confirmations()
 
         is_killed = False
         if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
@@ -1736,12 +1725,7 @@ class RemoteGatewayServer:
                 self.agent_loop.voice.stop_speaking()
             except Exception:
                 pass
-        # Unblock any pending confirmations as denied
-        with self._confirm_lock:
-            for cid, record in list(self._pending_confirmations.items()):
-                record["approved"] = False
-                record["allowlist"] = False
-                record["event"].set()
+        self._abandon_pending_confirmations()
 
         self.current_state = "killed"
         self.broadcast_event("status_change", {"state": "killed", "details": "Emergency stop tripped remotely!", "killed": True})
@@ -2318,19 +2302,50 @@ class RemoteGatewayServer:
         if telegram_gw is not None and hasattr(telegram_gw, "set_confirmation_resolver"):
             telegram_gw.set_confirmation_resolver(self.resolve_confirmation)
 
+    def _abandon_pending_confirmations(self) -> None:
+        """Release every open approval because the task was stopped or killed."""
+        released: List[Tuple[str, Tuple[bool, bool]]] = []
+        with self._confirm_lock:
+            for cid, record in list(self._pending_confirmations.items()):
+                result = record.get("result")
+                if not isinstance(result, tuple):
+                    result = (False, False)
+                    record["result"] = result
+                event = record.get("event")
+                if event is not None:
+                    event.set()
+                self._pending_confirmations.pop(cid, None)
+                released.append((cid, result))
+
+        for cid, result in released:
+            approved, allowlist = result
+            self.broadcast_event("confirmation_resolved", {"id": cid, "result": result})
+            tg = self._telegram_gw
+            if tg is not None and hasattr(tg, "finalize_confirmation_card"):
+                try:
+                    tg.finalize_confirmation_card(cid, approved, allowlist)
+                except Exception as e:
+                    logger.debug("Telegram confirmation finalize failed: %s", e)
+            ui = self._desktop_ui
+            if ui is not None and hasattr(ui, "dismiss_gateway_confirmation"):
+                try:
+                    ui.dismiss_gateway_confirmation(cid)
+                except Exception as e:
+                    logger.debug("Desktop confirmation dismiss failed: %s", e)
+
     def request_confirmation(
         self,
         action_type: str,
         details: Dict[str, Any],
         risk_level: int,
         reason: str,
-        timeout_seconds: float = 120.0,
         cancel_event: Optional[threading.Event] = None,
         on_registered: Optional[Callable[[str], None]] = None,
     ) -> Optional[Tuple[bool, bool]]:
-        """
-        Register a confirmation request and wait for remote resolution.
-        Returns (approved, remember) or None if timed out.
+        """Register an approval and wait until the user decides.
+
+        The request stays pending across disconnects. Coming back to the app
+        still shows it. Stop and the kill switch are the only automatic ends.
         """
         cid = str(uuid.uuid4())[:8]
         event = threading.Event()
@@ -2362,20 +2377,23 @@ class RemoteGatewayServer:
             except Exception as e:
                 logger.error("Confirmation on_registered hook failed: %s", e)
 
-        logger.info("Registered remote confirmation request %s (waiting up to %.1fs)", cid, timeout_seconds)
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            if event.is_set() or (cancel_event and cancel_event.is_set()):
+        logger.info("Registered confirmation %s; waiting for the user to approve or reject", cid)
+        while not event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
                 break
-            time.sleep(0.05)
+            if run_was_cancelled(self.agent_loop):
+                self._abandon_pending_confirmations()
+                break
+            event.wait(0.5)
 
         with self._confirm_lock:
             res = record.get("result")
             self._pending_confirmations.pop(cid, None)
-
-        if res is None:
-            self.broadcast_event("confirmation_resolved", {"id": cid, "result": res})
-        return res if event.is_set() and res is not None else None
+        if isinstance(res, tuple):
+            return res
+        if run_was_cancelled(self.agent_loop):
+            return False, False
+        return None
 
     def resolve_confirmation(self, request_id: str, approved: bool, allowlist: bool = False) -> bool:
         """Resolve a pending confirmation request by id."""
@@ -2433,11 +2451,6 @@ class RemoteGatewayServer:
             if not self.is_running():
                 return False, False
 
-            safety_cfg = {}
-            if hasattr(self.agent_loop, "config") and isinstance(self.agent_loop.config, dict):
-                safety_cfg = self.agent_loop.config.get("safety", {}) or {}
-            timeout_seconds = float(safety_cfg.get("confirmation_timeout_seconds", 120))
-
             def on_registered(cid: str) -> None:
                 ui = self._desktop_ui
                 if ui is not None and hasattr(ui, "request_gateway_confirmation"):
@@ -2456,64 +2469,11 @@ class RemoteGatewayServer:
                 details,
                 int(risk_level),
                 reason,
-                timeout_seconds=timeout_seconds,
                 on_registered=on_registered,
             )
             return res if res is not None else (False, False)
 
         return unified_callback
-
-    def create_composite_confirmation_callback(
-        self, desktop_callback: Optional[Callable[..., Tuple[bool, bool]]] = None
-    ) -> Callable[..., Tuple[bool, bool]]:
-        """
-        Creates a dual-channel confirmation callback:
-        Presents the confirmation on both Desktop GUI modal AND Remote Mobile Gateway.
-        Whichever responds first decides the outcome!
-        """
-        def dual_callback(
-            action_type: str, details: Dict[str, Any], risk_level: RiskLevel, reason: str
-        ) -> Tuple[bool, bool]:
-            outcome_queue: List[Tuple[bool, bool]] = []
-            done_event = threading.Event()
-
-            # 1. Spawn Desktop Prompt in background thread
-            def _desktop():
-                if desktop_callback:
-                    try:
-                        approved, remember = desktop_callback(action_type, details, risk_level, reason)
-                        if not done_event.is_set():
-                            outcome_queue.append((approved, remember))
-                            done_event.set()
-                    except Exception as e:
-                        logger.error("Error in desktop confirmation: %s", e)
-
-            # 2. Spawn Remote Gateway Prompt in background thread
-            def _remote():
-                try:
-                    res = self.request_confirmation(
-                        action_type, details, int(risk_level), reason, timeout_seconds=180.0, cancel_event=done_event
-                    )
-                    if res is not None and not done_event.is_set():
-                        outcome_queue.append(res)
-                        done_event.set()
-                except Exception as e:
-                    logger.error("Error in remote confirmation: %s", e)
-
-            t_desk = threading.Thread(target=_desktop, daemon=True)
-            t_rem = threading.Thread(target=_remote, daemon=True)
-            t_desk.start()
-            t_rem.start()
-
-            done_event.wait(timeout=180.0)
-
-            if outcome_queue:
-                return outcome_queue[0]
-
-            logger.warning("Dual confirmation timed out without approval.")
-            return False, False
-
-        return dual_callback
 
     def start(self):
         """Start the remote gateway server in a background daemon thread."""

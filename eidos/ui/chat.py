@@ -14,7 +14,17 @@ import urllib.parse
 import webbrowser
 
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QAction, QColor, QDesktopServices, QFont, QSyntaxHighlighter, QTextCharFormat
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QImageReader,
+    QPixmap,
+    QSyntaxHighlighter,
+    QTextCharFormat,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -30,9 +40,28 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from eidos.ui.attachments import attached_image_paths
 from eidos.ui.styles import GLOBAL_TOOLTIP_STYLE
 
 logger = logging.getLogger(__name__)
+
+
+def _chat_image_preview(path: str) -> Optional[QPixmap]:
+    """Scaled thumbnail for a photo the user attached in chat."""
+    try:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        size = reader.size()
+        if size.isValid() and not size.isEmpty():
+            size.scale(220, 140, Qt.AspectRatioMode.KeepAspectRatio)
+            reader.setScaledSize(size)
+        image = reader.read()
+    except Exception as exc:
+        logger.debug("Could not preview chat image %s: %s", path, exc)
+        return None
+    if image.isNull():
+        return None
+    return QPixmap.fromImage(image)
 
 
 def _launch_external_url(url: str) -> bool:
@@ -1188,6 +1217,8 @@ class MessageBubble(QFrame):
             return
 
         # Assistant or User message with rich markdown and code blocks
+        if self.role == "user":
+            self._add_attachment_previews(text)
         segments = parse_markdown_segments(text)
         self.code_snippets = [seg["code"] for seg in segments if seg.get("type") == "code"]
 
@@ -1262,6 +1293,39 @@ class MessageBubble(QFrame):
             else:
                 self.content_label.setTextFormat(Qt.TextFormat.PlainText)
             self.content_label.setText(text)
+
+    def _add_attachment_previews(self, text: str) -> None:
+        """Show thumbnails for photos listed in an attachment prompt."""
+        paths = attached_image_paths(text)
+        if not paths:
+            return
+        row_widget = QWidget(self.content_container)
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        shown = False
+        for path in paths:
+            preview = _chat_image_preview(path)
+            if preview is None:
+                continue
+            button = QPushButton(row_widget)
+            button.setIcon(QIcon(preview))
+            button.setIconSize(preview.size())
+            button.setFixedSize(preview.width() + 8, preview.height() + 8)
+            button.setToolTip(path)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(
+                "QPushButton { background: #1e1f29; border: 1px solid #44475a; border-radius: 6px; } "
+                "QPushButton:hover { border-color: #bd93f9; }"
+            )
+            button.clicked.connect(lambda _checked=False, target=path: open_chat_link(target))
+            row.addWidget(button)
+            shown = True
+        if not shown:
+            row_widget.deleteLater()
+            return
+        row.addStretch(1)
+        self.content_layout.addWidget(row_widget)
 
     def _tool_markup(self, text: str) -> str:
         escaped = html.escape(text, quote=False)
@@ -1558,8 +1622,8 @@ class ChatHistoryWidget(QScrollArea):
 
         desc = QLabel(
             "Welcome! Ask a question or give a desktop task below.<br/>"
-            "I can interact with windows, execute shell commands, read screens, "
-            "and answer system queries."
+            "Paste a photo into the message box, or attach a file, and I can look at it.<br/>"
+            "I can also interact with windows, execute shell commands, and read screens."
         )
         desc.setWordWrap(True)
         desc.setStyleSheet("color: #6272a4; font-size: 12px; line-height: 1.4;")

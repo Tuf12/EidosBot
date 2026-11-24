@@ -456,7 +456,7 @@ def cli_entrypoint():
         "--steps",
         type=int,
         default=None,
-        help="Maximum cycle steps per task (default: agent.max_steps, or 50)",
+        help="Optional hard cap on cycle steps for this run. Omit it and the task runs until it finishes, stalls, or hits the safety fuse.",
     )
     parser.add_argument("--gui", action="store_true", help="Launch PyQt6 Desktop HUD and Floating Pill")
     parser.add_argument("--cli", action="store_true", help="Force headless CLI mode")

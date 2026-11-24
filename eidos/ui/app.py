@@ -6,8 +6,7 @@ import os
 import queue
 import re
 import threading
-import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication
@@ -16,7 +15,13 @@ from eidos.core.loop import AgentLoop
 from eidos.safety.allowlist import AllowlistManager
 from eidos.safety.kill_switch import KillSwitch
 from eidos.safety.risk_classifier import RiskLevel
+from eidos.gateway.files import attachment_prompt
 from eidos.ui.allowlist_dialog import AllowlistManagerDialog
+from eidos.ui.attachments import (
+    is_image_record,
+    observe_attached_images,
+    save_chat_attachments,
+)
 from eidos.ui.conversations_dialog import ConversationsDialog
 from eidos.ui.dialogs import ConfirmationDialog
 from eidos.ui.hud import HUDOverlay
@@ -82,6 +87,7 @@ class UIController(QObject):
         self._agent_loop: Optional[AgentLoop] = None
         self._telegram_gw = None
         self._remote_gw = None
+        self._local_files = None
         self._active_task_prompt: Optional[str] = None
 
         self._connect_signals()
@@ -325,11 +331,13 @@ class UIController(QObject):
         """Start a fresh conversation thread and update chat UI."""
         if self._agent_loop is None:
             self.pill.chat_history.clear_messages()
+            self.pill.clear_attachments()
             self.pill.set_conversation_title("New Chat")
             self.pill.set_status("idle", "New chat started")
             return
 
         new_id = self._agent_loop.start_new_conversation(title="New Chat")
+        self.pill.clear_attachments()
         self.pill.load_conversation_messages(new_id, "New Chat", [])
         self.pill.set_status("idle", "Started new conversation")
 
@@ -345,6 +353,7 @@ class UIController(QObject):
             conv = store.get_conversation(conv_id)
             title = conv.get("title", "New Chat") if conv else "New Chat"
             messages = store.get_messages(conv_id)
+            self.pill.clear_attachments()
             self.pill.load_conversation_messages(conv_id, title, messages)
             if not self.pill.is_expanded:
                 self.pill.expand_chat()
@@ -515,36 +524,17 @@ class UIController(QObject):
             self.pill.signal_set_status.emit("confirming", f"Confirm: {action_type}")
             self.signal_prompt_confirmation.emit(action_type, details, int(risk_level), reason)
 
-            timeout_seconds = float(
-                self.config.get("safety", {}).get("confirmation_timeout_seconds", 120)
-            )
-            deadline = time.monotonic() + timeout_seconds
             while True:
                 if self.kill_switch.is_triggered():
-                    logger.warning("Confirmation auto-denied: kill switch active")
+                    logger.warning("Confirmation denied: kill switch active")
                     return False, False
-
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "Confirmation timed out after %.0fs for action '%s'",
-                        timeout_seconds,
-                        action_type,
-                    )
-                    self.pill.signal_set_status.emit(
-                        "error",
-                        f"Confirmation timed out ({int(timeout_seconds)}s)",
-                    )
-                    self.signal_chat_error.emit(
-                        f"Action confirmation timed out after {int(timeout_seconds)} seconds. "
-                        "Look for the confirmation dialog or reset the kill switch and try again."
-                    )
+                agent = self._agent_loop
+                if agent is not None and getattr(agent, "is_stop_requested", lambda: False)():
+                    logger.info("Confirmation ended because the task was stopped")
                     return False, False
 
                 try:
-                    approved, remember = self._confirm_result_queue.get(
-                        timeout=min(1.0, remaining)
-                    )
+                    approved, remember = self._confirm_result_queue.get(timeout=0.5)
                     return approved, remember
                 except queue.Empty:
                     continue
@@ -742,7 +732,7 @@ class UIController(QObject):
         if not voice_cfg.get("auto_submit_transcription", True):
             return
         logger.info("Auto-submitting transcribed speech as chat turn.")
-        self.start_task_in_background(cleaned)
+        self.start_task_in_background(cleaned, self.pill.attachment_payload())
 
     @pyqtSlot(bool)
     def _on_toggle_auto_speak(self, enabled: bool):
@@ -873,8 +863,25 @@ class UIController(QObject):
         """Return True when a background agent task thread is still active."""
         return self._agent_thread is not None and self._agent_thread.is_alive()
 
-    def start_task_in_background(self, task_prompt: str):
+    def _shared_files(self):
+        """Inbox registry shared with the web app when the gateway is running."""
+        gateway = self._remote_gw
+        registry = getattr(gateway, "files", None) if gateway is not None else None
+        if registry is not None:
+            return registry
+        if self._local_files is None:
+            from eidos.gateway.files import SharedFileRegistry
+
+            self._local_files = SharedFileRegistry()
+        return self._local_files
+
+    def _conversation_id(self) -> str:
+        raw = getattr(self._agent_loop, "active_conversation_id", None)
+        return str(raw) if raw else ""
+
+    def start_task_in_background(self, task_prompt: str, attachments: Any = None):
         """Run an agent task in a dedicated worker thread so GUI remains responsive."""
+        pending = list(attachments or [])
         if self._agent_loop is None:
             logger.error("No AgentLoop registered with UIController.")
             self.signal_chat_error.emit("Error: AgentLoop is not registered with UIController.")
@@ -907,21 +914,69 @@ class UIController(QObject):
             self.pill.set_status("killed", "Reset kill switch to continue")
             return
 
+        user_text = (task_prompt or "").strip()
+        records: List[Dict[str, Any]] = []
+        if pending:
+            try:
+                records = save_chat_attachments(
+                    self._shared_files(),
+                    pending,
+                    self._conversation_id(),
+                )
+            except Exception as exc:
+                logger.warning("Desktop attachment save failed: %s", exc)
+                self.pill.set_attach_notice(str(exc))
+                self.signal_chat_error.emit(f"Could not attach files: {exc}")
+                return
+
+        if records:
+            base_prompt = attachment_prompt(user_text, records)
+            if any(not is_image_record(rec) for rec in records):
+                base_prompt += "\n\nRead the attached files from the paths above before you answer."
+        else:
+            base_prompt = user_text
+        if not base_prompt:
+            return
+
         if self._agent_loop is not None and hasattr(self._agent_loop, "voice") and self._agent_loop.voice:
             try:
                 self._agent_loop.voice.stop_speaking()
             except Exception:
                 pass
 
+        image_records = [rec for rec in records if is_image_record(rec)]
+        status_line = user_text or "Attached files"
         self.pill.clear_prompt()
-        self.pill.set_status("thinking", f"Task: {task_prompt}")
+        self.pill.clear_attachments(delete_staged=False)
+        self.pill.set_attach_notice("")
+        if image_records:
+            self.pill.set_status("perceiving", "Looking at attached photos...")
+        else:
+            self.pill.set_status("thinking", f"Task: {status_line[:120]}")
+            self.signal_chat_user_message.emit(base_prompt)
         self.signal_task_running.emit(True)
-        self.signal_chat_user_message.emit(task_prompt)
-        self._active_task_prompt = task_prompt
+        self._active_task_prompt = status_line
 
         def worker():
+            prompt = base_prompt
             try:
-                res = self._agent_loop.run_task(task_prompt)
+                if image_records:
+                    try:
+                        notes = observe_attached_images(
+                            getattr(self._agent_loop, "router", None),
+                            image_records,
+                            user_text,
+                        )
+                    except Exception as exc:
+                        logger.warning("Attached image viewing failed: %s", exc)
+                        notes = f"Vision notes: could not view the attached photos ({exc})."
+                    if notes:
+                        prompt = attachment_prompt(user_text, records, notes)
+                        if any(not is_image_record(rec) for rec in records):
+                            prompt += "\n\nRead the attached files from the paths above before you answer."
+                    self.signal_chat_user_message.emit(prompt)
+                    self.pill.signal_set_status.emit("thinking", f"Task: {status_line[:120]}")
+                res = self._agent_loop.run_task(prompt)
                 summary = res.get("summary", "")
                 if res.get("stopped"):
                     self.pill.signal_set_status.emit("idle", "Task stopped by user")

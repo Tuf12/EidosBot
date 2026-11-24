@@ -2,7 +2,7 @@
 # Copy to config.yaml and customize for your local setup
 
 agent:
-  max_steps: 50                  # Sense/act cycles per task. Desktop work needs more than a short reply.
+  safety_step_fuse: 400          # Backstop only. Desktop tasks stop when an action stalls, not at a step budget.
 
 models:
   provider_preference: "local"     # Options: "local", "cloud", "auto"
@@ -112,7 +112,7 @@ scheduling:
   missed_policy: fire_once       # drop | fire_once | fire_immediately_on_startup
   agent_turn_on_fire:
     enabled: true
-    max_steps: 15
+    max_steps: 15                 # Cap for an unattended timer turn. Foreground chat does not use this.
     require_confirmation: false
     defer_while_foreground_busy: true
     defer_seconds: 120.0

@@ -3,24 +3,48 @@
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QIcon, QKeySequence, QPainter, QShortcut
+from PyQt6.QtGui import (
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QImage,
+    QImageReader,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
 from PyQt6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizeGrip,
     QSizePolicy,
     QStyle,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
+)
+
+from eidos.ui.attachments import (
+    MAX_ATTACHMENTS,
+    discard_staged,
+    is_image_path,
+    pasted_image_name,
+    pending_from_path,
+    staging_path,
 )
 
 from eidos.ui.chat import ChatHistoryWidget
@@ -52,12 +76,83 @@ PROMPT_STYLE = (
     "QPlainTextEdit:focus { border: 1px solid #bd93f9; }"
 )
 
+PROMPT_PLACEHOLDER = (
+    "Ask EidosBot... paste a photo or attach a file (Shift+Enter for a new line)"
+)
+
+_SIDE_BUTTON_STYLE = (
+    "QPushButton { background-color: #282a36; color: #f8f8f2; "
+    "border: 1px solid #44475a; border-radius: 6px; padding: 6px 10px; font-size: 13px; } "
+    "QPushButton:hover { background-color: #44475a; border-color: #50fa7b; }"
+)
+
+
+def _local_file_paths(mime) -> List[str]:
+    """Local files carried by a clipboard or drop payload."""
+    if mime is None or not mime.hasUrls():
+        return []
+    paths: List[str] = []
+    for url in mime.urls():
+        if not url.isLocalFile():
+            continue
+        path = url.toLocalFile()
+        if path:
+            paths.append(path)
+    return paths
+
+
+# PyQt6 QMimeData.hasFormat/data take str. bytes used to raise TypeError inside
+# insertFromMimeData, and an exception there segfaults the process.
+_IMAGE_MIME_TYPES = ("image/png", "image/jpeg", "image/jpg", "image/webp", "image/bmp")
+
+
+def _qimage_from_mime(mime) -> Optional[QImage]:
+    """Image pixels from a clipboard or drop payload."""
+    if mime is None:
+        return None
+    try:
+        if mime.hasImage():
+            raw = mime.imageData()
+            image = raw if isinstance(raw, QImage) else QImage(raw)
+            if image is not None and not image.isNull():
+                return image
+    except Exception:
+        logger.debug("Clipboard image decode failed", exc_info=True)
+    for fmt in _IMAGE_MIME_TYPES:
+        try:
+            if not mime.hasFormat(fmt):
+                continue
+            image = QImage()
+            if image.loadFromData(bytes(mime.data(fmt))):
+                return image
+        except Exception:
+            logger.debug("Clipboard format %s skipped", fmt, exc_info=True)
+    return None
+
+
+def _preview_pixmap(path: str, edge: int = 28) -> Optional[QPixmap]:
+    """Small thumbnail for an image file. Other files return None."""
+    if not is_image_path(path):
+        return None
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and not size.isEmpty():
+        size.scale(edge, edge, Qt.AspectRatioMode.KeepAspectRatio)
+        reader.setScaledSize(size)
+    image = reader.read()
+    if image.isNull():
+        return None
+    return QPixmap.fromImage(image)
+
 
 class AutoGrowPromptEdit(QPlainTextEdit):
     """Multi-line prompt that grows with content (same behavior as web ChatView textarea)."""
 
     submit_requested = pyqtSignal()
     height_changed = pyqtSignal()
+    image_pasted = pyqtSignal(QImage)
+    files_pasted = pyqtSignal(list)
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -68,6 +163,7 @@ class AutoGrowPromptEdit(QPlainTextEdit):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.setTabChangesFocus(True)
+        self.setAcceptDrops(True)
         self.setStyleSheet(PROMPT_STYLE)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.document().setDocumentMargin(2)
@@ -100,9 +196,15 @@ class AutoGrowPromptEdit(QPlainTextEdit):
         if int(doc.textWidth()) != width:
             doc.setTextWidth(width)
         content = 0.0
+        # The box never grows past _max_height, so stop once the text is
+        # already taller than that. Laying out every line of a long script
+        # on the paste event freezes the window.
+        limit = float(self._max_height())
         block = doc.begin()
         while block.isValid():
             content += layout.blockBoundingRect(block).height()
+            if content >= limit:
+                break
             block = block.next()
         margins = self.contentsMargins()
         chrome = margins.top() + margins.bottom() + int(doc.documentMargin() * 2) + 8
@@ -141,10 +243,94 @@ class AutoGrowPromptEdit(QPlainTextEdit):
             return
         super().keyPressEvent(event)
 
+    def insertFromMimeData(self, source):
+        """Paste a copied photo or copied files instead of dumping them as text.
+
+        A raised exception here is fatal: PyQt aborts the process while it is
+        still inside the paste event. Probe failures fall back to plain text.
+        """
+        paths: List[str] = []
+        image = None
+        try:
+            paths = _local_file_paths(source)
+            image = None if paths else _qimage_from_mime(source)
+        except Exception:
+            logger.exception("Paste payload could not be inspected; inserting text")
+        if image is not None:
+            self.image_pasted.emit(image)
+            return
+        if paths:
+            self.files_pasted.emit(paths)
+            return
+        super().insertFromMimeData(source)
+
+    def dragEnterEvent(self, event):
+        if _local_file_paths(event.mimeData()) or _qimage_from_mime(event.mimeData()) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        paths = _local_file_paths(mime)
+        if paths:
+            self.files_pasted.emit(paths)
+            event.acceptProposedAction()
+            return
+        image = _qimage_from_mime(mime)
+        if image is not None:
+            self.image_pasted.emit(image)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
     def clear(self) -> None:
         super().clear()
         self._apply_height(self._min_height())
         self.height_changed.emit()
+
+
+class AttachmentChip(QFrame):
+    """One pending file or photo sitting above the message box."""
+
+    remove_requested = pyqtSignal(str)
+
+    def __init__(
+        self,
+        item_id: str,
+        name: str,
+        preview: Optional[QPixmap] = None,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.item_id = item_id
+        self.setStyleSheet(
+            "QFrame { background-color: #282a36; border: 1px solid #44475a; border-radius: 6px; }"
+        )
+        row = QHBoxLayout(self)
+        row.setContentsMargins(4, 2, 2, 2)
+        row.setSpacing(4)
+        if preview is not None and not preview.isNull():
+            thumb = QLabel()
+            thumb.setPixmap(preview)
+            thumb.setFixedSize(preview.size())
+            thumb.setStyleSheet("border: none; background: transparent;")
+            row.addWidget(thumb)
+        shown = name if len(name) <= 28 else name[:25] + "…"
+        label = QLabel(shown)
+        label.setToolTip(name)
+        label.setStyleSheet("color: #f8f8f2; font-size: 11px; border: none; background: transparent;")
+        row.addWidget(label)
+        button = QPushButton("✕")
+        button.setFixedSize(18, 18)
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip("Remove attachment")
+        button.setStyleSheet(
+            "QPushButton { background: transparent; color: #6272a4; border: none; font-size: 11px; } "
+            "QPushButton:hover { color: #ff5555; }"
+        )
+        button.clicked.connect(lambda: self.remove_requested.emit(self.item_id))
+        row.addWidget(button)
 
 
 class ElidedLabel(QLabel):
@@ -224,7 +410,7 @@ class StatusPill(QWidget):
     # Signals
     signal_set_status = pyqtSignal(str, str)  # status_key, message
     signal_set_background_activity = pyqtSignal(bool, str, str)  # active, task, details
-    signal_submit_task = pyqtSignal(str)  # user prompt
+    signal_submit_task = pyqtSignal(str, object)  # prompt text, attachment payloads
     signal_stop_task = pyqtSignal()  # stop active task / generation
     signal_retry_task = pyqtSignal(str)  # retry task prompt
     signal_replay_tts = pyqtSignal(str)  # replay TTS audio
@@ -278,6 +464,8 @@ class StatusPill(QWidget):
         self._tray_menu: Optional[QMenu] = None
         self._restore_chip: Optional[PillRestoreChip] = None
         self._minimize_hint_shown: bool = False
+        self._pending_attachments: List[Dict[str, Any]] = []
+        self._attach_dir: str = str(Path.home())
 
         self._init_window()
         self._init_ui()
@@ -485,33 +673,61 @@ class StatusPill(QWidget):
         self.speech_bar.seek_requested.connect(self.signal_playback_seek.emit)
         card_layout.addWidget(self.speech_bar)
 
-        # 4. Prompt Input Bar: Quick prompt entry, mic push-to-talk, send button
+        # 4. Prompt Input Bar: attachments, message box, mic, send
+        composer = QVBoxLayout()
+        composer.setSpacing(4)
+
+        self.attach_notice = QLabel("")
+        self.attach_notice.setWordWrap(True)
+        self.attach_notice.setStyleSheet("color: #ff5555; font-size: 11px;")
+        self.attach_notice.setVisible(False)
+        composer.addWidget(self.attach_notice)
+
+        self.attach_scroll = QScrollArea()
+        self.attach_scroll.setWidgetResizable(True)
+        self.attach_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.attach_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.attach_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.attach_scroll.setFixedHeight(40)
+        self.attach_scroll.setVisible(False)
+        self.attach_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.attach_host = QWidget()
+        self.attach_host.setStyleSheet("background: transparent;")
+        self.attach_row_layout = QHBoxLayout(self.attach_host)
+        self.attach_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.attach_row_layout.setSpacing(4)
+        self.attach_scroll.setWidget(self.attach_host)
+        composer.addWidget(self.attach_scroll)
+
         prompt_bar = QHBoxLayout()
         prompt_bar.setSpacing(6)
 
         self.prompt_input = AutoGrowPromptEdit()
-        self.prompt_input.setPlaceholderText(
-            "Ask EidosBot to do something... (Shift+Enter for newline)"
-        )
+        self.prompt_input.setPlaceholderText(PROMPT_PLACEHOLDER)
+        self.prompt_input.setToolTip("Paste a copied photo with Ctrl+V, or drop files here")
         self.prompt_input.submit_requested.connect(self._on_submit_prompt)
         self.prompt_input.height_changed.connect(self._on_prompt_height_changed)
+        self.prompt_input.image_pasted.connect(self._add_clipboard_image)
+        self.prompt_input.files_pasted.connect(self._add_file_paths)
         prompt_bar.addWidget(self.prompt_input, stretch=1, alignment=Qt.AlignmentFlag.AlignBottom)
+
+        self.btn_attach = QPushButton("📎")
+        self.btn_attach.setToolTip("Attach files or photos for Eidos to view")
+        self.btn_attach.setStyleSheet(_SIDE_BUTTON_STYLE)
+        self.btn_attach.clicked.connect(self._choose_attachments)
+        prompt_bar.addWidget(self.btn_attach, alignment=Qt.AlignmentFlag.AlignBottom)
 
         # Push-to-Talk Mic Button
         self.btn_mic = QPushButton("🎙️")
         self.btn_mic.setToolTip(
             "Push-to-Talk (click to start/stop). When you stop, speech is transcribed and sent as a chat turn."
         )
-        self.btn_mic.setStyleSheet(
-            "QPushButton { background-color: #282a36; color: #f8f8f2; "
-            "border: 1px solid #44475a; border-radius: 6px; padding: 6px 10px; font-size: 13px; } "
-            "QPushButton:hover { background-color: #44475a; border-color: #50fa7b; }"
-        )
+        self.btn_mic.setStyleSheet(_SIDE_BUTTON_STYLE)
         self.btn_mic.clicked.connect(self.signal_toggle_mic.emit)
         prompt_bar.addWidget(self.btn_mic, alignment=Qt.AlignmentFlag.AlignBottom)
 
         self.btn_send = QPushButton("▶")
-        self.btn_send.setToolTip("Execute prompt (Enter; Shift+Enter for newline)")
+        self.btn_send.setToolTip("Send the message and any attached files (Enter; Shift+Enter for a new line)")
         self.btn_send.setStyleSheet(
             "QPushButton { background-color: #bd93f9; color: #282a36; font-weight: bold; "
             "border-radius: 6px; padding: 6px 12px; font-size: 12px; border: none; } "
@@ -519,8 +735,10 @@ class StatusPill(QWidget):
         )
         self.btn_send.clicked.connect(self._on_submit_prompt)
         prompt_bar.addWidget(self.btn_send, alignment=Qt.AlignmentFlag.AlignBottom)
+        composer.addLayout(prompt_bar)
 
-        card_layout.addLayout(prompt_bar)
+        card_layout.addLayout(composer)
+        self.setAcceptDrops(True)
 
         # 5. Bottom Footer Bar: Hint + Resize Grip (Resize grip only visible when expanded)
         self.bottom_bar = QHBoxLayout()
@@ -1075,7 +1293,7 @@ class StatusPill(QWidget):
         if not self.is_expanded:
             self.expand_chat()
         self.signal_retry_task.emit(prompt.strip())
-        self.signal_submit_task.emit(prompt.strip())
+        self.signal_submit_task.emit(prompt.strip(), [])
 
     @pyqtSlot(str, str)
     def _on_edit_message(self, message_id: str, new_text: str):
@@ -1088,7 +1306,7 @@ class StatusPill(QWidget):
         if not self.is_expanded:
             self.expand_chat()
         self.signal_edit_submitted.emit(message_id, clean)
-        self.signal_submit_task.emit(clean)
+        self.signal_submit_task.emit(clean, [])
 
     @pyqtSlot(str)
     def _on_link_clicked(self, link: str):
@@ -1163,7 +1381,7 @@ class StatusPill(QWidget):
                 "border: 1px solid #44475a; border-radius: 6px; padding: 6px 10px; font-size: 13px; } "
                 "QPushButton:hover { background-color: #44475a; border-color: #50fa7b; }"
             )
-            self.prompt_input.setPlaceholderText("Ask EidosBot to do something...")
+            self.prompt_input.setPlaceholderText(PROMPT_PLACEHOLDER)
 
     @pyqtSlot(str)
     def set_prompt_text(self, text: str):
@@ -1175,6 +1393,131 @@ class StatusPill(QWidget):
     def clear_prompt(self):
         """Clear the prompt input without submitting a task."""
         self.prompt_input.clear()
+
+    def attachment_payload(self) -> List[Dict[str, Any]]:
+        """Plain attachment records safe to hand to the agent thread."""
+        return [
+            {
+                "name": item["name"],
+                "path": item["path"],
+                "staged": bool(item.get("staged")),
+            }
+            for item in self._pending_attachments
+        ]
+
+    def set_attach_notice(self, text: str) -> None:
+        """Show or hide a short attachment error under the message box."""
+        self.attach_notice.setText(text or "")
+        self.attach_notice.setVisible(bool(text))
+        self._fit_collapsed_to_content()
+
+    def clear_attachments(self, delete_staged: bool = True) -> None:
+        """Remove pending chips. Staged clipboard files are deleted unless a send already consumed them."""
+        items = list(self._pending_attachments)
+        self._pending_attachments.clear()
+        self._rebuild_attachment_chips()
+        if delete_staged:
+            discard_staged(items)
+
+    def _choose_attachments(self) -> None:
+        dialog = QFileDialog(
+            self,
+            "Attach files for Eidos",
+            self._attach_dir,
+            "All files (*);;Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp)",
+        )
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        dialog.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if dialog.exec() != QFileDialog.DialogCode.Accepted:
+            return
+        paths = dialog.selectedFiles()
+        if not paths:
+            return
+        self._attach_dir = str(Path(paths[0]).parent)
+        self._add_file_paths(paths)
+
+    def _add_file_paths(self, paths: List[str]) -> None:
+        notices: List[str] = []
+        for path in paths:
+            try:
+                item = pending_from_path(path)
+            except ValueError as exc:
+                notices.append(str(exc))
+                continue
+            problem = self._add_pending(item, _preview_pixmap(item["path"]))
+            if problem:
+                notices.append(problem)
+                break
+        self.set_attach_notice(" ".join(dict.fromkeys(notices)))
+
+    def _add_clipboard_image(self, image: QImage) -> None:
+        if image is None or image.isNull():
+            self.set_attach_notice("Clipboard image is empty.")
+            return
+        dest = staging_path(".png")
+        if not image.save(str(dest), "PNG"):
+            self.set_attach_notice("Could not save the pasted image.")
+            return
+        try:
+            item = pending_from_path(str(dest), staged=True, name=pasted_image_name())
+        except ValueError as exc:
+            discard_staged([{"staged": True, "path": str(dest)}])
+            self.set_attach_notice(str(exc))
+            return
+        preview = QPixmap.fromImage(image).scaled(
+            28,
+            28,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        problem = self._add_pending(item, preview)
+        self.set_attach_notice(problem or "")
+
+    def _add_pending(self, item: Dict[str, Any], preview: Optional[QPixmap]) -> str:
+        """Keep one attachment. Return an error message, or an empty string."""
+        if any(existing["path"] == item["path"] for existing in self._pending_attachments):
+            if item.get("staged"):
+                discard_staged([item])
+            return ""
+        if len(self._pending_attachments) >= MAX_ATTACHMENTS:
+            if item.get("staged"):
+                discard_staged([item])
+            return f"You can attach up to {MAX_ATTACHMENTS} files at a time."
+        if preview is not None and not preview.isNull():
+            item["preview"] = preview
+        self._pending_attachments.append(item)
+        self._rebuild_attachment_chips()
+        return ""
+
+    def _remove_attachment(self, item_id: str) -> None:
+        kept: List[Dict[str, Any]] = []
+        removed: List[Dict[str, Any]] = []
+        for item in self._pending_attachments:
+            if item.get("id") == item_id:
+                removed.append(item)
+            else:
+                kept.append(item)
+        self._pending_attachments = kept
+        discard_staged(removed)
+        self._rebuild_attachment_chips()
+
+    def _rebuild_attachment_chips(self) -> None:
+        while self.attach_row_layout.count():
+            layout_item = self.attach_row_layout.takeAt(0)
+            widget = layout_item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not self._pending_attachments:
+            self.attach_scroll.setVisible(False)
+            self._fit_collapsed_to_content()
+            return
+        for item in self._pending_attachments:
+            chip = AttachmentChip(item["id"], item["name"], item.get("preview"))
+            chip.remove_requested.connect(self._remove_attachment)
+            self.attach_row_layout.addWidget(chip)
+        self.attach_row_layout.addStretch(1)
+        self.attach_scroll.setVisible(True)
+        self._fit_collapsed_to_content()
 
     @pyqtSlot(bool, str, str)
     def set_background_activity(self, active: bool, task: str = "", details: str = ""):
@@ -1299,14 +1642,15 @@ class StatusPill(QWidget):
             return
 
         prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
+        attachments = self.attachment_payload()
+        if not prompt and not attachments:
             return
 
         # Auto-expand to show chat response if currently collapsed
         if not self.is_expanded:
             self.expand_chat()
 
-        self.signal_submit_task.emit(prompt)
+        self.signal_submit_task.emit(prompt, attachments)
 
     def _on_prompt_height_changed(self) -> None:
         """Keep the prompt row and compact pill height in sync with wrapped text."""
@@ -1351,8 +1695,15 @@ class StatusPill(QWidget):
         """Determine if a mouse click is in an allowed window dragging zone."""
         child = QApplication.widgetAt(global_pos)
         # Interactive controls are never draggable
-        if isinstance(child, (QPushButton, QPlainTextEdit, QSizeGrip)):
+        if isinstance(child, (QPushButton, QPlainTextEdit, QSizeGrip, QScrollArea)):
             return False
+        if self.attach_scroll.isVisible():
+            attach_rect = QRect(
+                self.attach_scroll.mapToGlobal(QPoint(0, 0)),
+                self.attach_scroll.size(),
+            )
+            if attach_rect.contains(global_pos):
+                return False
 
         # In compact pill mode, the whole widget (outside buttons/input) moves the window
         if not self.is_expanded:
@@ -1488,6 +1839,30 @@ class StatusPill(QWidget):
             if not self._resizing:
                 self.unsetCursor()
         return super().eventFilter(obj, event)
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if _local_file_paths(mime) or _qimage_from_mime(mime) is not None:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        paths = _local_file_paths(mime)
+        if paths:
+            self._add_file_paths(paths)
+            event.acceptProposedAction()
+            return
+        image = _qimage_from_mime(mime)
+        if image is not None:
+            self._add_clipboard_image(image)
+            event.acceptProposedAction()
+            return
+        event.ignore()
 
     def mousePressEvent(self, event):
         if not self._handle_mouse_press(event):

@@ -348,10 +348,8 @@ class EpisodicReflector:
     def _fallback_heuristic_eval(self, record: EpisodeRecord) -> ReflectionEvaluation:
         """Deterministic heuristic fallback when LLM is unavailable or unparseable."""
         outcome = record.metadata.outcome.lower()
-        total_steps = record.metadata.total_steps or len(record.trajectory)
 
         failed_actions: List[str] = []
-        successful_actions: List[str] = []
         final_step_succeeded = False
 
         for step in record.trajectory:
@@ -370,8 +368,6 @@ class EpisodicReflector:
 
                 if is_fail:
                     failed_actions.append(name)
-                elif name:
-                    successful_actions.append(name)
 
         if record.trajectory:
             last_step = record.trajectory[-1]
@@ -385,22 +381,19 @@ class EpisodicReflector:
         # Goal fulfillment determination
         if outcome == "success" and (final_step_succeeded or not failed_actions):
             goal_fulfilled = True
-        elif outcome in ("failed", "aborted", "max_steps"):
+        elif outcome in ("failed", "aborted", "max_steps", "stalled"):
             goal_fulfilled = False
         else:
             goal_fulfilled = final_step_succeeded
 
-        # Critic score calculation
+        # Critic score calculation. Length is not a penalty: a finished desktop
+        # task can take many steps. stalled and max_steps are unfinished.
         if not goal_fulfilled:
             critic_score = 0.0 if outcome in ("failed", "aborted") else 0.3
         else:
             base_score = 1.0
-            # Penalize for exploratory failures / dead-ends
             if failed_actions:
                 base_score -= min(0.3, len(failed_actions) * 0.1)
-            # Penalize if took too many steps
-            if total_steps > 8:
-                base_score -= 0.1
             critic_score = max(0.4, round(base_score, 2))
 
         # Resolution summary & lessons

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SharedFile } from '../types/gateway';
 import { codeToSpeech, markdownToPlainText, MarkdownRenderer, ReadAloudControl } from './MarkdownRenderer';
-import { ChevronDown, ChevronRight, Download, Eye, FileText, Loader2, Maximize2, Minimize2, RotateCcw, Square, Volume2, X, ZoomIn, ZoomOut } from 'lucide-react';
+import { ChevronDown, ChevronRight, Download, Eye, FileText, Loader2, Maximize2, Minimize2, RotateCcw, Square, Video, Volume2, X, ZoomIn, ZoomOut } from 'lucide-react';
 
 interface SharedFilesProps {
   files: SharedFile[];
@@ -9,7 +9,7 @@ interface SharedFilesProps {
   readAloud?: Omit<ReadAloudControl, 'playbackPrefix'>;
 }
 
-type PreviewKind = 'image' | 'pdf' | 'text' | 'html' | 'binary';
+type PreviewKind = 'image' | 'pdf' | 'text' | 'html' | 'video' | 'binary';
 
 const TEXT_EXT = new Set([
   'md', 'txt', 'json', 'csv', 'py', 'ts', 'tsx', 'js', 'jsx', 'yaml', 'yml',
@@ -20,6 +20,13 @@ function isHtmlPreview(file: SharedFile): boolean {
   const ext = file.name.split('.').pop()?.toLowerCase() || '';
   const mime = (file.mime || '').toLowerCase();
   return ext === 'html' || ext === 'htm' || mime === 'text/html';
+}
+
+function isPlayableVideo(file: SharedFile): boolean {
+  const ext = file.name.split('.').pop()?.toLowerCase() || '';
+  const mime = (file.mime || '').toLowerCase();
+  if (ext === 'mp4' || ext === 'm4v' || ext === 'webm' || ext === 'ogv') return true;
+  return mime === 'video/mp4' || mime === 'video/webm' || mime === 'video/ogg';
 }
 
 function fileUrl(token: string, id: string, download = false): string {
@@ -42,6 +49,7 @@ function previewKind(file: SharedFile): PreviewKind {
   if (ext === 'svg' || mime.includes('svg')) return 'html';
   if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ext) || mime.startsWith('image/')) return 'image';
   if (ext === 'pdf' || mime === 'application/pdf') return 'pdf';
+  if (isPlayableVideo(file)) return 'video';
   if (mime.startsWith('text/') || mime.includes('json') || TEXT_EXT.has(ext)) return 'text';
   return 'binary';
 }
@@ -173,7 +181,11 @@ export function SharedFiles({ files, token, readAloud }: SharedFilesProps) {
                   key={file.id}
                   className="flex items-center gap-2 px-3 py-2 border-b border-[#44475a]/30 last:border-b-0"
                 >
-                  <FileText className="w-3.5 h-3.5 text-[#8be9fd] shrink-0" />
+                  {isPlayableVideo(file) ? (
+                    <Video className="w-3.5 h-3.5 text-[#8be9fd] shrink-0" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5 text-[#8be9fd] shrink-0" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <div className="text-xs text-[#f8f8f2] truncate">{file.name}</div>
                     <div className="text-[10px] text-[#6272a4] truncate">
@@ -223,7 +235,7 @@ export function SharedFiles({ files, token, readAloud }: SharedFilesProps) {
                     type="button"
                     onClick={() => setOpenFile(file)}
                     disabled={file.missing}
-                    title="View"
+                    title={isPlayableVideo(file) ? 'Play' : 'View'}
                     className="p-1.5 rounded-lg text-[#50fa7b] hover:bg-[#50fa7b]/10 disabled:opacity-30 disabled:cursor-not-allowed"
                   >
                     <Eye className="w-3.5 h-3.5" />
@@ -470,7 +482,7 @@ function FileViewer({
 
   useEffect(() => {
     const stage = stageRef.current;
-    if (!stage || !isFullscreen) return;
+    if (!stage || !isFullscreen || kind === 'video') return;
 
     let pinch: {
       dist: number;
@@ -691,7 +703,7 @@ function FileViewer({
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
     };
-  }, [isFullscreen, setZoomAround, resetZoom]);
+  }, [isFullscreen, kind, setZoomAround, resetZoom]);
 
   useEffect(() => {
     const needsText = kind === 'text' || (kind === 'html' && showHtmlSource);
@@ -747,7 +759,7 @@ function FileViewer({
           isFullscreen
             ? 'h-full flex-1 rounded-none border-0 shadow-none'
             : `max-h-[85dvh] border border-[#44475a] rounded-2xl shadow-2xl ${
-                htmlPreview ? 'max-w-5xl' : 'max-w-2xl'
+                htmlPreview || kind === 'video' ? 'max-w-5xl' : 'max-w-2xl'
               }`
         }`}
       >
@@ -858,7 +870,7 @@ function FileViewer({
           ref={stageRef}
           data-eidos-zoomable
           className={`flex-1 relative overflow-hidden select-text ${
-            isFullscreen ? 'touch-none' : 'overflow-auto p-3'
+            isFullscreen ? (kind === 'video' ? '' : 'touch-none') : 'overflow-auto p-3'
           } ${
             isFullscreen && zoom > 1.01 ? 'cursor-grab active:cursor-grabbing' : ''
           }`}
@@ -866,7 +878,7 @@ function FileViewer({
           <div
             ref={contentRef}
             style={
-              isFullscreen
+              isFullscreen && kind !== 'video'
                 ? {
                     transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
                     transformOrigin: 'center center',
@@ -877,7 +889,10 @@ function FileViewer({
             className={`w-full h-full flex flex-col ${
               isFullscreen
                 ? `p-3 ${
-                    kind === 'pdf' || (kind === 'html' && !showHtmlSource) || kind === 'image'
+                    kind === 'pdf' ||
+                    kind === 'video' ||
+                    (kind === 'html' && !showHtmlSource) ||
+                    kind === 'image'
                       ? 'flex-1 min-h-0'
                       : 'overflow-auto'
                   }`
@@ -957,6 +972,22 @@ function FileViewer({
                 {text}
               </pre>
             )}
+            {!loading && !error && kind === 'video' && (
+              <video
+                key={file.id}
+                src={url}
+                controls
+                playsInline
+                preload="metadata"
+                className={
+                  isFullscreen
+                    ? 'w-full h-full flex-1 min-h-0 object-contain rounded-lg bg-black'
+                    : 'w-full h-auto max-h-[70dvh] rounded-lg bg-black'
+                }
+              >
+                This browser cannot play this video. Use Download to save it.
+              </video>
+            )}
             {!loading && !error && kind === 'binary' && (
               <div className="text-xs text-[#f8f8f2] leading-relaxed">
                 This file does not preview in the browser. Download it to open it on this device.
@@ -964,7 +995,7 @@ function FileViewer({
             )}
           </div>
 
-          {isFullscreen && (
+          {isFullscreen && kind !== 'video' && (
             <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-30 shadow-2xl backdrop-blur-md bg-[#1e1f29]/95 border border-[#44475a] rounded-xl flex items-center px-1.5 py-1 gap-1 text-[#f8f8f2] select-none">
               <button
                 type="button"

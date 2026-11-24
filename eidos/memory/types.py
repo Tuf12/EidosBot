@@ -158,7 +158,7 @@ class TaskScope(BaseModel):
 class EpisodeMetadata(BaseModel):
     """Metadata describing the overall execution and evaluation of an episode."""
 
-    outcome: str = "unknown"  # "success", "failed", "aborted", "max_steps"
+    outcome: str = "unknown"  # "success", "failed", "aborted", "stalled", "max_steps"
     total_steps: int = 0
     user_intervened: bool = False
     critic_score: Optional[float] = None  # 1.0 (success) -> 0.0 (failure)

@@ -37,6 +37,7 @@ except ImportError:
     MessageHandler = None
     filters = None
 
+from eidos.safety.gatekeeper import run_was_cancelled
 from eidos.safety.risk_classifier import RiskLevel
 
 logger = logging.getLogger(__name__)
@@ -706,10 +707,12 @@ class TelegramGateway:
         details: Dict[str, Any],
         risk_level: int,
         reason: str,
-        timeout_seconds: float = 120.0,
         cancel_event: Optional[threading.Event] = None,
     ) -> Optional[Tuple[bool, bool]]:
-        """Deliver interactive confirmation card to Telegram and await user button tap."""
+        """Deliver an approval card and wait until the user taps it.
+
+        The card stays until they approve, reject, or the task is stopped.
+        """
         if not self.is_running() or not self.allowed_user_ids:
             return None
 
@@ -733,18 +736,21 @@ class TelegramGateway:
         card_text, reply_markup = self._build_approval_card(cid, action_type, details, risk_level, reason)
         self._dispatch_approval_card(cid, card_text, reply_markup, {cid: record["sent_messages"]})
 
-        # Wait for user button tap or timeout
-        start_time = time.time()
-        while time.time() - start_time < timeout_seconds:
-            if event.is_set() or (cancel_event and cancel_event.is_set()):
+        while not event.is_set():
+            if cancel_event is not None and cancel_event.is_set():
                 break
-            time.sleep(0.05)
+            if run_was_cancelled(self.agent_loop):
+                break
+            event.wait(0.5)
 
         with self._confirm_lock:
             res = record.get("result")
             self._pending_confirmations.pop(cid, None)
-
-        return res if event.is_set() and res is not None else None
+        if isinstance(res, tuple):
+            return res
+        if run_was_cancelled(self.agent_loop):
+            return False, False
+        return None
 
     def resolve_confirmation(
         self,
@@ -846,11 +852,11 @@ class TelegramGateway:
     @staticmethod
     def combine_callbacks(
         *callbacks: Optional[Callable[..., Optional[Tuple[bool, bool]]]],
-        timeout_seconds: float = 120.0,
     ) -> Callable[..., Tuple[bool, bool]]:
         """Multi-channel combiner racing desktop GUI, web gateway, and Telegram.
 
-        Whichever channel user interacts with first resolves the prompt.
+        Whichever channel the user answers first resolves the prompt.
+        The run stays paused until that answer, or until the task is stopped.
         """
         valid_callbacks = [cb for cb in callbacks if cb is not None]
         if not valid_callbacks:
@@ -866,22 +872,31 @@ class TelegramGateway:
         ) -> Tuple[bool, bool]:
             outcome_queue: List[Tuple[bool, bool]] = []
             done_event = threading.Event()
+            pending = len(valid_callbacks)
+            pending_lock = threading.Lock()
 
             def _worker(cb_func):
+                nonlocal pending
                 try:
                     res = cb_func(action_type, details, risk_level, reason)
-                    if not done_event.is_set() and res is not None:
-                        outcome_queue.append(res)
-                        done_event.set()
+                    with pending_lock:
+                        if res is not None and not done_event.is_set():
+                            outcome_queue.append(res)
+                            done_event.set()
                 except Exception as e:
                     logger.debug("Error in confirmation channel: %s", e)
+                finally:
+                    with pending_lock:
+                        pending -= 1
+                        if pending <= 0:
+                            done_event.set()
 
             threads = [threading.Thread(target=_worker, args=(cb,), daemon=True) for cb in valid_callbacks]
             for t in threads:
                 t.start()
 
-            done_event.wait(timeout=timeout_seconds)
-            done_event.set()
+            while not done_event.is_set():
+                done_event.wait(0.5)
             return outcome_queue[0] if outcome_queue else (False, False)
 
         return composite

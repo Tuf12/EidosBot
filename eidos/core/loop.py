@@ -13,6 +13,7 @@ from eidos.actions.shell import ShellExecutor
 from eidos.browser.manager import PlaywrightManager
 from eidos.core.clock import EidosClock
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
+from eidos.core.stall import StallTracker
 from eidos.core.tool_registry import ToolRegistry
 from eidos.integrations.mcp_client import MCPClientManager
 from eidos.integrations.mcp_config import MCPConfigManager
@@ -47,9 +48,10 @@ from eidos.voice.voice_manager import VoiceManager
 
 logger = logging.getLogger(__name__)
 
-# Desktop tasks chain perception, shell, and GUI actions. 15 steps was
-# exhausted before many of those tasks could finish.
-DEFAULT_MAX_STEPS = 50
+# Backstop for a loop the stall check does not recognize. Desktop work stops
+# on a stall, on finish_task, or on the kill switch — not on a short step budget.
+# Callers can still pass max_steps for an unattended turn (--steps, scheduled agent_turn).
+DEFAULT_SAFETY_STEP_FUSE = 400
 
 
 class AgentLoop:
@@ -1345,21 +1347,25 @@ PRIMARY JOB: {job_name} ({job_id})
 
         return base_or_scoped
 
-    def _resolve_max_steps(self, max_steps: Optional[int]) -> int:
-        """Use the caller's cap, otherwise agent.max_steps from config."""
+    def _resolve_step_ceiling(self, max_steps: Optional[int]) -> tuple[int, bool]:
+        """Return (ceiling, explicit).
+
+        An explicit cap is the caller's max_steps (CLI --steps, a scheduled turn).
+        Otherwise the ceiling is the safety fuse, and a stall ends the run first.
+        """
         if max_steps is not None:
             try:
                 value = int(max_steps)
             except (TypeError, ValueError):
                 value = 0
             if value > 0:
-                return value
-        configured = self.config.get("agent", {}).get("max_steps", DEFAULT_MAX_STEPS)
+                return value, True
+        configured = self.config.get("agent", {}).get("safety_step_fuse", DEFAULT_SAFETY_STEP_FUSE)
         try:
             value = int(configured)
         except (TypeError, ValueError):
-            value = DEFAULT_MAX_STEPS
-        return value if value > 0 else DEFAULT_MAX_STEPS
+            value = DEFAULT_SAFETY_STEP_FUSE
+        return value if value > 0 else DEFAULT_SAFETY_STEP_FUSE, False
 
     @staticmethod
     def _compact_trace_text(value: Any, limit: int) -> str:
@@ -1513,8 +1519,8 @@ PRIMARY JOB: {job_name} ({job_id})
         max_steps: Optional[int] = None,
         speak_summary: bool = True,
     ) -> Dict[str, Any]:
-        """Run autonomous agent loop until goal achieved or max_steps reached."""
-        max_steps = self._resolve_max_steps(max_steps)
+        """Run until the goal is finished, the task stalls, or the step ceiling is hit."""
+        step_ceiling, explicit_step_cap = self._resolve_step_ceiling(max_steps)
         logger.info("Starting EidosBot task: %s", user_goal)
         self.compute_policy.touch_user_activity()
         self._stop_requested.clear()
@@ -1546,7 +1552,8 @@ PRIMARY JOB: {job_name} ({job_id})
         try:
             return self._run_task_body(
                 user_goal,
-                max_steps=max_steps,
+                step_ceiling=step_ceiling,
+                explicit_step_cap=explicit_step_cap,
                 speak_summary=speak_summary,
             )
         finally:
@@ -1558,7 +1565,8 @@ PRIMARY JOB: {job_name} ({job_id})
         self,
         user_goal: str,
         *,
-        max_steps: int,
+        step_ceiling: int,
+        explicit_step_cap: bool,
         speak_summary: bool,
     ) -> Dict[str, Any]:
         # Start trajectory logging
@@ -1644,12 +1652,13 @@ PRIMARY JOB: {job_name} ({job_id})
         task_summary = ""
         turn_thoughts: List[str] = []
         turn_actions: List[Dict[str, str]] = []
+        stall = StallTracker()
 
-        while step < max_steps:
+        while step < step_ceiling:
             step += 1
             step_start_time = time.monotonic()
-            logger.info("=== Cycle Step %d / %d ===", step, max_steps)
-            self._emit("on_step", step, max_steps)
+            logger.info("=== Cycle Step %d / %d ===", step, step_ceiling)
+            self._emit("on_step", step, step_ceiling)
 
             # 1. Sense emergency kill switch or user cancellation
             if self.kill_switch.is_triggered():
@@ -1683,6 +1692,7 @@ PRIMARY JOB: {job_name} ({job_id})
 
             # Refresh system context (date/time, active window, user profile, active skill) each step
             active_win = self.windows.get_active_window_info()
+            window_now = active_win
             if self.memory_enabled:
                 user_profile_ctx = self.user_store.get_prompt_context()
             messages[0]["content"] = self._assemble_system_prompt(
@@ -1762,7 +1772,7 @@ PRIMARY JOB: {job_name} ({job_id})
                     )
                 )
 
-                if is_model_error and step < max_steps:
+                if is_model_error and step < step_ceiling:
                     logger.warning("Model communication error encountered on step %d: %s", step, response.content)
                     # Attempt recovery: aggressively compact context and retry with Chutes if available
                     self._compact_context_if_needed(messages, max_chars=24000)
@@ -1835,6 +1845,8 @@ PRIMARY JOB: {job_name} ({job_id})
             task_finished = False
             executed_tools: List[Dict[str, Any]] = []
             executed_observations: List[Dict[str, Any]] = []
+            stall_stop = None
+            stall_nudge = None
 
             for tc in response.tool_calls:
                 if self._stop_requested.is_set() or self.kill_switch.is_triggered():
@@ -1860,6 +1872,23 @@ PRIMARY JOB: {job_name} ({job_id})
                     task_summary = tool_result.get("summary", "Task completed.")
                     task_finished = True
                     self._emit("on_response", task_summary)
+                else:
+                    window_after = window_now
+                    if tc.name in StallTracker.POINTER_ACTS:
+                        window_after = self.windows.get_active_window_info()
+                    verdict = stall.observe(
+                        tc.name,
+                        tc.arguments,
+                        tool_result,
+                        window_now,
+                        window_after,
+                    )
+                    window_now = window_after
+                    if verdict is not None:
+                        if verdict.stop:
+                            stall_stop = verdict
+                        elif stall_nudge is None:
+                            stall_nudge = verdict
 
                 # Append tool result to conversation history with observation capping
                 raw_tool_content = json.dumps(tool_result)
@@ -1877,6 +1906,8 @@ PRIMARY JOB: {job_name} ({job_id})
                     "content": capped_content,
                     "name": tc.name,
                 })
+                if stall_stop is not None:
+                    break
 
             if self.memory_enabled and episode_id:
                 step_rec = StepRecord(
@@ -1905,6 +1936,26 @@ PRIMARY JOB: {job_name} ({job_id})
                     include_trace=stopped,
                 )
 
+            if stall_stop is not None:
+                logger.warning("Agent loop stalled at step %d: %s", step, stall_stop.detail)
+                return self._complete_run(
+                    episode_id=episode_id,
+                    headline=stall_stop.stop_headline(),
+                    success=False,
+                    outcome="stalled",
+                    step=step,
+                    speak=True,
+                    speak_summary=speak_summary,
+                    thoughts=turn_thoughts,
+                    actions=turn_actions,
+                    include_trace=True,
+                )
+
+            if stall_nudge is not None:
+                stall.commit_nudge(stall_nudge.signature)
+                logger.info("Stall nudge at step %d: %s", step, stall_nudge.detail)
+                messages.append({"role": "user", "content": stall_nudge.nudge_text()})
+
             time.sleep(0.1)
 
         is_model_error = bool(
@@ -1932,8 +1983,13 @@ PRIMARY JOB: {job_name} ({job_id})
         if is_model_error:
             headline = task_summary
             outcome = "failed"
-        elif step >= max_steps:
-            headline = f"Reached the step limit ({max_steps}) before the task was finished."
+        elif step >= step_ceiling:
+            if explicit_step_cap:
+                headline = f"Reached the step limit ({step_ceiling}) before the task was finished."
+            else:
+                headline = (
+                    f"Hit the safety step fuse ({step_ceiling}) before the task was finished."
+                )
             outcome = "max_steps"
         else:
             headline = "The attempt stopped without a final answer."
