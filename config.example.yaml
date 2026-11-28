@@ -5,7 +5,7 @@ agent:
   safety_step_fuse: 400          # Backstop only. Desktop tasks stop when an action stalls, not at a step budget.
 
 models:
-  provider_preference: "local"     # Options: "local", "cloud", "auto"
+  provider_preference: "local"     # "local" and "auto" keep one Ollama prompt at a time. "cloud" allows another conversation, speech, and dictation while a prompt is working.
   
   local:
     base_url: "http://localhost:11434"
@@ -131,6 +131,9 @@ memory:
   conversations_db_path: "~/.eidos/eidos.db"                     # Persistent SQLite chat conversations & message history
   embedding_model: "nomic-embed-text:latest"                     # 768-dim local embeddings on Ollama
   embedding_num_gpu: 0                                           # Keep embedder on CPU; LLM keeps the GPU
+  recall_min_similarity: 0.20    # Mid-turn <recall> and older chat-turn retrieval (not macro injection)
+  macro_recall_min_similarity_success: 0.45  # Turn-start golden path; pre-scope-boost cosine floor
+  macro_recall_min_similarity_pitfall: 0.35  # Turn-start cautionary pitfall; slightly lower than success
   confirm_profile_writes: true   # HUD confirmation before agent saves profile facts
   reflector:
     enabled: true                # Autonomous post-task critique and calibrated critic scoring

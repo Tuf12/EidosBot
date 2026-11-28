@@ -27,7 +27,7 @@ Introduce **Context-Aware Dynamic Task Scoping & Multi-Source Cross-Referencing*
   - Active X11 window class and window title.
   - Currently loaded skill (`active_skill`).
 - **Scope-Augmented Vector Ranking (Soft-Boost Re-ranking):** Rather than blindly pruning cross-project memories (which might contain universal shell tricks like `tar -xvf` or `pkill`), apply a calibrated **Scope Boost (+0.25 similarity)** to episodes matching the active project, directory, or skill.
-- **Unified Multi-Source Context Fusion:** Coordinates mid-stream `<recall>` queries across Episodic Memory, OptimalX Notes, and recent Conversation History, returning clear, disambiguated XML blocks (`<recalled_memory>`, `<recalled_notes>`, `<recalled_conversation>`).
+- **Unified Multi-Source Context Fusion:** Coordinates mid-stream `<recall>` queries across Episodic Memory and OptimalX Notes, returning `<recalled_memory>` and `<recalled_notes>`. Conversation retrieval is specified separately in [SPEC_CONVERSATION_RECALL.md](SPEC_CONVERSATION_RECALL.md) and is not part of this implemented scoping work.
 
 ---
 
@@ -156,7 +156,7 @@ When querying `EpisodicStore.search(query, scope=task_scope)`:
 When `<recall>query</recall>` executes in `RecallStreamInterceptor`:
 - Pass `task_scope` to `EpisodicStore` to ensure matching past episodes reflect the active project.
 - Pass `task_scope.project_name` to `OptimalXBridge.search_notes()` to scope personal notes to the active project folder first before falling back to global notes.
-- Format results into distinct, cleanly separated XML containers:
+- Format results into distinct, cleanly separated XML containers. `<recalled_conversation>` is not produced here. Past chat turns are indexed and retrieved by [SPEC_CONVERSATION_RECALL.md](SPEC_CONVERSATION_RECALL.md).
 
 ```xml
 <recalled_memory episode="ep_20260910_opt_1" scope="OptimalX">

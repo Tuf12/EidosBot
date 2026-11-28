@@ -48,6 +48,13 @@ function liveUrl(id: string, token: string, suffix = ''): string {
   return `/api/tts/live/${id}${suffix}${tokenQuery}`;
 }
 
+function fileUrl(id: string, token: string, version: number): string {
+  const params = new URLSearchParams();
+  if (token) params.set('token', token);
+  params.set('v', String(Math.max(0, Math.round(version * 1000))));
+  return `/api/tts/live/${id}/file?${params.toString()}`;
+}
+
 function bufferedEnd(audio: HTMLAudioElement): number {
   try {
     if (audio.seekable.length > 0) return audio.seekable.end(audio.seekable.length - 1);
@@ -82,8 +89,10 @@ function setPlaybackSessionType() {
 }
 
 /**
- * One audio element, one WAV URL. Android continues that stream when the
- * screen locks or the user switches apps. Chunked play() calls do not.
+ * One audio element for the current read-aloud. Speech is recorded on the
+ * server and kept until the next read-aloud replaces it. The first play uses
+ * the live WAV so audio can start early; pause, seek, replay, and any break
+ * in that stream use the saved recording.
  */
 export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudioPlaybackOptions) {
   const [isPlaying, setIsPlaying] = useState(false);
@@ -122,6 +131,13 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
   const pollRef = useRef<number | null>(null);
   const activeRef = useRef(false);
   const stopAudioRef = useRef<() => void>(() => {});
+  const followRef = useRef(false);
+  const recoverLockRef = useRef(false);
+  const recoverWhenReadyRef = useRef<boolean | null>(null);
+  const reopenAtRef = useRef<(audio: HTMLAudioElement, absoluteTime: number, autoplay: boolean) => void>(() => {});
+  const settleFinishedRef = useRef<() => boolean>(() => false);
+  const pauseAudioRef = useRef<() => void>(() => {});
+  const resumeAudioRef = useRef<() => void>(() => {});
 
   const apiRef = useRef({
     setIsPlaying,
@@ -154,6 +170,7 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
     audio.onplay = () => {
       if (suppressRef.current || finishedRef.current) return;
       if (textSentRef.current) {
+        followRef.current = true;
         apiRef.current.setIsPlaying(true);
         apiRef.current.setIsPaused(false);
         apiRef.current.setPlaybackActive(true);
@@ -188,7 +205,24 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
     audio.onended = () => {
       if (suppressRef.current) return;
       if (activeRef.current && textSentRef.current) {
-        settleFinished();
+        const played = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+        if (
+          usingFileRef.current &&
+          followRef.current &&
+          !finishedRef.current &&
+          played > 0 &&
+          durationRef.current > played + 0.3
+        ) {
+          reopenAtRef.current(audio, Math.min(audio.currentTime || played, durationRef.current), true);
+          return;
+        }
+        if (usingFileRef.current && followRef.current && !finishedRef.current && !completeRef.current) {
+          return;
+        }
+        settleFinishedRef.current();
+        if (!usingFileRef.current && sessionRef.current && (completeRef.current || durationRef.current > 0)) {
+          reopenAtRef.current(audio, durationRef.current || speechStartRef.current, false);
+        }
         return;
       }
       apiRef.current.setIsPlaying(false);
@@ -198,9 +232,30 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
       publishMedia('none');
     };
     audio.onerror = () => {
-      if (suppressRef.current || !activeRef.current) return;
-      apiRef.current.setPlaybackError('Android could not keep this audio stream open.');
-      apiRef.current.setIsBuffering(false);
+      if (!activeRef.current || !textSentRef.current) return;
+      suppressRef.current = false;
+      const start = speechStartRef.current;
+      const recorded = durationRef.current;
+      const waitingForAudio = recorded <= start + 0.05 && !completeRef.current;
+      if (recoverLockRef.current || waitingForAudio) {
+        recoverWhenReadyRef.current = followRef.current || !finishedRef.current;
+        apiRef.current.setIsBuffering(true);
+        apiRef.current.setPlaybackError(null);
+        return;
+      }
+      recoverLockRef.current = true;
+      window.setTimeout(() => {
+        recoverLockRef.current = false;
+      }, 700);
+      const speechPos = positionRef.current;
+      const speechDur = Math.max(0, recorded - start);
+      const atEnd = finishedRef.current || (speechDur > 0.2 && speechPos >= speechDur - 0.4);
+      const autoplay = !atEnd && followRef.current;
+      followRef.current = autoplay;
+      apiRef.current.setPlaybackError(null);
+      apiRef.current.setIsBuffering(autoplay);
+      if (atEnd) settleFinishedRef.current();
+      reopenAtRef.current(audio, atEnd ? recorded : start + speechPos, autoplay);
     };
     document.body.appendChild(audio);
     audioRef.current = audio;
@@ -290,6 +345,7 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
     publishMedia('paused');
     return true;
   };
+  settleFinishedRef.current = settleFinished;
 
   const finishIfAtEnd = () => {
     if (finishedRef.current) return true;
@@ -358,6 +414,33 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
     if (meta.complete && (meta.cues?.length || 0) > 0 && textSentRef.current) {
       apiRef.current.setIsBuffering(false);
     }
+    const audio = audioRef.current;
+    const start = speechStartRef.current;
+    if (
+      recoverWhenReadyRef.current !== null &&
+      textSentRef.current &&
+      typeof meta.duration === 'number' &&
+      meta.duration > start + 0.05
+    ) {
+      const autoplay = recoverWhenReadyRef.current;
+      recoverWhenReadyRef.current = null;
+      followRef.current = autoplay;
+      if (audio && sessionRef.current) {
+        reopenAtRef.current(audio, start, autoplay);
+      }
+    } else if (
+      audio &&
+      usingFileRef.current &&
+      followRef.current &&
+      !finishedRef.current &&
+      audio.ended &&
+      Number.isFinite(audio.duration) &&
+      audio.duration > 0 &&
+      typeof meta.duration === 'number' &&
+      meta.duration > audio.duration + 0.3
+    ) {
+      reopenAtRef.current(audio, Math.min(audio.currentTime || 0, meta.duration), true);
+    }
     maybeSkipPrimer();
     syncPosition();
     if (finishedRef.current && completeRef.current) stopPolling();
@@ -388,6 +471,20 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
   };
 
   const stopAudio = useCallback(() => {
+    const recorded = durationRef.current > speechStartRef.current + 0.05 || completeRef.current;
+    if (textSentRef.current && sessionRef.current && recorded) {
+      followRef.current = false;
+      recoverWhenReadyRef.current = null;
+      try {
+        audioRef.current?.pause();
+      } catch {
+        /* ignore */
+      }
+      settleFinishedRef.current();
+      const audio = audioRef.current;
+      if (audio) reopenAtRef.current(audio, durationRef.current || speechStartRef.current, false);
+      return;
+    }
     suppressRef.current = true;
     const audio = audioRef.current;
     activeRef.current = false;
@@ -440,6 +537,9 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
       textSentRef.current = Boolean(text);
       userSeekedRef.current = false;
       skippedPrimerRef.current = false;
+      followRef.current = Boolean(text);
+      recoverWhenReadyRef.current = null;
+      recoverLockRef.current = false;
       cuesRef.current = [];
       speechStartRef.current = 0;
       durationRef.current = 0;
@@ -580,6 +680,17 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
       }
       if (voice) voiceRef.current = voice;
       const current = audioRef.current;
+      if (messageId && messageId === messageIdRef.current && activeRef.current && textSentRef.current && current) {
+        const saved = completeRef.current || durationRef.current > speechStartRef.current + 0.05;
+        if (saved) {
+          if (!finishedRef.current && !current.paused && !current.ended && !current.error) {
+            pauseAudioRef.current();
+            return;
+          }
+          resumeAudioRef.current();
+          return;
+        }
+      }
       if (
         messageId &&
         messageId === messageIdRef.current &&
@@ -648,7 +759,7 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
         apiRef.current.setPlaybackError(message);
       });
     };
-    if (usingFileRef.current && audio.currentSrc.includes(`/api/tts/live/${id}/file`) && audio.readyState >= 1) {
+    if (usingFileRef.current && audio.currentSrc.includes('/file') && audio.readyState >= 1 && Math.abs((durationRef.current || 0) - (Number.isFinite(audio.duration) ? audio.duration : 0)) < 0.3) {
       apply();
       return;
     }
@@ -656,9 +767,10 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
     usingFileRef.current = true;
     reopenListenerRef.current = apply;
     audio.addEventListener('loadedmetadata', apply, { once: true });
-    audio.src = liveUrl(id, tokenRef.current, '/file');
+    audio.src = fileUrl(id, tokenRef.current, durationRef.current || target);
     audio.load();
   }, []);
+  reopenAtRef.current = reopenAt;
 
   const seekTo = useCallback((target: number) => {
     const audio = audioRef.current;
@@ -676,18 +788,28 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
       apiRef.current.setPosition(dur);
       return;
     }
-    if (fromFinished || audio.ended) {
+    const haveRecording = dur > 0.05 || completeRef.current;
+    const needFile = !usingFileRef.current || fromFinished || audio.ended || Boolean(audio.error);
+    if (haveRecording && sessionRef.current && needFile) {
+      const keepPlaying = !fromFinished && !audio.paused && !audio.ended && !audio.error;
       finishedRef.current = false;
-      apiRef.current.setIsPlaying(false);
-      apiRef.current.setIsPaused(true);
-      if (sessionRef.current && completeRef.current) {
-        reopenAt(audio, start + nextSpeechPos, false);
-        return;
+      followRef.current = keepPlaying;
+      if (!keepPlaying) {
+        apiRef.current.setIsPlaying(false);
+        apiRef.current.setIsPaused(true);
       }
+      reopenAt(audio, start + nextSpeechPos, keepPlaying);
+      return;
     }
     try {
       audio.currentTime = start + nextSpeechPos;
     } catch {
+      if (sessionRef.current) {
+        const keepPlaying = !audio.paused && !finishedRef.current;
+        followRef.current = keepPlaying;
+        reopenAt(audio, start + nextSpeechPos, keepPlaying);
+        return;
+      }
       apiRef.current.setPlaybackError('This part is not ready to skip to yet.');
       return;
     }
@@ -732,6 +854,7 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
   const resumeAudio = useCallback(() => {
     const audio = ensureAudio();
     if (!activeRef.current) return;
+    followRef.current = true;
     if (textSentRef.current) {
       audio.volume = 1;
     }
@@ -742,13 +865,15 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
       apiRef.current.setIsBuffering(true);
       return;
     }
-    if (finishedRef.current) {
+    if (finishedRef.current || audio.error) {
+      const start = speechStartRef.current;
+      const fromBeginning = finishedRef.current;
       finishedRef.current = false;
       userSeekedRef.current = false;
       skippedPrimerRef.current = false;
-      const start = speechStartRef.current;
-      if (sessionRef.current && completeRef.current) {
-        reopenAt(audio, start, true);
+      if (sessionRef.current && (completeRef.current || durationRef.current > 0 || audio.error)) {
+        const at = fromBeginning ? start : start + Math.max(0, positionRef.current);
+        reopenAt(audio, at, true);
         return;
       }
       try {
@@ -757,15 +882,22 @@ export function useAudioPlayback({ token, defaultVoice = 'bm_george' }: UseAudio
         /* ignore */
       }
     }
-    void audio.play().catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : 'Playback was blocked';
-      apiRef.current.setPlaybackError(message);
+    void audio.play().catch(() => {
+      if (sessionRef.current && textSentRef.current) {
+        const start = speechStartRef.current;
+        reopenAt(audio, start + Math.max(0, positionRef.current), true);
+        return;
+      }
+      apiRef.current.setPlaybackError('Playback was blocked');
     });
   }, [ensureAudio, reopenAt]);
+  resumeAudioRef.current = resumeAudio;
 
   const pauseAudio = useCallback(() => {
+    followRef.current = false;
     audioRef.current?.pause();
   }, []);
+  pauseAudioRef.current = pauseAudio;
 
   const toggleAutoSpeak = useCallback(() => {
     setAutoSpeak((prev) => {

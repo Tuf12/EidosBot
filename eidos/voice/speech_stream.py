@@ -255,9 +255,11 @@ class SpeechStreamer:
                 session = self._session()
                 if self._use_session():
                     pcm, sample_rate = playback.load_pcm(wav_path)
-                    if not session.active:
-                        session.begin()
-                    session.append(pcm, sample_rate)
+                    if gen != self._generation:
+                        continue
+                    session = self._session()
+                    if session is not None and session.active:
+                        session.append(pcm, sample_rate)
                 elif playback.uses_native_audio:
                     pcm, sample_rate = playback.load_pcm(wav_path)
                     playback.play_pcm(pcm, sample_rate, blocking=True)
@@ -265,10 +267,21 @@ class SpeechStreamer:
                     self.tts.play_audio(wav_path, blocking=True, interrupt=False)
             except Exception as e:
                 logger.error("TTS clip playback failed: %s", e)
+                self._seal_recording(gen)
             finally:
                 if not self._use_session():
                     self._is_playing = False
                 self._cleanup_wav(wav_path)
+
+    def _seal_recording(self, gen: int) -> None:
+        """Keep audio already recorded when a later chunk fails and nothing else is queued."""
+        if gen != self._generation or self._is_synthesizing:
+            return
+        if not self._synth_q.empty() or not self._play_q.empty():
+            return
+        session = self._session()
+        if session is not None and session.active:
+            session.mark_complete()
 
     @staticmethod
     def _cleanup_wav(wav_path: str) -> None:

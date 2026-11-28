@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
-from eidos.models.inflight import InflightRequest
+from eidos.models.inflight import InflightBoard, InflightRequest
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,7 @@ class ChutesClient(BaseModelClient):
         self.reasoning_model = reasoning_model
         self.timeout = timeout
         self.stream = stream
-        self._inflight = InflightRequest()
+        self._tickets = InflightBoard()
         self.recall_interceptor = recall_interceptor
         self.on_recall_callback = on_recall_callback
         self.service_name = "Chutes AI"
@@ -115,13 +115,22 @@ class ChutesClient(BaseModelClient):
             logger.error("Failed to list %s models: %s", self.service_name, e)
         return []
 
-    def abort(self) -> None:
-        """Close the model request that is currently generating."""
-        self._inflight.abort()
+    @property
+    def _inflight(self) -> InflightRequest:
+        """Ticket for the agent run on this thread."""
+        return self._tickets.current()
 
-    def reset_abort(self) -> None:
-        """Clear a previous stop so the next task can call the model."""
-        self._inflight.reset()
+    def abort(self, run_id: Optional[str] = None) -> None:
+        """Close one run's request, or every request when ``run_id`` is omitted."""
+        self._tickets.abort(run_id)
+
+    def reset_abort(self, run_id: Optional[str] = None) -> None:
+        """Clear a previous stop for this run so its next call can start."""
+        self._tickets.reset(run_id)
+
+    def drop_run(self, run_id: str) -> None:
+        """Forget a finished run's ticket."""
+        self._tickets.drop(run_id)
 
     def _cancelled_response(self, model_name: str) -> ModelResponse:
         return ModelResponse(content="", model=model_name, raw={"cancelled": True})

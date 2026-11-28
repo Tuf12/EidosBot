@@ -55,6 +55,14 @@ class ModelRouter(BaseModelClient):
         """Select which configured cloud API cloud and auto modes call ('chutes' or 'meta')."""
         self.cloud_provider = (provider or "chutes").strip().lower()
 
+    def parallel_actions_allowed(self) -> bool:
+        """True when the selected provider is a cloud API.
+
+        Local and auto keep one Ollama action at a time. Cloud prompts, speech,
+        and dictation may overlap, including a task in another conversation.
+        """
+        return self.preference == ProviderPreference.CLOUD
+
     def _clients(self):
         return (self.ollama, self.chutes, self.meta)
 
@@ -115,16 +123,27 @@ class ModelRouter(BaseModelClient):
             if hasattr(client, "on_recall_callback"):
                 client.on_recall_callback = value
 
-    def abort(self) -> None:
-        """Close whichever provider is generating the current reply."""
+    def abort(self, run_id: Optional[str] = None) -> None:
+        """Close one run's provider call, or every call when ``run_id`` is omitted."""
         for client in self._clients():
             abort = getattr(client, "abort", None)
             if not callable(abort):
                 continue
             try:
-                abort()
+                abort(run_id)
             except Exception:
                 logger.debug("Model abort failed", exc_info=True)
+
+    def drop_run(self, run_id: str) -> None:
+        """Drop per-run cancel tickets after a task leaves the loop."""
+        for client in self._clients():
+            drop = getattr(client, "drop_run", None)
+            if not callable(drop):
+                continue
+            try:
+                drop(run_id)
+            except Exception:
+                logger.debug("Model ticket drop failed", exc_info=True)
 
     def reset_abort(self) -> None:
         """Clear a previous stop on local and cloud providers."""

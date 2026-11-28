@@ -1,9 +1,11 @@
-"""One seekable speech clip for the desktop player bar.
+"""One seekable speech recording for the desktop player bar.
 
 Kokoro still arrives as short WAV pieces. This session stitches them into a
-single timeline so the pill can pause, replay, and jump by five seconds the
-same way the phone player does. The PortAudio stream is never started from a
-Qt widget thread's media-player object; sounddevice's callback owns the device.
+single timeline and keeps that recording until the next utterance replaces it.
+Pause, replay, and five-second jumps all use the saved samples, so a device
+glitch or a failed later chunk does not throw away audio the user can still
+hear. The PortAudio stream is never started from a Qt widget thread's
+media-player object; sounddevice's callback owns the device.
 """
 
 from __future__ import annotations
@@ -104,6 +106,10 @@ class ClipPlayer:
         with self._lock:
             if not self._active or incoming.size == 0:
                 return
+            # halt() and a finished recording are sealed. A late chunk must not
+            # reopen a clip the user already stopped or replaced.
+            if self._complete and not self._playing:
+                return
             rate = int(sample_rate) or self._rate or 48000
             if self._pcm.size == 0:
                 self._rate = rate
@@ -117,9 +123,31 @@ class ClipPlayer:
         self._ensure_stream()
 
     def mark_complete(self) -> None:
+        """No more chunks are coming. Keep whatever was recorded."""
         with self._lock:
-            if self._active:
+            if not self._active:
+                return
+            self._complete = True
+            if self._pcm.size == 0:
+                self._active = False
+
+    def halt(self) -> None:
+        """Silence the speakers and keep the recording so Play can start it again."""
+        stream = None
+        with self._lock:
+            stream = self._stream
+            self._stream = None
+            self._playing = False
+            self._paused = False
+            if self._pcm.size == 0:
+                self._active = False
+                self._complete = False
+                self._cursor = 0
+            else:
+                self._active = True
                 self._complete = True
+                self._cursor = self._pcm.size
+        _close_stream(stream)
 
     def pause(self) -> None:
         with self._lock:
@@ -171,7 +199,6 @@ class ClipPlayer:
         _close_stream(stream)
 
     def snapshot(self) -> dict:
-        stream = None
         with self._lock:
             rate = self._rate or 48000
             duration = self._pcm.size / rate if rate else 0.0
@@ -187,19 +214,29 @@ class ClipPlayer:
             )
             playing = self._transport_playing_locked() and not starved
             held = self._paused or (not self._playing and not starved and self._pcm.size > 0)
+            dead = None
+            if self._stream is not None and not _stream_alive(self._stream):
+                dead = self._stream
+                self._stream = None
+            revive = (
+                dead is not None
+                and self._playing
+                and not self._paused
+                and not finished
+                and self._pcm.size > 0
+            )
             data = {
                 "active": self._active,
-                "playing": playing,
+                "playing": playing and dead is None,
                 "paused": self._active and not finished and not playing and held,
                 "buffering": self._active and not finished and not self._paused and (self._pcm.size == 0 or starved),
                 "finished": finished,
                 "position": position,
                 "duration": duration,
             }
-            if finished and self._stream is not None:
-                stream = self._stream
-                self._stream = None
-        _close_stream(stream)
+        _close_stream(dead)
+        if revive:
+            self._ensure_stream()
         return data
 
     def advance(self, frames: int) -> None:
@@ -225,10 +262,17 @@ class ClipPlayer:
     def _ensure_stream(self) -> None:
         if not self.available:
             return
+        dead = None
         with self._lock:
-            if self._stream is not None or not self._active or self._pcm.size == 0:
+            if not self._active or self._pcm.size == 0:
                 return
+            if self._stream is not None:
+                if _stream_alive(self._stream):
+                    return
+                dead = self._stream
+                self._stream = None
             rate = self._rate or 48000
+        _close_stream(dead)
         try:
             stream = self._sd.OutputStream(
                 samplerate=rate,
@@ -269,6 +313,13 @@ class ClipPlayer:
             if self._complete and self._cursor >= self._pcm.size:
                 self._playing = False
                 self._paused = False
+
+
+def _stream_alive(stream: object) -> bool:
+    try:
+        return bool(getattr(stream, "active", False))
+    except Exception:
+        return False
 
 
 def _close_stream(stream: Optional[object]) -> None:

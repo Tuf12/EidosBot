@@ -1,10 +1,18 @@
-"""Track the HTTP call that is generating a reply so Stop can close it."""
+"""Track the HTTP call that is generating a reply so Stop can close it.
 
+Each agent run gets its own ticket. Stopping one cloud request closes that
+socket and leaves another run's request alone. A kill closes every ticket.
+"""
+
+from contextvars import ContextVar
 import logging
 import threading
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+# Set by AgentLoop for the worker that is inside run_task.
+model_run_id: ContextVar[Optional[str]] = ContextVar("eidos_model_run_id", default=None)
 
 
 class InflightRequest:
@@ -67,3 +75,54 @@ class InflightRequest:
             obj.close()
         except Exception:
             logger.debug("Failed to close in-flight model request", exc_info=True)
+
+
+class InflightBoard:
+    """Cancel tickets keyed by agent run.
+
+    Cloud clients use one board so two API calls do not share a socket.
+    ``abort(None)`` closes every ticket. ``abort(run_id)`` closes one.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tickets: Dict[str, InflightRequest] = {}
+
+    def _key(self, run_id: Optional[str]) -> str:
+        if run_id is not None:
+            return run_id
+        return model_run_id.get() or ""
+
+    def current(self, run_id: Optional[str] = None) -> InflightRequest:
+        key = self._key(run_id)
+        with self._lock:
+            ticket = self._tickets.get(key)
+            if ticket is None:
+                ticket = InflightRequest()
+                self._tickets[key] = ticket
+            return ticket
+
+    def reset(self, run_id: Optional[str] = None) -> None:
+        """Replace this run's ticket. Other runs keep theirs."""
+        key = self._key(run_id)
+        with self._lock:
+            self._tickets[key] = InflightRequest()
+
+    def abort(self, run_id: Optional[str] = None) -> None:
+        if run_id is None:
+            self.abort_all()
+            return
+        with self._lock:
+            ticket = self._tickets.get(run_id)
+        if ticket is not None:
+            ticket.abort()
+
+    def abort_all(self) -> None:
+        with self._lock:
+            tickets = list(self._tickets.values())
+        for ticket in tickets:
+            ticket.abort()
+
+    def drop(self, run_id: str) -> None:
+        with self._lock:
+            self._tickets.pop(run_id, None)

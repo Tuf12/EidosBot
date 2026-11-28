@@ -1,14 +1,15 @@
 {
-  "plan_path": "docs/plans/PLAN_EPISODIC_ENTITY_GRAPH.md",
+  "plan_path": "docs/plans/PLAN_CONVERSATION_RECALL.md",
   "status": "complete",
-  "current_phase": 6,
-  "total_phases": 6,
+  "current_phase": 7,
+  "total_phases": 7,
   "phase_labels": [
-    "Phase 1: Data Contracts & Entity Taxonomy (`eidos/memory/types.py`)",
-    "Phase 2: Deterministic Entity Extractor (`eidos/memory/entity_extractor.py`)",
-    "Phase 3: Relational SQLite Graph Store (`eidos/memory/graph_store.py`)",
-    "Phase 4: Hybrid Graph-Augmented Retrieval (`eidos/memory/episodic_store.py`)",
-    "Phase 5: Query Enhancement in Recall Stream (`eidos/memory/recall_stream.py`)",
-    "Phase 6: Verification & Test Suite (`tests/test_entity_graph.py`)"
+    "Phase 1: Index schema and search (`conversation_index.py`, `types.py`)",
+    "Phase 2: Pairing and residue column (`conversation_store.py`)",
+    "Phase 3: Save, delete, and backfill (`loop.py`)",
+    "Phase 4: Prompt tail and turn-start retrieval (`loop.py`)",
+    "Phase 5: Residue on new chat and clear (`loop.py`)",
+    "Phase 6: Mid-thought recall (`recall_stream.py`)",
+    "Phase 7: Tests (`tests/test_conversation_recall.py`)"
   ]
 }

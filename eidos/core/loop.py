@@ -6,12 +6,14 @@ import os
 from pathlib import Path
 import threading
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from eidos.actions.mouse_keyboard import InputSimulator
 from eidos.actions.shell import ShellExecutor
 from eidos.browser.manager import PlaywrightManager
 from eidos.core.clock import EidosClock
+from eidos.core.task_run import TaskRun, current_run
 from eidos.core.context import EIDOS_TOOLS, build_system_prompt
 from eidos.core.stall import StallTracker
 from eidos.core.tool_registry import ToolRegistry
@@ -21,9 +23,10 @@ from eidos.integrations.optimalx import OptimalXBridge
 from eidos.integrations.web_research import WebResearchEngine
 from eidos.jobs import BatchJobRunner, SkillJobProcessor
 from eidos.memory.consolidator import EpisodicConsolidator, IdleConsolidationRunner
+from eidos.memory.conversation_index import ConversationIndex
 from eidos.memory.conversation_store import ConversationStore
 from eidos.memory.episodic_store import EpisodicStore
-from eidos.memory.recall_stream import RecallStreamInterceptor
+from eidos.memory.recall_stream import RecallBinding, RecallStreamInterceptor, recall_binding
 from eidos.memory.reflector import EpisodicReflector
 from eidos.memory.scope_resolver import ScopeResolver
 from eidos.memory.trajectory_logger import TrajectoryLogger
@@ -32,6 +35,7 @@ from eidos.memory.user_store import UserStore
 from eidos.models.base import BaseModelClient, ToolCall
 from eidos.models.chutes_client import ChutesClient
 from eidos.models.meta_client import DEFAULT_META_MODEL, DEFAULT_REASONING_EFFORT, META_BASE_URL, MetaClient
+from eidos.models.inflight import model_run_id
 from eidos.models.ollama_client import OllamaClient
 from eidos.models.compute_policy import ComputePolicy, compute_settings_from_config
 from eidos.models.ollama_options import embedding_num_gpu, local_num_ctx
@@ -71,12 +75,12 @@ class AgentLoop:
         reflector: Optional[EpisodicReflector] = None,
     ):
         self.config = config or {}
-        self._task_active = False
-        self._is_busy = threading.Event()
+        self._task_runs: Dict[str, TaskRun] = {}
+        self._task_runs_lock = threading.Lock()
         self._last_task_finished_time = time.monotonic()
         self.compute_policy = ComputePolicy.from_config(
             self.config,
-            is_task_active=lambda: self._task_active,
+            is_task_active=self.has_running_task,
         )
         self.kill_switch = kill_switch or KillSwitch()
         self.allowlist = AllowlistManager(
@@ -133,6 +137,20 @@ class AgentLoop:
         self.conversation_store: Optional[ConversationStore] = conversation_store or (
             ConversationStore(db_path=conv_db_path) if self.memory_enabled else None
         )
+        self.conversation_index: Optional[ConversationIndex] = None
+        self._conversation_backfill_started = False
+        if self.memory_enabled and self.conversation_store and self.episodic_store:
+            if vector_db_path:
+                index_path = Path(os.path.expanduser(str(vector_db_path))).parent / "conversation_index.db"
+            else:
+                index_path = Path(self.episodic_store.db_path).parent / "conversation_index.db"
+            embed_client = getattr(self.episodic_store, "embedding_client", None)
+            dimension = getattr(embed_client, "dimension", None) or getattr(self.episodic_store, "dimension", 768)
+            self.conversation_index = ConversationIndex(
+                db_path=index_path,
+                embedding_client=embed_client,
+                dimension=int(dimension),
+            )
         self.active_conversation_id: Optional[str] = None
         if self.conversation_store:
             self.active_conversation_id = self.conversation_store.get_or_create_active_conversation_id()
@@ -170,6 +188,7 @@ class AgentLoop:
                 optimalx_bridge=self.optimalx,
                 max_recalls_per_turn=int(mem_cfg.get("max_recalls_per_turn", 3)),
                 min_similarity=float(mem_cfg.get("recall_min_similarity", 0.20)),
+                conversation_index=self.conversation_index,
             )
             self.ollama.recall_interceptor = self.recall_interceptor
             self.ollama.on_recall_callback = self._on_recall_triggered
@@ -378,7 +397,6 @@ class AgentLoop:
             logger.debug("Could not attach voice barge-in to kill switch.")
 
         # Callbacks & conversational memory
-        self._stop_requested = threading.Event()
         self._callbacks: Dict[str, List[Any]] = {
             "on_task_start": [],
             "on_step": [],
@@ -399,6 +417,7 @@ class AgentLoop:
         self.conversation_history: List[Dict[str, Any]] = []
         self.last_turn_trace: Dict[str, Any] = {}
         self.reload_conversation_history()
+        self._start_conversation_backfill()
 
     def register_callback(self, event_name: str, callback: Any):
         """Register an observer callback for execution events."""
@@ -426,6 +445,7 @@ class AgentLoop:
 
     def reload_conversation_history(self) -> None:
         """Replace in-memory turns with the active conversation's stored messages."""
+        self._detach_running_history(self.active_conversation_id)
         self.conversation_history.clear()
         if not self.conversation_store or not self.active_conversation_id:
             return
@@ -438,34 +458,56 @@ class AgentLoop:
 
     def clear_history(self):
         """Clear conversational turn history and stored messages for active conversation."""
+        self._detach_running_history(self.active_conversation_id)
+        conversation_id = self.active_conversation_id
+        self._store_conversation_residue(conversation_id)
+        self._drop_indexed_exchanges(conversation_id)
         self.conversation_history.clear()
         title = "New Chat"
-        if self.conversation_store and self.active_conversation_id:
-            self.conversation_store.clear_conversation_messages(self.active_conversation_id)
-            conv = self.conversation_store.get_conversation(self.active_conversation_id)
+        if self.conversation_store and conversation_id:
+            self.conversation_store.clear_conversation_messages(conversation_id)
+            conv = self.conversation_store.get_conversation(conversation_id)
             if conv:
                 title = conv.get("title", "New Chat")
-        self._emit("on_conversation_changed", self.active_conversation_id, title)
+        self._emit("on_conversation_changed", conversation_id, title)
 
-    def _abort_model(self) -> None:
-        """Close the model HTTP call that is generating the current step."""
+    def _model_clients(self):
+        """Providers that can hold a cancel ticket, without listing one object twice."""
         seen = set()
+        clients = []
         for client in (
             getattr(self, "model", None),
             getattr(self, "router", None),
             getattr(self, "ollama", None),
             getattr(self, "chutes", None),
+            getattr(self, "meta", None),
         ):
             if client is None or id(client) in seen:
                 continue
             seen.add(id(client))
+            clients.append(client)
+        return clients
+
+    def _abort_model(self, run_id: Optional[str] = None) -> None:
+        """Close one run's model call, or every call when ``run_id`` is omitted."""
+        for client in self._model_clients():
             abort = getattr(client, "abort", None)
             if not callable(abort):
                 continue
             try:
-                abort()
+                abort(run_id)
             except Exception:
                 logger.debug("Model abort failed", exc_info=True)
+
+    def _drop_model_run(self, run_id: str) -> None:
+        for client in self._model_clients():
+            drop = getattr(client, "drop_run", None)
+            if not callable(drop):
+                continue
+            try:
+                drop(run_id)
+            except Exception:
+                logger.debug("Model ticket drop failed", exc_info=True)
 
     def _reset_model_abort(self) -> None:
         """Clear stop flags on model clients before a new task."""
@@ -487,31 +529,177 @@ class AgentLoop:
             except Exception:
                 logger.debug("Model abort reset failed", exc_info=True)
 
-    def cancel_task(self) -> None:
-        """Request graceful cancellation of the running agent task."""
-        logger.info("AgentLoop task cancellation requested.")
-        self._stop_requested.set()
-        self._abort_model()
+    def _live_runs(self) -> List[TaskRun]:
+        with self._task_runs_lock:
+            return [run for run in self._task_runs.values() if not run.finished]
+
+    def has_running_task(self) -> bool:
+        """True while any conversation still has a task that has not finished."""
+        return bool(self._live_runs())
+
+    @property
+    def _task_active(self) -> bool:
+        return self.has_running_task()
+
+    def running_conversation_ids(self) -> List[str]:
+        return [run.conversation_id for run in self._live_runs() if run.conversation_id]
+
+    def conversation_is_running(self, conversation_id: Optional[str]) -> bool:
+        if not conversation_id:
+            return False
+        return any(run.conversation_id == conversation_id for run in self._live_runs())
+
+    def parallel_actions_allowed(self) -> bool:
+        """Cloud API mode may overlap prompts, speech, and dictation."""
+        router = getattr(self, "router", None)
+        allowed = getattr(router, "parallel_actions_allowed", None)
+        if not callable(allowed):
+            return False
         try:
-            if self.voice:
-                self.voice.stop_speaking()
+            return bool(allowed())
         except Exception:
-            pass
+            return False
+
+    def local_machine_is_free(self) -> bool:
+        """False when a local Ollama task should keep the next speech or prompt waiting."""
+        return self.parallel_actions_allowed() or not self.has_running_task()
+
+    def _runs_for_stop(self, conversation_id: Optional[str]) -> List[TaskRun]:
+        runs = self._live_runs()
+        if conversation_id:
+            return [run for run in runs if run.conversation_id == conversation_id]
+        active = self.active_conversation_id or ""
+        matched = [run for run in runs if run.conversation_id == active]
+        if matched:
+            return matched
+        if len(runs) == 1:
+            return runs
+        return runs
+
+    def cancel_task(self, conversation_id: Optional[str] = None) -> None:
+        """Stop one conversation's task. Speech keeps playing when a cloud API is selected."""
+        logger.info("AgentLoop task cancellation requested.")
+        for run in self._runs_for_stop(conversation_id):
+            run.stop.set()
+            self._abort_model(run.run_id)
+        if not self.parallel_actions_allowed():
+            self._stop_voice()
         try:
             if hasattr(self, "jobs") and self.jobs and self.jobs.is_worker_running():
                 self.jobs.stop_background_worker(timeout=2.0)
         except Exception:
             pass
 
+    def cancel_all_tasks(self) -> None:
+        """Stop every task. The emergency kill switch uses this."""
+        logger.info("AgentLoop cancelling every task.")
+        for run in self._live_runs():
+            run.stop.set()
+        self._abort_model(None)
+        self._stop_voice()
+        try:
+            if hasattr(self, "jobs") and self.jobs and self.jobs.is_worker_running():
+                self.jobs.stop_background_worker(timeout=2.0)
+        except Exception:
+            pass
+
+    def _stop_voice(self) -> None:
+        try:
+            if self.voice:
+                self.voice.stop_speaking()
+        except Exception:
+            pass
+
     def is_stop_requested(self) -> bool:
-        """Return True if cancellation has been requested for the running task."""
-        return self._stop_requested.is_set()
+        """Return True when the task on this thread, or the open chat's task, was stopped."""
+        run = current_run.get()
+        if run is not None:
+            return run.stop.is_set()
+        active = self.active_conversation_id or ""
+        for item in self._live_runs():
+            if item.conversation_id == active:
+                return item.stop.is_set()
+        return False
 
     def is_busy(self) -> bool:
-        """Return True if agent loop or background batch job is actively running."""
-        is_task = (hasattr(self, "_is_busy") and self._is_busy.is_set()) or getattr(self, "_task_active", False)
+        """Return True if an agent task or background batch job is actively running."""
         is_job = hasattr(self, "jobs") and self.jobs and self.jobs.is_worker_running()
-        return bool(is_task or is_job)
+        return self.has_running_task() or bool(is_job)
+
+    def _mark_run_finished(self) -> None:
+        run = current_run.get()
+        if run is not None:
+            run.finished = True
+
+    def _detach_running_history(self, conversation_id: Optional[str]) -> None:
+        """Give a live task its own transcript before the open chat is replaced."""
+        if not conversation_id:
+            return
+        with self._task_runs_lock:
+            runs = [
+                run
+                for run in self._task_runs.values()
+                if run.conversation_id == conversation_id and run.history is self.conversation_history
+            ]
+        for run in runs:
+            run.history = list(self.conversation_history)
+
+    def _history_for_conversation(self, conversation_id: str) -> List[Dict[str, Any]]:
+        if not conversation_id or conversation_id == (self.active_conversation_id or ""):
+            return self.conversation_history
+        loaded: List[Dict[str, Any]] = []
+        store = self.conversation_store
+        if not store:
+            return loaded
+        try:
+            messages = store.get_messages(conversation_id)
+        except Exception:
+            logger.debug("Could not load history for conversation %s", conversation_id, exc_info=True)
+            return loaded
+        if not isinstance(messages, list):
+            return loaded
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = (message.get("role") or "").lower()
+            if role in ("user", "assistant"):
+                loaded.append({"role": role, "content": message.get("content", "")})
+        return loaded
+
+    def _bound_conversation_id(self) -> Optional[str]:
+        run = current_run.get()
+        if run is not None and run.conversation_id:
+            return run.conversation_id
+        return self.active_conversation_id
+
+    def _bound_history(self) -> List[Dict[str, Any]]:
+        run = current_run.get()
+        if run is not None:
+            return run.history
+        return self.conversation_history
+
+    def _bound_scope(self):
+        run = current_run.get()
+        if run is not None:
+            return run.scope
+        return self.current_task_scope
+
+    def _set_bound_scope(self, scope: Any) -> None:
+        run = current_run.get()
+        if run is not None:
+            run.scope = scope
+        if run is None or run.conversation_id == (self.active_conversation_id or ""):
+            self.current_task_scope = scope
+
+    def _busy_result(self, kind: str) -> Dict[str, Any]:
+        if kind == "local":
+            summary = (
+                "The local model is already working. Wait for it to finish, "
+                "or switch the provider to a cloud API to run another prompt."
+            )
+        else:
+            summary = "This conversation is already working on a prompt."
+        return {"success": False, "busy": True, "summary": summary, "steps_taken": 0}
 
     def shutdown(self, timeout: float = 2.0) -> None:
         """Shutdown background worker threads including episodic reflector and consolidator."""
@@ -597,6 +785,24 @@ class AgentLoop:
             self._write_live_focus(None, integration)
             return
         self._write_live_focus(None, None)
+
+    def _sync_recall_conversation(self) -> None:
+        """Tell mid-thought recall which conversation and job scope to search."""
+        interceptor = getattr(self, "recall_interceptor", None)
+        if interceptor is None:
+            return
+        conversation_id = self._bound_conversation_id()
+        job_id = None
+        scope_bound = False
+        store = getattr(self, "conversation_store", None)
+        if store and conversation_id:
+            try:
+                scope = store.get_conversation_scope(conversation_id) or {}
+                job_id = scope.get("job_id")
+                scope_bound = bool(scope.get("bound"))
+            except Exception as exc:
+                logger.debug("Could not read conversation scope for recall: %s", exc)
+        interceptor.set_conversation_ref(conversation_id, job_id, scope_bound)
 
     def _persist_scope_on_conversation(self, conversation_id: Optional[str]) -> None:
         """Save the live job or integration focus onto one conversation."""
@@ -693,7 +899,10 @@ class AgentLoop:
 
     def start_new_conversation(self, title: str = "New Chat") -> str:
         """Create a fresh conversation with no job scope from the conversation being left."""
-        self._persist_scope_on_conversation(getattr(self, "active_conversation_id", None))
+        left_id = getattr(self, "active_conversation_id", None)
+        self._detach_running_history(left_id)
+        self._persist_scope_on_conversation(left_id)
+        self._store_conversation_residue(left_id)
         if self.conversation_store:
             new_id = self.conversation_store.create_conversation(title=title)
             self.active_conversation_id = new_id
@@ -705,12 +914,14 @@ class AgentLoop:
         self._emit("on_conversation_title_changed", title)
         self._emit("on_conversation_changed", self.active_conversation_id, title)
         self._emit("on_job_focus")
+        self._sync_recall_conversation()
         return self.active_conversation_id or ""
 
     def switch_conversation(self, conversation_id: str) -> bool:
         """Switch active conversation, restoring that conversation's own job scope."""
         if not self.conversation_store:
             return False
+        self._detach_running_history(self.active_conversation_id)
         conv = self.conversation_store.get_conversation(conversation_id)
         if not conv:
             return False
@@ -726,6 +937,7 @@ class AgentLoop:
         else:
             self.active_conversation_id = conversation_id
         self.reload_conversation_history()
+        self._sync_recall_conversation()
         title = conv.get("title", "New Chat")
         self._emit("on_conversation_title_changed", title)
         self._emit("on_conversation_changed", conversation_id, title)
@@ -744,6 +956,11 @@ class AgentLoop:
         """Delete conversation from persistence. If active, switch to next available."""
         if not self.conversation_store:
             return False
+        if self.conversation_index:
+            try:
+                self.conversation_index.delete_conversation(conversation_id)
+            except Exception as exc:
+                logger.warning("Could not drop conversation index rows for %s: %s", conversation_id, exc)
         deleted = self.conversation_store.delete_conversation(conversation_id)
         if self.active_conversation_id == conversation_id:
             recent = self.conversation_store.get_most_recent_conversation()
@@ -885,12 +1102,14 @@ class AgentLoop:
             if self.recall_interceptor:
                 self.recall_interceptor.episodic_store = self.episodic_store
                 self.recall_interceptor.optimalx = self.optimalx
+                self.recall_interceptor.conversation_index = self.conversation_index
             elif (self.memory_enabled and self.episodic_store) or self.optimalx:
                 self.recall_interceptor = RecallStreamInterceptor(
                     episodic_store=self.episodic_store,
                     optimalx_bridge=self.optimalx,
                     max_recalls_per_turn=int(mem_cfg.get("max_recalls_per_turn", 3)),
                     min_similarity=float(mem_cfg.get("recall_min_similarity", 0.20)),
+                    conversation_index=self.conversation_index,
                 )
                 self.ollama.recall_interceptor = self.recall_interceptor
                 self.ollama.on_recall_callback = self._on_recall_triggered
@@ -1011,15 +1230,16 @@ class AgentLoop:
                 user_intervened=user_intervened,
             )
             if rec and self.episodic_store:
-                if self.current_task_scope:
-                    rec.metadata.project_name = self.current_task_scope.project_name
-                    rec.metadata.workspace_path = self.current_task_scope.workspace_path
-                    rec.metadata.cwd = self.current_task_scope.cwd
-                    rec.metadata.active_skill = self.current_task_scope.active_skill
-                    rec.metadata.window_class = self.current_task_scope.window_class
-                    rec.metadata.window_title = self.current_task_scope.window_title
-                    rec.metadata.job_id = self.current_task_scope.job_id
-                    rec.metadata.integration = self.current_task_scope.integration
+                scope = self._bound_scope()
+                if scope:
+                    rec.metadata.project_name = scope.project_name
+                    rec.metadata.workspace_path = scope.workspace_path
+                    rec.metadata.cwd = scope.cwd
+                    rec.metadata.active_skill = scope.active_skill
+                    rec.metadata.window_class = scope.window_class
+                    rec.metadata.window_title = scope.window_title
+                    rec.metadata.job_id = scope.job_id
+                    rec.metadata.integration = scope.integration
                     try:
                         self.trajectory_logger.update_episode(rec)
                     except Exception as upd_err:
@@ -1031,13 +1251,8 @@ class AgentLoop:
             return None
 
     def _on_kill_stop_voice(self) -> None:
-        """Stop TTS, request loop cancellation, and halt batch workers immediately when emergency kill fires."""
-        self._stop_requested.set()
-        try:
-            if self.voice:
-                self.voice.stop_speaking()
-        except Exception:
-            pass
+        """Stop TTS, cancel every task, and halt batch workers when emergency kill fires."""
+        self.cancel_all_tasks()
         try:
             if hasattr(self, "jobs") and self.jobs:
                 self.jobs._on_kill_switch_triggered()
@@ -1431,6 +1646,217 @@ PRIMARY JOB: {job_name} ({job_id})
             text = text[:7900] + "\n… [earlier progress truncated]"
         return text
 
+    def _start_conversation_backfill(self) -> None:
+        """Index up to 200 stored exchanges once per process. Embed failures stop the pass."""
+        if self._conversation_backfill_started:
+            return
+        if not self.memory_enabled or self.conversation_index is None or self.conversation_store is None:
+            return
+        self._conversation_backfill_started = True
+        threading.Thread(
+            target=self._backfill_conversation_index,
+            name="conversation-index-backfill",
+            daemon=True,
+        ).start()
+
+    def _backfill_conversation_index(self) -> None:
+        index = self.conversation_index
+        store = self.conversation_store
+        if index is None or store is None:
+            return
+        try:
+            known = index.known_message_ids()
+            missing = [item for item in store.iter_exchanges(None) if item.message_id not in known]
+            missing.sort(key=lambda item: item.created_at, reverse=True)
+            for exchange in missing[:200]:
+                scope = store.get_conversation_scope(exchange.conversation_id) or {}
+                conversation = store.get_conversation(exchange.conversation_id) or {}
+                saved = index.upsert(
+                    message_id=exchange.message_id,
+                    conversation_id=exchange.conversation_id,
+                    job_id=scope.get("job_id") or "",
+                    scope_bound=bool(scope.get("bound")),
+                    conversation_title=conversation.get("title") or "",
+                    user_text=exchange.user_text,
+                    assistant_text=exchange.assistant_text,
+                    created_at=exchange.created_at,
+                )
+                if not saved:
+                    logger.warning("Conversation index backfill stopped after an embed failure.")
+                    return
+        except Exception as exc:
+            logger.warning("Conversation index backfill stopped: %s", exc)
+
+    def _build_residue(self, conversation_id: str) -> str:
+        """Clip the latest exchanges into a local residue. No messages yields an empty string."""
+        store = self.conversation_store
+        if store is None or not conversation_id:
+            return ""
+        exchanges = store.iter_exchanges(conversation_id)[-8:]
+        if not exchanges:
+            return ""
+        lines: List[str] = []
+        for exchange in exchanges:
+            user = " ".join((exchange.user_text or "").split())[:200]
+            assistant = " ".join((exchange.assistant_text or "").split())[:300]
+            lines.append(f"User: {user}")
+            lines.append(f"Assistant: {assistant}")
+        return "\n".join(lines)[:1500]
+
+    def _store_conversation_residue(self, conversation_id: Optional[str]) -> None:
+        """Save a residue and index it. An empty build leaves any existing residue in place."""
+        store = self.conversation_store
+        if store is None or not conversation_id:
+            return
+        try:
+            residue = self._build_residue(conversation_id)
+            if not residue:
+                return
+            store.set_residue(conversation_id, residue)
+            index = self.conversation_index
+            if index is None:
+                return
+            scope = store.get_conversation_scope(conversation_id) or {}
+            conversation = store.get_conversation(conversation_id) or {}
+            created_at = max(item.created_at for item in store.iter_exchanges(conversation_id))
+            index.upsert(
+                message_id=f"residue:{conversation_id}",
+                conversation_id=conversation_id,
+                job_id=scope.get("job_id") or "",
+                scope_bound=bool(scope.get("bound")),
+                conversation_title=conversation.get("title") or "",
+                user_text="Conversation residue",
+                assistant_text=residue,
+                created_at=created_at,
+                is_residue=True,
+            )
+        except Exception as exc:
+            logger.warning("Could not store conversation residue for %s: %s", conversation_id, exc)
+
+    def _drop_indexed_exchanges(self, conversation_id: Optional[str]) -> None:
+        """Remove indexed turns for a conversation and keep its residue row."""
+        store = self.conversation_store
+        index = self.conversation_index
+        if store is None or index is None or not conversation_id:
+            return
+        try:
+            message_ids = [item.message_id for item in store.iter_exchanges(conversation_id)]
+            index.delete_messages(message_ids)
+        except Exception as exc:
+            logger.warning("Could not drop indexed exchanges for %s: %s", conversation_id, exc)
+
+    @staticmethod
+    def _conversation_tail(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep the last three user messages and three assistant messages, in order."""
+        user_kept = 0
+        assistant_kept = 0
+        chosen: List[int] = []
+        for index in range(len(history) - 1, -1, -1):
+            role = (history[index].get("role") or "").lower()
+            if role == "user" and user_kept < 3:
+                chosen.append(index)
+                user_kept += 1
+            elif role == "assistant" and assistant_kept < 3:
+                chosen.append(index)
+                assistant_kept += 1
+            if user_kept >= 3 and assistant_kept >= 3:
+                break
+        chosen.sort()
+        return [history[index] for index in chosen]
+
+    def _tail_assistant_message_ids(self, conversation_id: str) -> set:
+        """Assistant message ids that correspond to the verbatim tail."""
+        store = self.conversation_store
+        if store is None or not conversation_id:
+            return set()
+        user_kept = 0
+        assistant_kept = 0
+        ids: set = set()
+        for message in reversed(store.get_messages(conversation_id)):
+            role = (message.get("role") or "").upper()
+            if role == "USER" and user_kept < 3:
+                user_kept += 1
+            elif role == "ASSISTANT" and assistant_kept < 3:
+                assistant_kept += 1
+                message_id = message.get("id")
+                if message_id:
+                    ids.add(message_id)
+            if user_kept >= 3 and assistant_kept >= 3:
+                break
+        return ids
+
+    @staticmethod
+    def _attach_conversation_context(system_prompt: str, block: str) -> str:
+        """Place retrieved chat after the episodic block, otherwise at the end of the prompt."""
+        text = (block or "").strip()
+        if not text:
+            return system_prompt
+        marker = "</episodic_context>"
+        if marker in system_prompt:
+            return system_prompt.replace(marker, marker + "\n" + text, 1)
+        return system_prompt.rstrip() + "\n" + text
+
+    def _conversation_context_block(self, user_goal: str) -> str:
+        """Search older exchanges for this goal. An embed miss leaves the tail as the only history."""
+        index = self.conversation_index
+        store = self.conversation_store
+        conversation_id = self._bound_conversation_id()
+        if index is None or store is None or not conversation_id:
+            return ""
+        try:
+            scope = store.get_conversation_scope(conversation_id) or {}
+            exclude = self._tail_assistant_message_ids(conversation_id)
+            exclude.add(f"residue:{conversation_id}")
+            mem_cfg = self.config.get("memory", {}) if isinstance(self.config, dict) else {}
+            min_similarity = float(mem_cfg.get("recall_min_similarity", 0.20))
+            hits = index.search(
+                user_goal,
+                conversation_id=conversation_id,
+                job_id=scope.get("job_id"),
+                scope_bound=bool(scope.get("bound")),
+                top_k=3,
+                min_similarity=min_similarity,
+                exclude_message_ids=exclude,
+            )
+            residue = store.get_residue(conversation_id)
+            return index.render_context(
+                residue,
+                hits,
+                active_conversation_id=conversation_id,
+            )
+        except Exception as exc:
+            logger.warning("Conversation retrieval skipped: %s", exc)
+            return ""
+
+    def _index_remembered_turn(self, assistant_id: str, content: str) -> None:
+        """Index the exchange this assistant message closes. Failures stay off the task path."""
+        index = self.conversation_index
+        store = self.conversation_store
+        conversation_id = self._bound_conversation_id()
+        if index is None or store is None or not conversation_id or not assistant_id:
+            return
+        try:
+            match = next(
+                (item for item in store.iter_exchanges(conversation_id) if item.message_id == assistant_id),
+                None,
+            )
+            if match is None:
+                return
+            scope = store.get_conversation_scope(conversation_id) or {}
+            conversation = store.get_conversation(conversation_id) or {}
+            index.upsert(
+                message_id=assistant_id,
+                conversation_id=conversation_id,
+                job_id=scope.get("job_id") or "",
+                scope_bound=bool(scope.get("bound")),
+                conversation_title=conversation.get("title") or "",
+                user_text=match.user_text,
+                assistant_text=content,
+                created_at=match.created_at,
+            )
+        except Exception as exc:
+            logger.warning("Could not index conversation turn %s: %s", assistant_id, exc)
+
     def _remember_turn(
         self,
         content: str,
@@ -1443,19 +1869,25 @@ PRIMARY JOB: {job_name} ({job_id})
         """Save the assistant turn for the next model call and for chat history."""
         public_thoughts = [self._compact_trace_text(t, 500) for t in thoughts if (t or "").strip()][-12:]
         public_actions = list(actions[-24:])
-        self.last_turn_trace = {
+        trace = {
             "headline": headline,
             "detail": content,
             "thoughts": public_thoughts,
             "actions": public_actions,
             "outcome": outcome,
         }
+        run = current_run.get()
+        if run is not None:
+            run.trace = trace
+        if run is None or run.conversation_id == (self.active_conversation_id or ""):
+            self.last_turn_trace = trace
         if not content:
             return
-        self.conversation_history.append({"role": "assistant", "content": content})
-        if self.conversation_store and self.active_conversation_id:
-            self.conversation_store.add_message(
-                self.active_conversation_id,
+        self._bound_history().append({"role": "assistant", "content": content})
+        conversation_id = self._bound_conversation_id()
+        if self.conversation_store and conversation_id:
+            assistant_id = self.conversation_store.add_message(
+                conversation_id,
                 role="assistant",
                 content=content,
                 metadata={
@@ -1465,6 +1897,7 @@ PRIMARY JOB: {job_name} ({job_id})
                     "outcome": outcome,
                 },
             )
+            self._index_remembered_turn(assistant_id, content)
 
     def _complete_run(
         self,
@@ -1501,55 +1934,90 @@ PRIMARY JOB: {job_name} ({job_id})
             actions=actions,
             outcome=outcome,
         )
+        self._mark_run_finished()
         self._emit("on_task_finish", headline, success)
         stopped = outcome == "aborted" and "stopped by user" in headline.lower()
+        trace = self._active_trace()
         return {
             "success": success,
             "stopped": stopped,
             "summary": headline,
             "detail": detail,
             "steps_taken": step,
-            "thoughts": list(self.last_turn_trace.get("thoughts") or []),
-            "actions": list(self.last_turn_trace.get("actions") or []),
+            "thoughts": list(trace.get("thoughts") or []),
+            "actions": list(trace.get("actions") or []),
         }
+
+    def _active_trace(self) -> Dict[str, Any]:
+        run = current_run.get()
+        if run is not None and run.trace:
+            return run.trace
+        return self.last_turn_trace
+
+    def _admit_run(self, conversation_id: str) -> tuple:
+        """Reserve a run, or return a busy result when this machine or chat is taken."""
+        run = TaskRun(
+            run_id=uuid.uuid4().hex,
+            conversation_id=conversation_id,
+            stop=threading.Event(),
+            history=self._history_for_conversation(conversation_id),
+        )
+        with self._task_runs_lock:
+            live = [item for item in self._task_runs.values() if not item.finished]
+            if not self.parallel_actions_allowed() and live:
+                return None, self._busy_result("local")
+            if conversation_id and any(item.conversation_id == conversation_id for item in live):
+                return None, self._busy_result("conversation")
+            if not conversation_id and live:
+                return None, self._busy_result("conversation")
+            self._task_runs[run.run_id] = run
+        return run, None
 
     def run_task(
         self,
         user_goal: str,
         max_steps: Optional[int] = None,
         speak_summary: bool = True,
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Run until the goal is finished, the task stalls, or the step ceiling is hit."""
+        """Run until the goal is finished, the task stalls, or the step ceiling is hit.
+
+        A cloud provider can host more than one of these. Local Ollama admits one.
+        """
         step_ceiling, explicit_step_cap = self._resolve_step_ceiling(max_steps)
+        conv_id = conversation_id or self.active_conversation_id or ""
+        conv_id = str(conv_id).strip()
+        run, busy = self._admit_run(conv_id)
+        if busy is not None:
+            logger.info("Task not started: %s", busy.get("summary"))
+            return busy
+
         logger.info("Starting EidosBot task: %s", user_goal)
-        self.compute_policy.touch_user_activity()
-        self._stop_requested.clear()
-        self._reset_model_abort()
-
-        # Re-activate assigned skill if a job is in focus; otherwise clear standalone skill
-        if self.active_job:
-            skill_info = self.active_job.get("skill")
-            skill_name = (
-                skill_info.get("name")
-                if isinstance(skill_info, dict)
-                else self.active_job.get("skill_name")
-            )
-            if not skill_name and self.active_job.get("skills"):
-                first_skill = self.active_job["skills"][0]
-                skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
-            if skill_name:
-                self.active_skill = self.skills.load_skill(skill_name)
-        else:
-            self.active_skill = None
-        self._emit("on_task_start", user_goal)
+        run_token = current_run.set(run)
+        model_token = model_run_id.set(run.run_id)
+        recall_token = recall_binding.set(RecallBinding(conversation_id=conv_id))
         try:
-            self.voice.stop_speaking()
-        except Exception:
-            pass
+            self.compute_policy.touch_user_activity()
+            self._reset_model_abort()
 
-        self._task_active = True
-        self._is_busy.set()
-        try:
+            # Re-activate assigned skill if a job is in focus; otherwise clear standalone skill
+            if self.active_job:
+                skill_info = self.active_job.get("skill")
+                skill_name = (
+                    skill_info.get("name")
+                    if isinstance(skill_info, dict)
+                    else self.active_job.get("skill_name")
+                )
+                if not skill_name and self.active_job.get("skills"):
+                    first_skill = self.active_job["skills"][0]
+                    skill_name = first_skill.get("name") if isinstance(first_skill, dict) else str(first_skill)
+                if skill_name:
+                    self.active_skill = self.skills.load_skill(skill_name)
+            else:
+                self.active_skill = None
+            self._emit("on_task_start", user_goal)
+            if not self.parallel_actions_allowed():
+                self._stop_voice()
             return self._run_task_body(
                 user_goal,
                 step_ceiling=step_ceiling,
@@ -1557,8 +2025,12 @@ PRIMARY JOB: {job_name} ({job_id})
                 speak_summary=speak_summary,
             )
         finally:
-            self._task_active = False
-            self._is_busy.clear()
+            current_run.reset(run_token)
+            model_run_id.reset(model_token)
+            recall_binding.reset(recall_token)
+            with self._task_runs_lock:
+                self._task_runs.pop(run.run_id, None)
+            self._drop_model_run(run.run_id)
             self._last_task_finished_time = time.monotonic()
 
     def _run_task_body(
@@ -1582,6 +2054,7 @@ PRIMARY JOB: {job_name} ({job_id})
         if self.kill_switch.is_triggered():
             summary = "Task aborted: Global kill switch is currently active. Reset kill switch before starting."
             self._finish_and_index_episode(episode_id, outcome="aborted", final_summary=summary)
+            self._mark_run_finished()
             self._emit("on_task_finish", summary, False)
             return {
                 "success": False,
@@ -1589,9 +2062,10 @@ PRIMARY JOB: {job_name} ({job_id})
                 "steps_taken": 0,
             }
 
-        if self._stop_requested.is_set():
+        if self.is_stop_requested():
             summary = "Task stopped by user."
             self._finish_and_index_episode(episode_id, outcome="aborted", final_summary=summary)
+            self._mark_run_finished()
             self._emit("on_task_finish", summary, False)
             return {
                 "success": False,
@@ -1602,20 +2076,37 @@ PRIMARY JOB: {job_name} ({job_id})
 
         # Macro retrieval of past experience (golden path + pitfall)
         active_win = self.windows.get_active_window_info()
-        self.current_task_scope = ScopeResolver.resolve_current_scope(
+        self._set_bound_scope(ScopeResolver.resolve_current_scope(
             cwd=os.getcwd(),
             active_window=active_win,
             active_skill=self.active_skill,
             active_job=self.active_job,
-        )
+        ))
         if self.recall_interceptor:
-            self.recall_interceptor.set_current_scope(self.current_task_scope)
+            self.recall_interceptor.set_current_scope(self._bound_scope())
+            self._sync_recall_conversation()
 
         episodic_ctx = ""
         if self.memory_enabled and self.episodic_store:
             try:
+                mem_cfg = self.config.get("memory", {}) if isinstance(self.config, dict) else {}
+                macro_success = float(
+                    mem_cfg.get(
+                        "macro_recall_min_similarity_success",
+                        mem_cfg.get("macro_min_similarity", 0.45),
+                    )
+                )
+                macro_pitfall = float(
+                    mem_cfg.get(
+                        "macro_recall_min_similarity_pitfall",
+                        mem_cfg.get("macro_min_similarity", 0.35),
+                    )
+                )
                 episodic_ctx = self.episodic_store.retrieve_macro_context(
-                    user_goal, scope=self.current_task_scope
+                    user_goal,
+                    scope=self._bound_scope(),
+                    min_similarity_success=macro_success,
+                    min_similarity_pitfall=macro_pitfall,
                 )
                 if episodic_ctx:
                     logger.info("Macro recall retrieved episodic context for task: %s", user_goal)
@@ -1629,23 +2120,31 @@ PRIMARY JOB: {job_name} ({job_id})
             episodic_ctx=episodic_ctx,
         )
 
-        # Construct messages including past conversational turns
+        # Construct messages including a short verbatim tail and retrieved older turns
+        conversation_block = self._conversation_context_block(user_goal)
+        if conversation_block:
+            system_prompt = self._attach_conversation_context(system_prompt, conversation_block)
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
         ]
-        for msg in self.conversation_history[-16:]:
-            if msg.get("role") in ("user", "assistant"):
-                messages.append(msg)
+        history = self._bound_history()
+        for msg in self._conversation_tail(history):
+            messages.append(msg)
 
         messages.append({"role": "user", "content": f"User Goal: {user_goal}"})
-        self.conversation_history.append({"role": "user", "content": user_goal})
-        if self.conversation_store and self.active_conversation_id:
-            old_conv = self.conversation_store.get_conversation(self.active_conversation_id)
+        history.append({"role": "user", "content": user_goal})
+        bound_conversation = self._bound_conversation_id()
+        if self.conversation_store and bound_conversation:
+            old_conv = self.conversation_store.get_conversation(bound_conversation)
             old_title = old_conv.get("title") if old_conv else None
-            self.conversation_store.add_message(self.active_conversation_id, role="user", content=user_goal)
-            new_conv = self.conversation_store.get_conversation(self.active_conversation_id)
+            self.conversation_store.add_message(bound_conversation, role="user", content=user_goal)
+            new_conv = self.conversation_store.get_conversation(bound_conversation)
             new_title = new_conv.get("title") if new_conv else None
-            if old_title != new_title and new_title:
+            if (
+                old_title != new_title
+                and new_title
+                and bound_conversation == (self.active_conversation_id or "")
+            ):
                 self._emit("on_conversation_title_changed", new_title)
 
         step = 0
@@ -1675,7 +2174,7 @@ PRIMARY JOB: {job_name} ({job_id})
                     actions=turn_actions,
                     include_trace=True,
                 )
-            if self._stop_requested.is_set():
+            if self.is_stop_requested():
                 logger.warning("Agent loop stopped by user request at step %d", step)
                 return self._complete_run(
                     episode_id=episode_id,
@@ -1718,7 +2217,7 @@ PRIMARY JOB: {job_name} ({job_id})
 
             # 2. Reason: Call model
             response = self.model.chat(messages=messages, tools=active_tools)
-            if self._stop_requested.is_set() or self.kill_switch.is_triggered() or (
+            if self.is_stop_requested() or self.kill_switch.is_triggered() or (
                 isinstance(getattr(response, "raw", None), dict) and response.raw.get("cancelled")
             ):
                 logger.warning("Agent loop stopped during model generation at step %d", step)
@@ -1849,7 +2348,7 @@ PRIMARY JOB: {job_name} ({job_id})
             stall_nudge = None
 
             for tc in response.tool_calls:
-                if self._stop_requested.is_set() or self.kill_switch.is_triggered():
+                if self.is_stop_requested() or self.kill_switch.is_triggered():
                     logger.warning("Agent loop stopped before tool '%s'", tc.name)
                     task_summary = "Task stopped by user."
                     task_finished = True
@@ -1922,7 +2421,7 @@ PRIMARY JOB: {job_name} ({job_id})
                 self.trajectory_logger.log_step(episode_id, step_rec)
 
             if task_finished:
-                stopped = self._stop_requested.is_set() or self.kill_switch.is_triggered()
+                stopped = self.is_stop_requested() or self.kill_switch.is_triggered()
                 return self._complete_run(
                     episode_id=episode_id,
                     headline=task_summary or ("Task stopped by user." if stopped else "Task completed."),
@@ -2954,7 +3453,7 @@ PRIMARY JOB: {job_name} ({job_id})
                     pause_between_items_sec=pause_sec,
                     max_items=max_items,
                     kill_switch_checker=self.kill_switch.is_triggered,
-                    stop_event=self._stop_requested,
+                    stop_event=(current_run.get().stop if current_run.get() is not None else threading.Event()),
                 )
             if job_id and self.active_job:
                 updated_manifest = self.jobs.load_manifest(job_id)
@@ -3074,8 +3573,9 @@ PRIMARY JOB: {job_name} ({job_id})
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
 
             # Tag current task scope integration for episodic memory (PROJECT_JOBS.md Section 13.4)
-            if self.current_task_scope:
-                self.current_task_scope.integration = server_name
+            scope = self._bound_scope()
+            if scope:
+                scope.integration = server_name
 
             res = self.mcp_client.call_tool(server_name, remote_tool, args)
             return res, False
@@ -3102,8 +3602,9 @@ PRIMARY JOB: {job_name} ({job_id})
                 return {"success": False, "error": f"Denied by safety policy: {reason}"}, False
 
             # Tag current task scope integration for episodic memory (PROJECT_JOBS.md Section 13.4)
-            if self.current_task_scope:
-                self.current_task_scope.integration = server_name
+            scope = self._bound_scope()
+            if scope:
+                scope.integration = server_name
 
             res = self.mcp_client.call_tool(server_name, remote_tool, tool_args)
             return res, False

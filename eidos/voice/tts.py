@@ -289,6 +289,12 @@ class KokoroTTS:
     def shutdown(self):
         """Stop playback and tear down the warm Kokoro worker."""
         self.stop()
+        release = getattr(self._playback, "release", None)
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                pass
         with self._worker_lock:
             if self._worker:
                 self._worker.shutdown()

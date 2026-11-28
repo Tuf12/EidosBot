@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { ChatMessage, SharedFile } from '../types/gateway';
 import { ThoughtAccordion } from './ThoughtAccordion';
 import { MarkdownRenderer, copyToClipboard, markdownToPlainText } from './MarkdownRenderer';
@@ -50,6 +50,8 @@ interface ChatViewProps {
   onDismissRetryNotice?: () => void;
   token: string;
   isThinking: boolean;
+  /** Cloud API mode: speech and a second conversation can run while this chat works. */
+  parallelActions?: boolean;
   isPlaying?: boolean;
   playbackActive?: boolean;
   isPaused?: boolean;
@@ -71,6 +73,7 @@ interface ChatViewProps {
   onReleasePreparedPlayback?: () => void;
   onStopTask?: () => void;
   playbackError?: string | null;
+  conversationId?: string | null;
   conversationTitle?: string;
   onNewChat?: () => void;
   onRefreshSync?: () => void;
@@ -115,6 +118,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   onDismissRetryNotice,
   token,
   isThinking,
+  parallelActions = false,
   isPlaying = false,
   playbackActive = false,
   isPaused = false,
@@ -134,6 +138,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
   onReleasePreparedPlayback,
   onStopTask,
   playbackError,
+  conversationId = null,
   conversationTitle = 'New Chat',
   onNewChat,
   onRefreshSync,
@@ -167,7 +172,13 @@ export const ChatView: React.FC<ChatViewProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState('');
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const programmaticScrollRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
+  const seenConversationRef = useRef<string | null | undefined>(undefined);
+  const touchStartYRef = useRef(0);
+  const [pinnedToBottom, setPinnedToBottom] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const editRef = useRef<HTMLTextAreaElement>(null);
@@ -192,9 +203,82 @@ export const ChatView: React.FC<ChatViewProps> = ({
     releasePlaybackRef.current?.();
   };
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isThinking]);
+  const scrollMessagesToBottom = useCallback(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    programmaticScrollRef.current = true;
+    el.scrollTop = el.scrollHeight;
+    lastScrollTopRef.current = el.scrollTop;
+    programmaticScrollRef.current = false;
+  }, []);
+
+  const followLatest = useCallback(() => {
+    stickToBottomRef.current = true;
+    setPinnedToBottom(true);
+    scrollMessagesToBottom();
+  }, [scrollMessagesToBottom]);
+
+  const handleMessagesScroll = () => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    if (programmaticScrollRef.current) {
+      lastScrollTopRef.current = el.scrollTop;
+      return;
+    }
+    const previous = lastScrollTopRef.current;
+    const top = el.scrollTop;
+    lastScrollTopRef.current = top;
+    const distance = el.scrollHeight - top - el.clientHeight;
+    if (top < previous - 2) {
+      stickToBottomRef.current = false;
+      setPinnedToBottom(false);
+      return;
+    }
+    if (distance <= 48) {
+      stickToBottomRef.current = true;
+      setPinnedToBottom(true);
+    }
+  };
+
+  const handleMessagesWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY >= 0) return;
+    const el = messagesContainerRef.current;
+    if (!el || el.scrollTop <= 0) return;
+    stickToBottomRef.current = false;
+    setPinnedToBottom(false);
+  };
+
+  const handleMessagesTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    touchStartYRef.current = event.touches[0]?.clientY ?? 0;
+  };
+
+  const handleMessagesTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    const y = event.touches[0]?.clientY ?? 0;
+    if (y <= touchStartYRef.current + 12) return;
+    const el = messagesContainerRef.current;
+    if (!el || el.scrollTop <= 0) return;
+    stickToBottomRef.current = false;
+    setPinnedToBottom(false);
+  };
+
+  useLayoutEffect(() => {
+    const previous = seenConversationRef.current;
+    const nextId = conversationId ?? null;
+    seenConversationRef.current = nextId;
+    if (previous === undefined || previous === nextId) return;
+    if (!previous && nextId) {
+      if (stickToBottomRef.current) scrollMessagesToBottom();
+      return;
+    }
+    stickToBottomRef.current = true;
+    setPinnedToBottom(true);
+    scrollMessagesToBottom();
+  }, [conversationId, scrollMessagesToBottom]);
+
+  useLayoutEffect(() => {
+    if (!stickToBottomRef.current) return;
+    scrollMessagesToBottom();
+  }, [messages, isThinking, scrollMessagesToBottom]);
 
   // Recording duration timer
   useEffect(() => {
@@ -287,6 +371,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     const text = editDraft.trim();
     if (!text || !onEditRetry || isThinking) return;
     if (autoSpeak) onPreparePlayback?.();
+    followLatest();
     onEditRetry(messageIndex, text, messageId);
     setEditingId(null);
     setEditDraft('');
@@ -307,6 +392,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     const user = messages[userIndex];
     if (!user || user.role !== 'user' || !user.content.trim()) return;
     if (autoSpeak) onPreparePlayback?.();
+    followLatest();
     onEditRetry(userIndex, user.content, user.id);
   };
 
@@ -329,6 +415,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
     if (isThinking || isUploading) return;
     const text = inputText.trim();
     if (!text && pendingFiles.length === 0) return;
+    followLatest();
     if (autoSpeak) onPreparePlayback?.();
     if (pendingFiles.length === 0) {
       onSendMessage(text);
@@ -482,6 +569,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
             if (autoSubmitVoice) {
               setInputText('');
               micArmedPlaybackRef.current = false;
+              followLatest();
               onSendMessage(transcribed);
               applyComposerCollapse();
             } else {
@@ -518,7 +606,7 @@ export const ChatView: React.FC<ChatViewProps> = ({
         setMicNotice(`Could not access microphone: ${err.message}`);
       }
     }
-  }, [token, autoSubmitVoice, onSendMessage, applyComposerCollapse]);
+  }, [token, autoSubmitVoice, onSendMessage, applyComposerCollapse, followLatest]);
 
   const stopRecording = useCallback(() => {
     if (
@@ -654,7 +742,15 @@ export const ChatView: React.FC<ChatViewProps> = ({
       )}
 
       {/* Messages Scroll Area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="relative flex-1 min-h-0">
+      <div
+        ref={messagesContainerRef}
+        onScroll={handleMessagesScroll}
+        onWheel={handleMessagesWheel}
+        onTouchStart={handleMessagesTouchStart}
+        onTouchMove={handleMessagesTouchMove}
+        className="h-full overflow-y-auto overflow-anchor-none p-4 space-y-4"
+      >
         {messages.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-center p-6 text-[#6272a4]">
             <div className="w-14 h-14 rounded-2xl bg-[#282a36] border border-[#44475a] flex items-center justify-center text-[#bd93f9] mb-3 shadow-lg">
@@ -961,7 +1057,17 @@ export const ChatView: React.FC<ChatViewProps> = ({
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+      </div>
+      {!pinnedToBottom && messages.length > 0 && (
+        <button
+          type="button"
+          onClick={followLatest}
+          className="absolute bottom-3 left-1/2 z-10 inline-flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-[#44475a] bg-[#282a36]/95 px-3 py-1.5 text-[11px] font-semibold text-[#f8f8f2] shadow-lg hover:border-[#bd93f9] hover:text-[#bd93f9] transition active:scale-95"
+        >
+          <ChevronDown className="w-3.5 h-3.5" />
+          Latest
+        </button>
+      )}
       </div>
 
       <SharedFiles
@@ -1112,8 +1218,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
             <button
               type="button"
               onClick={handleCollapsedMic}
-              disabled={isTranscribing}
-              title={isTranscribing ? 'Transcribing with Parakeet STT...' : 'Dictate and open the composer'}
+              disabled={isTranscribing || (isThinking && !parallelActions)}
+              title={
+                isTranscribing
+                  ? 'Transcribing with Parakeet STT...'
+                  : isThinking && !parallelActions
+                  ? 'Dictation waits until the local model is free.'
+                  : 'Dictate and open the composer'
+              }
               className={`shrink-0 p-2 rounded-xl transition active:scale-95 ${
                 isTranscribing
                   ? 'text-[#50fa7b] cursor-wait'
@@ -1200,12 +1312,14 @@ export const ChatView: React.FC<ChatViewProps> = ({
               <button
                 type="button"
                 onClick={toggleRecording}
-                disabled={isTranscribing}
+                disabled={isTranscribing || (isThinking && !parallelActions)}
                 title={
                   isRecording
                     ? 'Recording in progress... Tap to finish and transcribe'
                     : isTranscribing
                     ? 'Transcribing with Parakeet STT...'
+                    : isThinking && !parallelActions
+                    ? 'Dictation waits until the local model is free.'
                     : 'Push to Dictate (Continuous Parakeet STT)'
                 }
                 className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-xs font-medium transition active:scale-95 ${
@@ -1258,32 +1372,28 @@ export const ChatView: React.FC<ChatViewProps> = ({
                 {isExpanded ? <Minimize2 className="w-4 h-4" /> : <Maximize2 className="w-4 h-4" />}
               </button>
 
-              {/* Submit, stop audio, or stop the running task. Audio stop never cancels the reply. */}
-              {isThinking || isPlaying ? (
-                <>
-                  {isPlaying && (
-                    <button
-                      type="button"
-                      onClick={handleStopSpeech}
-                      title="Stop audio playback. The reply stays in the chat."
-                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#44475a] text-[#f8f8f2] font-bold text-xs hover:bg-[#6272a4] transition active:scale-95 shadow-md"
-                    >
-                      <VolumeX className="w-3.5 h-3.5" />
-                      <span>Stop audio</span>
-                    </button>
-                  )}
-                  {isThinking && (
-                    <button
-                      type="button"
-                      onClick={handleStopTask}
-                      title="Stop the current task (Esc)"
-                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition active:scale-95 shadow-md animate-pulse"
-                    >
-                      <Square className="w-3.5 h-3.5 fill-current" />
-                      <span>Stop</span>
-                    </button>
-                  )}
-                </>
+              {/* Stop audio, stop this chat's task, and send stay independent. */}
+              {isPlaying && (
+                <button
+                  type="button"
+                  onClick={handleStopSpeech}
+                  title="Stop audio playback. The reply stays in the chat."
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#44475a] text-[#f8f8f2] font-bold text-xs hover:bg-[#6272a4] transition active:scale-95 shadow-md"
+                >
+                  <VolumeX className="w-3.5 h-3.5" />
+                  <span>Stop audio</span>
+                </button>
+              )}
+              {isThinking ? (
+                <button
+                  type="button"
+                  onClick={handleStopTask}
+                  title="Stop this conversation (Esc)"
+                  className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-[#ff5555] text-white font-bold text-xs hover:bg-[#ff5555]/90 transition active:scale-95 shadow-md animate-pulse"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>Stop</span>
+                </button>
               ) : (
                 <button
                   type="submit"

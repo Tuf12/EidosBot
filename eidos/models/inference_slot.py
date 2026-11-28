@@ -1,7 +1,7 @@
-"""Process-wide mutex for GPU-heavy local inference (Ollama LLM + Parakeet STT).
+"""Process-wide mutex for GPU-heavy local inference (Ollama LLM + CUDA Parakeet).
 
-Only one of these may run at a time so VRAM is not stacked. CPU-only work
-(nomic-embed on CPU, Kokoro TTS) does not use this slot.
+Only one of these may run at a time so VRAM is not stacked. Cloud API calls,
+CPU embeddings, and Kokoro TTS do not use this slot.
 """
 
 from __future__ import annotations

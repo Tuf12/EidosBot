@@ -1,5 +1,6 @@
 """SQLite-backed conversation and message persistence store for EidosBot (~/.eidos/eidos.db)."""
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
@@ -15,6 +16,20 @@ import uuid
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONVERSATIONS_DB_PATH = Path.home() / ".eidos" / "eidos.db"
+
+
+@dataclass
+class Exchange:
+    """One user message paired with the assistant message that followed it.
+
+    ``message_id`` is the assistant message. That id is the conversation-index key.
+    """
+
+    conversation_id: str
+    message_id: str
+    user_text: str
+    assistant_text: str
+    created_at: int
 
 
 def _generate_title_from_prompt(prompt: str, max_chars: int = 42) -> str:
@@ -194,6 +209,8 @@ class ConversationStore:
             self._conn.execute("ALTER TABLE Conversation ADD COLUMN jobId TEXT")
         if "integrationFocus" not in columns:
             self._conn.execute("ALTER TABLE Conversation ADD COLUMN integrationFocus TEXT")
+        if "residue" not in columns:
+            self._conn.execute("ALTER TABLE Conversation ADD COLUMN residue TEXT")
 
     def get_conversation_scope(self, conversation_id: str) -> Optional[Dict[str, Any]]:
         """Return the job scope bound to a conversation.
@@ -248,6 +265,70 @@ class ConversationStore:
                 (job_val, integration_val, conversation_id),
             )
             self._conn.commit()
+
+    def get_residue(self, conversation_id: str) -> str:
+        """Return the stored residue summary, or an empty string when none exists."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT residue FROM Conversation WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if not row:
+                return ""
+            raw = row["residue"]
+            return raw.strip() if isinstance(raw, str) else ""
+
+    def set_residue(self, conversation_id: str, text: str) -> None:
+        """Store a residue summary on the conversation. Does not change job scope."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE Conversation SET residue = ? WHERE id = ?",
+                (text or "", conversation_id),
+            )
+            self._conn.commit()
+
+    def iter_exchanges(self, conversation_id: Optional[str] = None) -> List[Exchange]:
+        """Pair each user message with the next assistant message.
+
+        Roles other than user and assistant are skipped. ``conversation_id``
+        None walks every conversation, oldest conversation first.
+        """
+        with self._lock:
+            if conversation_id:
+                conv_ids = [conversation_id]
+            else:
+                rows = self._conn.execute(
+                    "SELECT id FROM Conversation ORDER BY createdAt ASC"
+                ).fetchall()
+                conv_ids = [row["id"] for row in rows]
+            exchanges: List[Exchange] = []
+            for conv_id in conv_ids:
+                messages = self._conn.execute(
+                    """
+                    SELECT id, content, role, createdAt
+                    FROM Message
+                    WHERE conversationId = ?
+                    ORDER BY createdAt ASC
+                    """,
+                    (conv_id,),
+                ).fetchall()
+                pending_user = None
+                for message in messages:
+                    role = (message["role"] or "").upper()
+                    if role == "USER":
+                        pending_user = message
+                    elif role == "ASSISTANT" and pending_user is not None:
+                        exchanges.append(
+                            Exchange(
+                                conversation_id=conv_id,
+                                message_id=message["id"],
+                                user_text=pending_user["content"] or "",
+                                assistant_text=message["content"] or "",
+                                created_at=int(message["createdAt"]),
+                            )
+                        )
+                        pending_user = None
+            return exchanges
 
     def create_conversation(
         self,

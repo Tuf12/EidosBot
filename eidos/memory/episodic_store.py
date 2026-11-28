@@ -708,6 +708,9 @@ class EpisodicStore:
         sharing (marked with ``cross_job_shared=True``), and general environment pitfalls are retained.
 
         Archived duplicate episodes (is_archived = 1) are excluded by default unless include_archived=True.
+
+        ``min_similarity`` is compared against composite (pre-scope-boost) similarity so ambient
+        boosts rank qualified hits without admitting weak vector matches.
         """
         cleaned_query = query.strip()
         if not cleaned_query:
@@ -908,7 +911,7 @@ class EpisodicStore:
                 continue
 
             final_sim = composite_sim + scope_boost
-            if final_sim < min_similarity:
+            if composite_sim < min_similarity:
                 continue
 
             key_actions: List[str] = []
@@ -1058,7 +1061,7 @@ class EpisodicStore:
                 continue
 
             final_sim = composite_sim + scope_boost
-            if final_sim < min_similarity:
+            if composite_sim < min_similarity:
                 continue
 
             key_actions: List[str] = []
@@ -1109,11 +1112,15 @@ class EpisodicStore:
         task_goal: str,
         top_k_success: int = 1,
         top_k_pitfall: int = 1,
-        min_similarity: float = 0.15,
+        min_similarity: float = 0.42,
+        min_similarity_success: Optional[float] = None,
+        min_similarity_pitfall: Optional[float] = None,
         include_archived: bool = False,
         scope: Optional[TaskScope] = None,
     ) -> str:
         """Retrieve top golden path success and cautionary pitfall for macro context injection."""
+        success_floor = min_similarity_success if min_similarity_success is not None else min_similarity
+        pitfall_floor = min_similarity_pitfall if min_similarity_pitfall is not None else min_similarity
         if not task_goal.strip():
             return ""
 
@@ -1127,7 +1134,7 @@ class EpisodicStore:
             query=task_goal,
             top_k=top_k_success,
             outcome_filter="success",
-            min_similarity=min_similarity,
+            min_similarity=success_floor,
             query_vector=shared_vector,
             include_archived=include_archived,
             scope=scope,
@@ -1138,7 +1145,7 @@ class EpisodicStore:
             query=task_goal,
             top_k=top_k_pitfall + len(success_ids) * 2,
             outcome_filter="pitfall",
-            min_similarity=min_similarity,
+            min_similarity=pitfall_floor,
             query_vector=shared_vector,
             include_archived=include_archived,
             scope=scope,

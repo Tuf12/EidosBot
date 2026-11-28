@@ -168,7 +168,7 @@ class VoiceManager:
             session.seek_by(seconds)
 
     def stop_speaking(self):
-        """Immediately stop ongoing TTS playback and discard queued clips."""
+        """Silence playback and keep the recording until the next utterance replaces it."""
         self.speech_stream.stop()
         self.tts.stop()
 

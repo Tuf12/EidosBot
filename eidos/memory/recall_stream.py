@@ -1,17 +1,35 @@
 """Active Recall & Mid-Stream Injection interceptor for token-stream self-querying."""
 
+from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
 
 from eidos.memory.episodic_store import EpisodicStore
-from eidos.memory.types import EpisodicSearchResult, TaskScope
+from eidos.memory.types import ConversationHit, EpisodicSearchResult, TaskScope
 from eidos.models.base import ModelResponse, ToolCall
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class RecallBinding:
+    """Per-run recall target so two cloud tasks do not share one conversation."""
+
+    scope: Any = None
+    conversation_id: str = ""
+    job_id: Optional[str] = None
+    scope_bound: bool = False
+
+
+recall_binding: ContextVar[Optional[RecallBinding]] = ContextVar(
+    "eidos_recall_binding",
+    default=None,
+)
 
 RECALL_TAG_PATTERN = re.compile(r"<recall>(.*?)</recall>", re.DOTALL | re.IGNORECASE)
 
@@ -53,16 +71,54 @@ class RecallStreamInterceptor:
         optimalx_bridge: Optional[Any] = None,
         max_recalls_per_turn: int = 3,
         min_similarity: float = 0.20,
+        conversation_index: Optional[Any] = None,
     ):
         self.episodic_store = episodic_store
         self.optimalx = optimalx_bridge
         self.max_recalls_per_turn = max_recalls_per_turn
         self.min_similarity = min_similarity
+        self.conversation_index = conversation_index
         self.current_scope: Optional[TaskScope] = None
+        self.conversation_id: str = ""
+        self.conversation_job_id: Optional[str] = None
+        self.conversation_scope_bound: bool = False
 
     def set_current_scope(self, scope: Optional[TaskScope]) -> None:
         """Set the active environmental TaskScope for mid-stream recall queries."""
         self.current_scope = scope
+        bound = recall_binding.get()
+        if bound is not None:
+            bound.scope = scope
+
+    def set_conversation_ref(
+        self,
+        conversation_id: Optional[str],
+        job_id: Optional[str],
+        scope_bound: bool,
+    ) -> None:
+        """Point mid-thought chat search at the active conversation and its job scope."""
+        self.conversation_id = (conversation_id or "").strip()
+        self.conversation_job_id = (job_id or "").strip() or None
+        self.conversation_scope_bound = bool(scope_bound)
+        bound = recall_binding.get()
+        if bound is not None:
+            bound.conversation_id = self.conversation_id
+            bound.job_id = self.conversation_job_id
+            bound.scope_bound = self.conversation_scope_bound
+
+    def _live_scope(self, scope: Optional[TaskScope] = None) -> Optional[TaskScope]:
+        if scope is not None:
+            return scope
+        bound = recall_binding.get()
+        if bound is not None:
+            return bound.scope
+        return self.current_scope
+
+    def _live_conversation(self) -> Tuple[str, Optional[str], bool]:
+        bound = recall_binding.get()
+        if bound is not None:
+            return bound.conversation_id, bound.job_id, bound.scope_bound
+        return self.conversation_id, self.conversation_job_id, self.conversation_scope_bound
 
     def lookup_memory(
         self,
@@ -83,7 +139,7 @@ class RecallStreamInterceptor:
         cleaned_query = sanitize_recall_query(query)
         if not cleaned_query:
             return None
-        effective_scope = scope if scope is not None else self.current_scope
+        effective_scope = self._live_scope(scope)
         try:
             results = self.episodic_store.search(
                 query=cleaned_query,
@@ -113,7 +169,7 @@ class RecallStreamInterceptor:
         if not cleaned_query:
             return []
 
-        effective_scope = scope if scope is not None else self.current_scope
+        effective_scope = self._live_scope(scope)
         notes: List[Dict[str, Any]] = []
 
         if effective_scope and effective_scope.project_name:
@@ -140,12 +196,36 @@ class RecallStreamInterceptor:
 
         return notes
 
+    def lookup_conversation(self, query: str) -> Optional[ConversationHit]:
+        """Search indexed chat exchanges with the active conversation's scope."""
+        index = self.conversation_index
+        conversation_id, job_id, scope_bound = self._live_conversation()
+        if index is None or not conversation_id:
+            return None
+        cleaned_query = sanitize_recall_query(query)
+        if not cleaned_query:
+            return None
+        try:
+            hits = index.search(
+                cleaned_query,
+                conversation_id=conversation_id,
+                job_id=job_id,
+                scope_bound=scope_bound,
+                top_k=1,
+                min_similarity=self.min_similarity,
+            )
+            return hits[0] if hits else None
+        except Exception as exc:
+            logger.warning("Error querying conversation index for recall '%s': %s", cleaned_query, exc)
+            return None
+
     def format_recalled_memory(
         self,
         result: Optional[EpisodicSearchResult],
         query: str,
         optimalx_notes: Optional[List[Dict[str, Any]]] = None,
         scope: Optional[TaskScope] = None,
+        conversation_hit: Optional[ConversationHit] = None,
     ) -> str:
         """Format matching episodic memory and/or OptimalX notes into XML blocks for mid-stream splicing.
 
@@ -156,9 +236,14 @@ class RecallStreamInterceptor:
         """
         has_episodic = result is not None
         has_notes = bool(optimalx_notes)
-        effective_scope = scope if scope is not None else self.current_scope
+        effective_scope = self._live_scope(scope)
+        chat_block = ""
+        if conversation_hit is not None and self.conversation_index is not None:
+            chat_block = self.conversation_index.render_recall(conversation_hit).strip()
 
         if not has_episodic and not has_notes:
+            if chat_block:
+                return f"\n{chat_block}\nContinuing plan: "
             return (
                 "\n<recalled_memory>\n"
                 f'No past experience found matching query: "{query.strip()}".\n'
@@ -228,8 +313,24 @@ class RecallStreamInterceptor:
             notes_lines.append("</recalled_notes>")
             parts.append("\n".join(notes_lines))
 
+        if chat_block:
+            parts.append("\n" + chat_block)
+
         parts.append("Continuing plan: ")
         return "\n".join(parts)
+
+    def _splice_recall(self, query: str) -> str:
+        """Look up episodes, notes, and chat, then format one splice."""
+        mem_result = self.lookup_memory(query, scope=self._live_scope())
+        notes_result = self.lookup_optimalx_notes(query, limit=2, scope=self._live_scope())
+        chat_hit = self.lookup_conversation(query)
+        return self.format_recalled_memory(
+            mem_result,
+            query,
+            optimalx_notes=notes_result,
+            scope=self._live_scope(),
+            conversation_hit=chat_hit,
+        )
 
     def extract_recall_query(self, text: str) -> Optional[str]:
         """Extract the query string from the first complete `<recall>...</recall>` block."""
@@ -344,11 +445,7 @@ class RecallStreamInterceptor:
                             resp.close()
                             resp = None
 
-                            mem_result = self.lookup_memory(query, scope=self.current_scope)
-                            notes_result = self.lookup_optimalx_notes(query, limit=2, scope=self.current_scope)
-                            splice_text = self.format_recalled_memory(
-                                mem_result, query, optimalx_notes=notes_result, scope=self.current_scope
-                            )
+                            splice_text = self._splice_recall(query)
 
                             if on_recall_callback:
                                 try:
@@ -561,11 +658,7 @@ class RecallStreamInterceptor:
                             resp.close()
                             resp = None
 
-                            mem_result = self.lookup_memory(query, scope=self.current_scope)
-                            notes_result = self.lookup_optimalx_notes(query, limit=2, scope=self.current_scope)
-                            splice_text = self.format_recalled_memory(
-                                mem_result, query, optimalx_notes=notes_result, scope=self.current_scope
-                            )
+                            splice_text = self._splice_recall(query)
 
                             if on_recall_callback:
                                 try:

@@ -42,6 +42,8 @@ export function App() {
     logs,
     conversationTitle,
     conversationId,
+    runningConversationIds,
+    parallelActions,
     isSyncing,
     refreshSync,
     startNewChat,
@@ -130,7 +132,9 @@ export function App() {
     }
   }, [messages, autoSpeak, isPlaying, playingMessageId, playText]);
 
-  const isThinking = ['thinking', 'executing', 'perceiving'].includes(agentState.toLowerCase());
+  const thisChatBusy = Boolean(conversationId && runningConversationIds.includes(conversationId));
+  const globalBusy = ['thinking', 'executing', 'perceiving'].includes(agentState.toLowerCase());
+  const isThinking = parallelActions ? thisChatBusy : thisChatBusy || globalBusy;
 
   const {
     notificationPermission,
@@ -190,6 +194,7 @@ export function App() {
             onDismissRetryNotice={clearRetryNotice}
             token={token}
             isThinking={isThinking}
+            parallelActions={parallelActions}
             isPlaying={isPlaying}
             playbackActive={playbackActive}
             isPaused={isPaused}
@@ -209,6 +214,7 @@ export function App() {
             onReleasePreparedPlayback={releaseBackgroundArm}
             onStopTask={handleStopCallOrTask}
             playbackError={playbackError}
+            conversationId={conversationId}
             conversationTitle={conversationTitle}
             onNewChat={() => startNewChat('New Chat')}
             onRefreshSync={refreshSync}

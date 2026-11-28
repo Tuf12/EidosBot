@@ -230,6 +230,19 @@ class EpisodicSearchResult(BaseModel):
     cross_job_shared: bool = False
 
 
+class ConversationHit(BaseModel):
+    """One past chat exchange returned by conversation-turn search."""
+
+    message_id: str
+    conversation_id: str
+    conversation_title: str = ""
+    job_id: str = ""
+    user_text: str = ""
+    assistant_text: str = ""
+    similarity: float = 0.0
+    is_residue: bool = False
+
+
 class CandidateRule(BaseModel):
     """Procedural rule or convention proposed by consolidation for Tier B review."""
 

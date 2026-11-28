@@ -75,6 +75,8 @@ export interface InboundWSEvent {
   time?: number;
   error?: string;
   conversation_id?: string;
+  running_conversation_ids?: string[];
+  parallel_actions?: boolean;
   conversation_title?: string;
   title?: string;
   messages?: any[];

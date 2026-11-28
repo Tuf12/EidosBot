@@ -66,7 +66,7 @@ export const AudioPlayerBar: React.FC<AudioPlayerBarProps> = ({
   const showPause = isPlaying && !isPaused;
   const stopEngaged = isBuffering || isPlaying || isPaused;
   const statusLabel = isBuffering ? 'Loading speech…' : showPause ? 'Playing voice' : isPaused ? 'Paused' : 'Finished';
-  const expandedStatus = isBuffering ? 'Loading speech…' : showPause ? 'Kokoro Voice Stream' : isPaused ? 'Paused' : 'Finished';
+  const expandedStatus = isBuffering ? 'Loading speech…' : showPause ? 'Read aloud' : isPaused ? 'Paused' : 'Finished';
   const togglePlayback = () => (showPause ? onPauseAudio?.() : onResumeAudio?.());
 
   return (

@@ -111,12 +111,12 @@ class WavPlayback:
         if self.session.available:
             self.session.begin()
             self.session.append(pcm, sample_rate)
+            self.session.mark_complete()
             if self.session.playing:
-                self.session.mark_complete()
                 if blocking:
                     return self._wait_session()
                 return True
-            self.session.dismiss()
+            # The device did not start. Keep the samples and try the one-shot player.
         if self._try_sounddevice_pcm(pcm, sample_rate, blocking):
             return True
         return self._play_subprocess_from_pcm(pcm, sample_rate, blocking)
@@ -126,16 +126,17 @@ class WavPlayback:
 
         while True:
             if self._stop_flag.is_set():
-                self.session.dismiss()
+                self.session.halt()
                 return False
             if not self.session.playing:
                 return True
             time.sleep(0.05)
 
     def stop(self) -> None:
+        """Silence playback. The current recording stays until the next utterance."""
         self._stop_flag.set()
         self._is_playing_audio = False
-        self.session.dismiss()
+        self.session.halt()
         with self._lock:
             if self._sd is not None:
                 try:
@@ -144,6 +145,11 @@ class WavPlayback:
                     pass
             self._stop_subprocess()
         self._stop_flag.clear()
+
+    def release(self) -> None:
+        """Drop the saved recording. Used when the voice subsystem shuts down."""
+        self.stop()
+        self.session.dismiss()
 
     def _try_sounddevice_path(self, path: str, blocking: bool) -> bool:
         if not self.uses_native_audio:

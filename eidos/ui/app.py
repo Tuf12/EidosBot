@@ -12,6 +12,7 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication
 
 from eidos.core.loop import AgentLoop
+from eidos.core.task_run import current_run
 from eidos.safety.allowlist import AllowlistManager
 from eidos.safety.kill_switch import KillSwitch
 from eidos.safety.risk_classifier import RiskLevel
@@ -83,7 +84,7 @@ class UIController(QObject):
         self.settings_dialog: Optional[SettingsDialog] = None
         self.conversations_dialog: Optional[ConversationsDialog] = None
 
-        self._agent_thread: Optional[threading.Thread] = None
+        self._agent_threads: Dict[str, threading.Thread] = {}
         self._agent_loop: Optional[AgentLoop] = None
         self._telegram_gw = None
         self._remote_gw = None
@@ -157,7 +158,11 @@ class UIController(QObject):
     def _apply_conversation_sync(self, conv_id: str, title: str, messages: list):
         """Update desktop chat view when active conversation changes remotely."""
         self.pill.load_conversation_messages(conv_id, title, messages)
-        self.pill.set_status("idle", f"Conversation: {title}")
+        self.pill.set_task_running(self.is_task_running())
+        if self.is_task_running():
+            self.pill.set_status("thinking", f"Conversation: {title}")
+        else:
+            self.pill.set_status("idle", f"Conversation: {title}")
 
     @pyqtSlot()
     def clear_chat_history(self):
@@ -177,9 +182,14 @@ class UIController(QObject):
                     self._agent_loop.voice.stop_speaking()
                 except Exception:
                     pass
-            if self._agent_loop is not None and hasattr(self._agent_loop, "cancel_task"):
+            if self._agent_loop is not None:
+                cancel_all = getattr(self._agent_loop, "cancel_all_tasks", None)
+                cancel_one = getattr(self._agent_loop, "cancel_task", None)
                 try:
-                    self._agent_loop.cancel_task()
+                    if callable(cancel_all):
+                        cancel_all()
+                    elif callable(cancel_one):
+                        cancel_one()
                 except Exception:
                     pass
             self.pill.set_task_running(False)
@@ -644,11 +654,28 @@ class UIController(QObject):
                 lambda text: self.signal_voice_transcribed.emit(text)
             )
 
-        # Register execution and chat callbacks with AgentLoop
-        agent_loop.register_callback("on_thought", lambda t: self.signal_chat_thought.emit(t))
-        agent_loop.register_callback("on_tool_start", lambda n, a: self.signal_chat_tool_start.emit(n, a))
-        agent_loop.register_callback("on_tool_end", lambda n, r: self.signal_chat_tool_end.emit(n, r))
-        agent_loop.register_callback("on_response", lambda r: self.signal_chat_assistant_message.emit(r))
+        # Register execution and chat callbacks with AgentLoop.
+        # A cloud task in another conversation must not write into the open chat.
+        def _on_thought(text: str):
+            if self._chat_event_visible():
+                self.signal_chat_thought.emit(text)
+
+        def _on_tool_start(name: str, arguments: Any):
+            if self._chat_event_visible():
+                self.signal_chat_tool_start.emit(name, arguments)
+
+        def _on_tool_end(name: str, result: Any):
+            if self._chat_event_visible():
+                self.signal_chat_tool_end.emit(name, result)
+
+        def _on_response(text: str):
+            if self._chat_event_visible():
+                self.signal_chat_assistant_message.emit(text)
+
+        agent_loop.register_callback("on_thought", _on_thought)
+        agent_loop.register_callback("on_tool_start", _on_tool_start)
+        agent_loop.register_callback("on_tool_end", _on_tool_end)
+        agent_loop.register_callback("on_response", _on_response)
         agent_loop.register_callback(
             "on_conversation_title_changed",
             lambda t: self.pill.signal_set_conversation_title.emit(t),
@@ -668,11 +695,18 @@ class UIController(QObject):
 
         # Remote task start synchronization (e.g. prompt sent from mobile gateway)
         def _on_remote_task_start(goal: str):
+            if not self._chat_event_visible():
+                return
+            self.signal_task_running.emit(True)
             if not self.is_task_running() or self._active_task_prompt != goal:
                 self.signal_chat_user_message.emit(goal)
                 self.pill.signal_set_status.emit("thinking", f"Task: {goal}")
 
+        def _on_task_finished(*_args):
+            self.signal_task_running.emit(self.is_task_running())
+
         agent_loop.register_callback("on_task_start", _on_remote_task_start)
+        agent_loop.register_callback("on_task_finish", _on_task_finished)
         agent_loop.register_callback(
             "on_background_activity",
             lambda active, task, details: self.pill.signal_set_background_activity.emit(active, task, details),
@@ -856,12 +890,51 @@ class UIController(QObject):
 
             threading.Thread(target=_stop, daemon=True).start()
         else:
+            free = getattr(self._agent_loop, "local_machine_is_free", None)
+            if callable(free) and not free():
+                self.pill.set_status("idle", "Dictation waits until the local model is free.")
+                return
             voice.start_listening()
             self.pill.signal_set_status.emit("perceiving", "Listening to mic...")
 
+    def _parallel_actions(self) -> bool:
+        loop = self._agent_loop
+        allowed = getattr(loop, "parallel_actions_allowed", None) if loop is not None else None
+        if not callable(allowed):
+            return False
+        try:
+            return bool(allowed())
+        except Exception:
+            return False
+
+    def _reap_task_threads(self) -> None:
+        finished = [key for key, thread in self._agent_threads.items() if not thread.is_alive()]
+        for key in finished:
+            self._agent_threads.pop(key, None)
+
+    def _chat_event_visible(self) -> bool:
+        """True when the worker's task belongs to the conversation open on the desktop."""
+        run = current_run.get()
+        if run is None or not run.conversation_id:
+            return True
+        active = getattr(self._agent_loop, "active_conversation_id", None)
+        return run.conversation_id == (active or "")
+
     def is_task_running(self) -> bool:
-        """Return True when a background agent task thread is still active."""
-        return self._agent_thread is not None and self._agent_thread.is_alive()
+        """True when the open chat has a task, or any task when the provider is local."""
+        self._reap_task_threads()
+        loop = self._agent_loop
+        if loop is None:
+            return bool(self._agent_threads)
+        if not self._parallel_actions():
+            if getattr(loop, "has_running_task", lambda: False)():
+                return True
+            return bool(self._agent_threads)
+        cid = self._conversation_id()
+        if cid and getattr(loop, "conversation_is_running", lambda _cid: False)(cid):
+            return True
+        thread = self._agent_threads.get(cid or "desktop")
+        return thread is not None and thread.is_alive()
 
     def _shared_files(self):
         """Inbox registry shared with the web app when the gateway is running."""
@@ -888,8 +961,8 @@ class UIController(QObject):
             return
 
         if self.is_task_running():
-            logger.warning("An agent task is already running.")
-            active = self._active_task_prompt or "unknown task"
+            logger.info("Prompt waiting: this chat or the local model is already working.")
+            active = self._active_task_prompt or "the current prompt"
             stopping = bool(
                 self._agent_loop is not None
                 and hasattr(self._agent_loop, "is_stop_requested")
@@ -898,12 +971,18 @@ class UIController(QObject):
             if stopping:
                 self.pill.set_status("executing", "Stopping the current task...")
                 self.signal_chat_error.emit("Stopping the current task. You can send a new one in a moment.")
-            else:
-                self.pill.set_status("executing", "Task already in progress...")
+            elif self._parallel_actions():
+                self.pill.set_status("executing", "This conversation is already working...")
                 self.signal_chat_error.emit(
-                    f"Still working on: \"{active}\". "
-                    "Wait for it to finish, use Stop to cancel it, "
-                    "or press Emergency Stop (Ctrl+Alt+Esc)."
+                    "This conversation is already working on a prompt. "
+                    "Stop it, or open another conversation to run a second one."
+                )
+            else:
+                self.pill.set_status("executing", "Local model is working...")
+                self.signal_chat_error.emit(
+                    f"The local model is still working on: \"{active}\". "
+                    "Wait for it, stop it, or switch the provider to a cloud API "
+                    "to run another conversation at the same time."
                 )
             return
 
@@ -938,7 +1017,12 @@ class UIController(QObject):
         if not base_prompt:
             return
 
-        if self._agent_loop is not None and hasattr(self._agent_loop, "voice") and self._agent_loop.voice:
+        if (
+            not self._parallel_actions()
+            and self._agent_loop is not None
+            and hasattr(self._agent_loop, "voice")
+            and self._agent_loop.voice
+        ):
             try:
                 self._agent_loop.voice.stop_speaking()
             except Exception:
@@ -976,8 +1060,12 @@ class UIController(QObject):
                             prompt += "\n\nRead the attached files from the paths above before you answer."
                     self.signal_chat_user_message.emit(prompt)
                     self.pill.signal_set_status.emit("thinking", f"Task: {status_line[:120]}")
-                res = self._agent_loop.run_task(prompt)
+                res = self._agent_loop.run_task(prompt, conversation_id=conversation_id or None)
                 summary = res.get("summary", "")
+                if res.get("busy"):
+                    self.pill.signal_set_status.emit("idle", summary)
+                    self.signal_chat_error.emit(summary or "That prompt did not start.")
+                    return
                 if res.get("stopped"):
                     self.pill.signal_set_status.emit("idle", "Task stopped by user")
                 elif res.get("success"):
@@ -994,30 +1082,42 @@ class UIController(QObject):
                 self.pill.signal_set_status.emit("error", str(e))
                 self.signal_chat_error.emit(f"Execution Error: {e}")
             finally:
-                self._active_task_prompt = None
+                if self._active_task_prompt == status_line:
+                    self._active_task_prompt = None
+                self._agent_threads.pop(thread_key, None)
                 self._unblock_confirmation(wait=False)
-                self.signal_task_running.emit(False)
+                self.signal_task_running.emit(self.is_task_running())
 
-        self._agent_thread = threading.Thread(target=worker, daemon=True)
-        self._agent_thread.start()
+        conversation_id = self._conversation_id()
+        thread_key = conversation_id or "desktop"
+        self._agent_threads[thread_key] = threading.Thread(
+            target=worker,
+            daemon=True,
+            name=f"EidosTask-{thread_key[:8]}",
+        )
+        self._agent_threads[thread_key].start()
 
     @pyqtSlot()
     def stop_active_task(self):
-        """Stop/cancel the running agent task, halt speech playback, and unblock modals."""
+        """Stop the open conversation's task. Cloud mode leaves speech playing."""
         logger.info("Stopping active agent task requested by user.")
-        # 1. Stop voice immediately
-        if self._agent_loop is not None and hasattr(self._agent_loop, "voice") and self._agent_loop.voice:
+        if (
+            not self._parallel_actions()
+            and self._agent_loop is not None
+            and hasattr(self._agent_loop, "voice")
+            and self._agent_loop.voice
+        ):
             try:
                 self._agent_loop.voice.stop_speaking()
             except Exception:
                 pass
 
-        # 2. Unblock any confirmation queue waiting on agent thread
         self._unblock_confirmation(wait=False)
 
-        # 3. Request loop cancellation
         if self._agent_loop is not None and hasattr(self._agent_loop, "cancel_task"):
-            self._agent_loop.cancel_task()
+            # Local mode has one task. Stop that task even if the open chat changed.
+            target = self._conversation_id() or None if self._parallel_actions() else None
+            self._agent_loop.cancel_task(target)
 
         self.pill.set_status("executing", "Stopping task...")
         self.signal_chat_assistant_message.emit("⏹ *Task stopped by user.*")
@@ -1030,6 +1130,10 @@ class UIController(QObject):
             return
         if self._agent_loop is None or not hasattr(self._agent_loop, "voice") or not self._agent_loop.voice:
             self.pill.set_status("error", "Voice subsystem not available.")
+            return
+        free = getattr(self._agent_loop, "local_machine_is_free", None)
+        if callable(free) and not free():
+            self.pill.set_status("idle", "Speech waits until the local model is free.")
             return
 
         voice = self._agent_loop.voice

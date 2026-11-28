@@ -51,8 +51,8 @@ Sandboxed shell is a separate path: writes are limited to the configured workspa
 
 `config.yaml` chooses the provider. `models.provider_preference` is `local`, `cloud`, or `auto`.
 
-- **Local:** Ollama at `http://localhost:11434`. The example config uses a reasoning model and a separate vision model. If the reasoning model can see images, the vision model stays unloaded.
-- **Cloud:** Chutes (`models.cloud`) or Meta Muse (`models.meta`, key from the config or `MODEL_API_KEY`). Cloud is used when you select it, or when local inference is busy and `models.compute` says to prefer cloud for background work such as the reflector.
+- **Local:** Ollama at `http://localhost:11434`. The example config uses a reasoning model and a separate vision model. If the reasoning model can see images, the vision model stays unloaded. Local and auto keep one Ollama prompt at a time so the GPU is not stacked. Speech and dictation wait while that prompt is running.
+- **Cloud:** Chutes (`models.cloud`) or Meta Muse (`models.meta`, key from the config or `MODEL_API_KEY`). With cloud selected, separate conversations can each have a prompt in flight, and speech or dictation can run while a prompt is working. Cloud is also used when local inference is busy and `models.compute` says to prefer cloud for background work such as the reflector.
 
 The example model names are defaults, not a requirement. Point `reasoning_model` and `vision_model` at whatever you have pulled.
 

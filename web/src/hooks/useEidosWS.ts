@@ -188,6 +188,8 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
   const [logs, setLogs] = useState<string[]>([]);
   const [conversationTitle, setConversationTitle] = useState<string>('New Chat');
   const [conversationId, setConversationId] = useState<string | null>(null);
+  const [runningConversationIds, setRunningConversationIds] = useState<string[]>([]);
+  const [parallelActions, setParallelActions] = useState(false);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
   const [retryNotice, setRetryNotice] = useState<string | null>(null);
   const [jobFocus, setJobFocus] = useState<JobFocusState | null>(null);
@@ -227,10 +229,14 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
         fetch('/api/prompt', {
           method: 'POST',
           headers,
-          body: JSON.stringify({ prompt: msg.prompt }),
+          body: JSON.stringify({ prompt: msg.prompt, conversation_id: msg.conversation_id || '' }),
         }).catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'stop' || msg.type === 'cancel' || msg.type === 'stop_task') {
-        fetch('/api/stop', { method: 'POST', headers }).catch((e) => addLog(`HTTP error: ${e}`));
+        fetch('/api/stop', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ conversation_id: msg.conversation_id || '' }),
+        }).catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'kill') {
         fetch('/api/kill', { method: 'POST', headers }).catch((e) => addLog(`HTTP error: ${e}`));
       } else if (msg.type === 'reset') {
@@ -249,6 +255,7 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
             prompt: msg.prompt,
             id: msg.id,
             message_index: msg.message_index,
+            conversation_id: msg.conversation_id || '',
           }),
         })
           .then(async (res) => {
@@ -411,6 +418,30 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
         try {
           const data: InboundWSEvent = JSON.parse(event.data);
           const ev = data.event;
+          if (Array.isArray(data.running_conversation_ids)) {
+            setRunningConversationIds(data.running_conversation_ids);
+          }
+          if (typeof data.parallel_actions === 'boolean') {
+            setParallelActions(data.parallel_actions);
+          }
+          const eventConv = typeof data.conversation_id === 'string' ? data.conversation_id : '';
+          const foreign = Boolean(
+            eventConv && conversationIdRef.current && eventConv !== conversationIdRef.current
+          );
+          const chatScoped = new Set([
+            'task_start',
+            'token_chunk',
+            'thought_chunk',
+            'tool_start',
+            'tool_end',
+            'task_finished',
+            'error',
+            'log',
+            'conversation_title_changed',
+          ]);
+          if (foreign && (chatScoped.has(ev) || (ev === 'status_change' && String(data.state || '').toLowerCase() !== 'killed'))) {
+            return;
+          }
 
           if (ev === 'status_change') {
             if (data.state) {
@@ -836,6 +867,7 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
         prompt: clean,
         id: messageId,
         message_index: messageIndex,
+        conversation_id: conversationIdRef.current || '',
       });
     },
     [sendMessage]
@@ -859,7 +891,11 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
         },
       ]);
 
-      sendMessage({ type: 'prompt', prompt: clean });
+      sendMessage({
+        type: 'prompt',
+        prompt: clean,
+        conversation_id: conversationIdRef.current || '',
+      });
     },
     [sendMessage]
   );
@@ -888,15 +924,22 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
 
   /** Cancel the running task without tripping the emergency stop. */
   const stopTask = useCallback(() => {
-    setAgentState('idle');
-    setStateDetails('Task stopped');
+    const mine = conversationIdRef.current;
+    setRunningConversationIds((prev) => {
+      const next = prev.filter((id) => id !== mine);
+      if (next.length === 0) {
+        setAgentState('idle');
+        setStateDetails('Task stopped');
+      }
+      return next;
+    });
     setMessages((prev) =>
       prev.map((m) =>
         m.streaming ? { ...m, streaming: false, content: (m.content || '') + ' [Stopped]' } : m
       )
     );
     currentAssistantMsgIdRef.current = null;
-    sendMessage({ type: 'stop' });
+    sendMessage({ type: 'stop', conversation_id: conversationIdRef.current || '' });
   }, [sendMessage]);
 
   /** Approve or deny a safety prompt, optionally remembering the command. */
@@ -935,6 +978,8 @@ export function useEidosWS(options: UseEidosWSOptions = {}) {
     logs,
     conversationTitle,
     conversationId,
+    runningConversationIds,
+    parallelActions,
     isSyncing,
     refreshSync,
     startNewChat,

@@ -1564,6 +1564,10 @@ class ChatHistoryWidget(QScrollArea):
         self._message_count = 0
         self.bubbles: list[MessageBubble] = []
         self._action_group: Optional[ActionGroupWidget] = None
+        # Stay with the live reply until the reader scrolls up to look at earlier messages.
+        self._follow_tail = True
+        self._programmatic_scroll = False
+        self._last_scroll_value = 0
         self._init_ui()
 
     def _init_ui(self):
@@ -1598,9 +1602,34 @@ class ChatHistoryWidget(QScrollArea):
 
         self.setWidget(self.container)
 
+        self.btn_latest = QPushButton("↓  Latest", self)
+        self.btn_latest.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_latest.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_latest.setVisible(False)
+        self.btn_latest.clicked.connect(self.scroll_to_bottom)
+        self.btn_latest.setStyleSheet(
+            "QPushButton { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; "
+            "border-radius: 12px; padding: 4px 12px; font-size: 12px; font-weight: 600; } "
+            "QPushButton:hover { border-color: #bd93f9; color: #bd93f9; }"
+        )
+        bar = self.verticalScrollBar()
+        bar.valueChanged.connect(self._on_scrollbar_changed)
+        bar.rangeChanged.connect(self._on_scrollbar_range_changed)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._fit_container_width()
+        self._place_latest_button()
+
+    def wheelEvent(self, event):
+        """Stop following as soon as the reader scrolls toward earlier messages."""
+        delta_y = event.angleDelta().y()
+        if delta_y == 0:
+            delta_y = event.pixelDelta().y()
+        if delta_y > 0 and self.verticalScrollBar().value() > 0:
+            self._follow_tail = False
+            self._sync_latest_button()
+        super().wheelEvent(event)
 
     def _fit_container_width(self) -> None:
         width = self.viewport().width()
@@ -1664,8 +1693,14 @@ class ChatHistoryWidget(QScrollArea):
         # Re-add bottom spacer
         self.layout_messages.addItem(self.spacer)
 
-        # Auto-scroll to bottom
-        QTimer.singleShot(50, self.scroll_to_bottom)
+        # A new prompt of your own returns to the live end. Tool rows and
+        # replies stay put when you have scrolled up to read.
+        if role == "user":
+            self._follow_tail = True
+        if self._follow_tail:
+            QTimer.singleShot(50, self._scroll_if_following)
+        else:
+            self._sync_latest_button()
         return bubble
 
     def _create_bubble(
@@ -1745,6 +1780,7 @@ class ChatHistoryWidget(QScrollArea):
 
     def clear_messages(self):
         """Remove all message bubbles and restore welcome card."""
+        self._follow_tail = True
         self._action_group = None
         for b in self.bubbles:
             b.deleteLater()
@@ -1762,6 +1798,7 @@ class ChatHistoryWidget(QScrollArea):
         self.welcome_widget.show()
         self.spacer = QSpacerItem(20, 20, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding)
         self.layout_messages.addItem(self.spacer)
+        self._sync_latest_button()
 
     def get_last_user_message(self) -> Optional[str]:
         """Return the text of the most recent user prompt in history."""
@@ -1771,10 +1808,59 @@ class ChatHistoryWidget(QScrollArea):
         return None
 
     def scroll_to_bottom(self):
-        """Scroll vertical scrollbar to bottom-most position."""
+        """Jump to the live end and keep following new actions until the reader scrolls up."""
+        self._follow_tail = True
+        self._scroll_to_end()
+        self._sync_latest_button()
+
+    def _scroll_if_following(self):
+        if not self._follow_tail:
+            self._sync_latest_button()
+            return
+        self._scroll_to_end()
+        self._sync_latest_button()
+
+    def _scroll_to_end(self):
         v_bar = self.verticalScrollBar()
-        if v_bar:
-            v_bar.setValue(v_bar.maximum())
+        if not v_bar:
+            return
+        self._programmatic_scroll = True
+        v_bar.setValue(v_bar.maximum())
+        self._last_scroll_value = v_bar.value()
+        self._programmatic_scroll = False
+
+    def _on_scrollbar_changed(self, value: int):
+        if self._programmatic_scroll:
+            return
+        previous = self._last_scroll_value
+        self._last_scroll_value = value
+        bar = self.verticalScrollBar()
+        at_bottom = bar.maximum() - value <= 48
+        if value < previous:
+            self._follow_tail = False
+        elif at_bottom:
+            self._follow_tail = True
+        self._sync_latest_button()
+
+    def _sync_latest_button(self):
+        bar = self.verticalScrollBar()
+        show = (not self._follow_tail) and self._message_count > 0 and bool(bar and bar.maximum() > 8)
+        self.btn_latest.setVisible(show)
+        if show:
+            self._place_latest_button()
+
+    def _on_scrollbar_range_changed(self, _minimum: int, _maximum: int):
+        if self.btn_latest.isVisible():
+            self._place_latest_button()
+
+    def _place_latest_button(self):
+        button = self.btn_latest
+        button.adjustSize()
+        origin = self.viewport().mapTo(self, QPoint(0, 0))
+        x = origin.x() + max(8, (self.viewport().width() - button.width()) // 2)
+        y = origin.y() + max(8, self.viewport().height() - button.height() - 10)
+        button.move(x, y)
+        button.raise_()
 
     @property
     def message_count(self) -> int:

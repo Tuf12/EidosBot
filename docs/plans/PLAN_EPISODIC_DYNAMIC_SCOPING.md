@@ -11,7 +11,7 @@
 ## 1. Objectives & Architectural Guardrails
 
 ### Primary Goal
-Implement **Context-Aware Dynamic Task Scoping & Multi-Source Fusion** (`eidos/memory/scope_resolver.py`) to systematically eliminate cross-project command contamination and bridge disconnected memory silos. At runtime, ambient execution context (working directory, Git project name, focused GUI window class/title, active skill, primary `job_id`, and active `integration`) is resolved into a structured `TaskScope`. Episodic vector search applies calibrated re-ranking score boosts for open tasks, enforces strict cross-job boundaries for project jobs, permits shared-entity cross-job hits via the entity graph, and disambiguates multi-source recall (`<recalled_memory>`, `<recalled_notes>`, `<recalled_conversation>`).
+Implement **Context-Aware Dynamic Task Scoping & Multi-Source Fusion** (`eidos/memory/scope_resolver.py`) to systematically eliminate cross-project command contamination and bridge disconnected memory silos. At runtime, ambient execution context (working directory, Git project name, focused GUI window class/title, active skill, primary `job_id`, and active `integration`) is resolved into a structured `TaskScope`. Episodic vector search applies calibrated re-ranking score boosts for open tasks, enforces strict cross-job boundaries for project jobs, permits shared-entity cross-job hits via the entity graph, and disambiguates multi-source recall (`<recalled_memory>`, `<recalled_notes>`). Conversation recall is a separate spec.
 
 ### Non-Negotiable Guardrails
 1. **PC Resource Protection & Zero Neural Overhead:** All scope resolution (Git root discovery, path traversal, window inspection) runs purely on CPU in $< 1\text{ ms}$ with **zero LLM tokens and zero GPU usage**. Scope detection results are cached to prevent redundant filesystem I/O.
@@ -22,7 +22,7 @@ Implement **Context-Aware Dynamic Task Scoping & Multi-Source Fusion** (`eidos/m
    - **Entity Graph Cross-Job Bridge:** An episode from a different job is retained **only if** the relational `GraphStore` confirms a shared real-world entity (e.g. shared device, identical path, or shared email/domain). When returned, it is clearly tagged with its source `job_id` and integration, and the foreign job's brief, documents, and tools are **never loaded**.
 4. **Non-Breaking Database Migration:** Add nullable scope columns to the `episodes` table in `~/.eidos/memory/vector_store/episodic.db` using safe `ALTER TABLE` operations within `_ensure_episode_schema_migrations()`. Legacy episodes missing scope attributes remain searchable without error.
 5. **Thread-Safe Relational Transactions:** All SQLite schema updates, inserts, and queries must execute under `EpisodicStore._lock`.
-6. **Clean Multi-Source Disambiguation:** Mid-stream `<recall>` queries must output distinct, well-formed XML blocks (`<recalled_memory scope="...">`, `<recalled_notes project="...">`, `<recalled_conversation>`) preventing context confusion in the LLM.
+6. **Clean Multi-Source Disambiguation:** Mid-stream `<recall>` queries must output distinct, well-formed XML blocks (`<recalled_memory scope="...">`, `<recalled_notes project="...">`) preventing context confusion in the LLM. Past chat is specified in `SPEC_CONVERSATION_RECALL.md`.
 
 ---
 

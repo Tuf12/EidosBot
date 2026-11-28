@@ -7,6 +7,7 @@
 
 - At most **one local GPU-heavy inference job** at a time (Ollama LLM chat/vision, optional CUDA Parakeet).
 - **No second local full reasoning model** while the agent or user is active.
+- A **cloud API** (Chutes or Meta) does not take the GPU slot. With `provider_preference: cloud`, prompts, speech, and dictation may overlap, including one live prompt per conversation. `local` and `auto` stay exclusive because they still use Ollama.
 - Background memory LLM (reflector, future consolidator) uses **Chutes when local compute is busy**, or waits for idle before local Ollama.
 - CPU embeddings (`nomic-embed-text`, `embedding_num_gpu: 0`) may run alongside Gemma but must not open a second chat stream on Ollama during an active stream.
 

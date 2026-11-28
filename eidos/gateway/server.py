@@ -6,6 +6,7 @@ and remotely approving/denying Level 2 and Level 3 safety confirmations from a p
 """
 
 import asyncio
+from contextvars import ContextVar
 import io
 import json
 import logging
@@ -35,6 +36,9 @@ from eidos.gateway.tts_live import MAX_TEXT_CHARS, LiveTtsHub, valid_session_id
 from eidos.voice.voices import DEFAULT_VOICE_ID, list_voices
 
 logger = logging.getLogger(__name__)
+
+# Set while one browser tab switches or rewinds a chat, so other tabs stay where they are.
+_ws_target: ContextVar[Optional[int]] = ContextVar("eidos_gateway_ws", default=None)
 
 WEB_DIST_DIR = Path(__file__).resolve().parent.parent.parent / "web" / "dist"
 
@@ -461,6 +465,7 @@ class RemoteGatewayServer:
         self._thread: Optional[threading.Thread] = None
 
         self._ws_clients: Set[web.WebSocketResponse] = set()
+        self._ws_focus: Dict[int, str] = {}
         self._pending_confirmations: Dict[str, Dict[str, Any]] = {}
         self._confirm_lock = threading.Lock()
         self._desktop_ui: Any = None
@@ -472,7 +477,8 @@ class RemoteGatewayServer:
         except Exception:
             logger.debug("Could not attach file registry to the agent loop.")
 
-        # Track agent state
+        # Track agent state. Cloud mode can have several conversations in flight;
+        # current_state stays "thinking" while any of them is still running.
         self.current_state = "idle"
         self.current_task = ""
         self.background_active = False
@@ -728,11 +734,22 @@ class RemoteGatewayServer:
 
     def get_active_conversation_info(self) -> Tuple[Optional[str], str, List[Dict[str, Any]]]:
         """Return (conversation_id, title, messages_list) for current active conversation."""
-        raw_conv_id = getattr(self.agent_loop, "active_conversation_id", None)
-        conv_id: Optional[str] = str(raw_conv_id) if isinstance(raw_conv_id, (str, int)) else None
+        return self._conversation_snapshot(None)
+
+    def _conversation_snapshot(
+        self,
+        conv_id: Optional[str],
+    ) -> Tuple[Optional[str], str, List[Dict[str, Any]]]:
+        """Return one conversation's title and public messages."""
+        if not conv_id:
+            raw_conv_id = getattr(self.agent_loop, "active_conversation_id", None)
+            conv_id = str(raw_conv_id) if isinstance(raw_conv_id, (str, int)) else None
+        else:
+            conv_id = str(conv_id)
         title = "New Chat"
         messages: List[Dict[str, Any]] = []
         store = getattr(self.agent_loop, "conversation_store", None)
+        active_id = str(getattr(self.agent_loop, "active_conversation_id", "") or "")
 
         if store and conv_id and hasattr(store, "get_conversation") and hasattr(store, "get_messages"):
             try:
@@ -750,7 +767,7 @@ class RemoteGatewayServer:
                 logger.debug("Error getting messages from conversation_store: %s", e)
 
         # Fallback to in-memory conversation_history if store didn't return messages
-        if not messages and hasattr(self.agent_loop, "conversation_history"):
+        if not messages and conv_id == active_id and hasattr(self.agent_loop, "conversation_history"):
             try:
                 raw_hist = self.agent_loop.conversation_history
                 if isinstance(raw_hist, list):
@@ -966,10 +983,11 @@ class RemoteGatewayServer:
             data = await request.json()
             prompt = str(data.get("prompt", "")).strip()
             speak_host = bool(data.get("speak_on_host", False))
+            conv = str(data.get("conversation_id") or "").strip()
             if not prompt:
                 return web.json_response({"ok": False, "error": "Empty prompt"}, status=400)
 
-            self.dispatch_task(prompt, speak_on_host=speak_host)
+            self.dispatch_task(prompt, speak_on_host=speak_host, conversation_id=conv or None)
             return web.json_response({"ok": True, "message": "Task dispatched"})
         except Exception as e:
             return web.json_response({"ok": False, "error": str(e)}, status=500)
@@ -984,9 +1002,15 @@ class RemoteGatewayServer:
             prompt = str(data.get("prompt", "")).strip()
             message_id = str(data.get("id") or data.get("message_id") or "").strip()
             message_index = self._coerce_message_index(data.get("message_index"))
+            conv = str(data.get("conversation_id") or "").strip()
             if not prompt:
                 return web.json_response({"ok": False, "error": "Empty prompt"}, status=400)
-            ok = self.edit_and_retry(prompt, message_id=message_id, message_index=message_index)
+            ok = self.edit_and_retry(
+                prompt,
+                message_id=message_id,
+                message_index=message_index,
+                conversation_id=conv,
+            )
             if not ok:
                 reason = getattr(self, "_edit_retry_error", "") or "Could not retry that message"
                 return web.json_response({"ok": False, "error": reason}, status=409)
@@ -1004,7 +1028,14 @@ class RemoteGatewayServer:
         if not self._verify_auth(request):
             return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
 
-        self.stop_task()
+        conv = ""
+        try:
+            data = await request.json()
+            if isinstance(data, dict):
+                conv = str(data.get("conversation_id") or "").strip()
+        except Exception:
+            conv = ""
+        self.stop_task(conv or None)
         return web.json_response({"ok": True, "message": "Task stopped"})
 
     async def _handle_kill(self, request: web.Request) -> web.Response:
@@ -1078,6 +1109,8 @@ class RemoteGatewayServer:
         """Vocalize message through Kokoro TTS."""
         if not self._verify_auth(request):
             return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        if self._local_work_in_progress():
+            return web.json_response({"ok": False, "error": self._local_work_message()}, status=409)
 
         try:
             data = await request.json()
@@ -1097,6 +1130,8 @@ class RemoteGatewayServer:
         """Synthesize text into a WAV stream using Kokoro-82M (Approach A)."""
         if not self._verify_auth(request):
             return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        if self._local_work_in_progress():
+            return web.json_response({"ok": False, "error": self._local_work_message()}, status=409)
 
         text = ""
         voice = None
@@ -1162,6 +1197,8 @@ class RemoteGatewayServer:
         """Split text into progressive TTS playback chunks using OptimalX chunker."""
         if not self._verify_auth(request):
             return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+        if self._local_work_in_progress():
+            return web.json_response({"ok": False, "error": self._local_work_message()}, status=409)
 
         text = ""
         if request.method == "GET":
@@ -1198,6 +1235,8 @@ class RemoteGatewayServer:
         session_id = request.match_info.get("session_id", "")
         if not valid_session_id(session_id):
             return web.json_response({"ok": False, "error": "Invalid session"}, status=400)
+        if self._local_work_in_progress():
+            return web.json_response({"ok": False, "error": self._local_work_message()}, status=409)
         try:
             data = await request.json()
         except Exception:
@@ -1256,16 +1295,21 @@ class RemoteGatewayServer:
                 offset += len(chunk)
                 await response.write(chunk)
                 await response.drain()
-        except (asyncio.CancelledError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
-            session.cancel()
+        except asyncio.CancelledError:
+            # The phone player dropped this response. Synthesis keeps recording so
+            # pause, seek, and replay can use the saved WAV.
+            logger.info("Live TTS listener disconnected; recording continues")
             raise
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            logger.info("Live TTS listener disconnected; recording continues")
+            return response
         except Exception as exc:
             logger.warning("Live TTS stream closed: %s", exc)
-            session.cancel()
+            return response
         try:
             await response.write_eof()
         except Exception:
-            session.cancel()
+            logger.info("Live TTS listener closed after the recording was sent")
         return response
 
     async def _handle_tts_live_meta(self, request: web.Request) -> web.Response:
@@ -1279,16 +1323,16 @@ class RemoteGatewayServer:
         return web.json_response(session.meta())
 
     async def _handle_tts_live_file(self, request: web.Request) -> web.Response:
-        """Finished WAV with a real length, so pause/seek can reopen the same track."""
+        """Saved WAV for the current read-aloud, including audio recorded so far."""
         if not self._verify_auth(request):
             return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
         session_id = request.match_info.get("session_id", "")
         session = self.live_tts.get(session_id) if valid_session_id(session_id) else None
         if session is None:
             return web.json_response({"ok": False, "error": "Session not found"}, status=404)
-        if not session.complete:
-            return web.json_response({"ok": False, "error": "Audio is still being generated"}, status=409)
         blob = session.wav_bytes()
+        if len(blob) <= 44:
+            return web.json_response({"ok": False, "error": "Audio is still being generated"}, status=409)
         start, end = 0, len(blob) - 1
         status = 200
         range_header = request.headers.get("Range", "")
@@ -1309,6 +1353,7 @@ class RemoteGatewayServer:
             "Accept-Ranges": "bytes",
             "Cache-Control": "no-store",
             "Content-Length": str(len(body)),
+            "X-Tts-Complete": "1" if session.complete else "0",
         }
         if status == 206:
             headers["Content-Range"] = f"bytes {start}-{end}/{len(blob)}"
@@ -1345,6 +1390,8 @@ class RemoteGatewayServer:
         stt = getattr(voice_mgr, "stt", None) if voice_mgr else None
         if not stt or not getattr(stt, "is_available", False):
             return web.json_response({"ok": False, "error": "Parakeet STT is not available on host"}, status=503)
+        if self._local_work_in_progress():
+            return web.json_response({"ok": False, "error": self._local_work_message()}, status=409)
 
         audio_bytes = b""
         content_type = request.content_type or ""
@@ -1607,12 +1654,100 @@ class RemoteGatewayServer:
     # Task Dispatch & Agent Controls
     # =========================================================================
 
-    def dispatch_task(self, prompt: str, speak_on_host: bool = False):
+    def _kill_switch_on(self) -> bool:
+        switch = getattr(self.agent_loop, "kill_switch", None)
+        triggered = getattr(switch, "is_triggered", None)
+        if not callable(triggered):
+            return False
+        try:
+            return bool(triggered())
+        except Exception:
+            return False
+
+    def _parallel_actions(self) -> bool:
+        allowed = getattr(self.agent_loop, "parallel_actions_allowed", None)
+        if not callable(allowed):
+            return False
+        try:
+            return bool(allowed())
+        except Exception:
+            return False
+
+    def _running_conversation_ids(self) -> List[str]:
+        listed = getattr(self.agent_loop, "running_conversation_ids", None)
+        if not callable(listed):
+            return []
+        try:
+            return [str(item) for item in listed() if item]
+        except Exception:
+            return []
+
+    def _local_work_in_progress(self) -> bool:
+        free = getattr(self.agent_loop, "local_machine_is_free", None)
+        if not callable(free):
+            return False
+        try:
+            return not bool(free())
+        except Exception:
+            return False
+
+    def _local_work_message(self) -> str:
+        return (
+            "The local model is working. Speech and dictation wait until it finishes. "
+            "A cloud API can speak, dictate, and run another conversation at the same time."
+        )
+
+    def _activity_meta(self, conversation_id: str = "") -> Dict[str, Any]:
+        return {
+            "conversation_id": conversation_id or None,
+            "running_conversation_ids": self._running_conversation_ids(),
+            "parallel_actions": self._parallel_actions(),
+        }
+
+    def _publish_activity(self, state: str, details: str, conversation_id: str = "") -> None:
+        """Tell clients about one conversation without clearing a different conversation's task."""
+        if self._kill_switch_on():
+            self.current_state = "killed"
+            state = "killed"
+        elif self._running_conversation_ids():
+            self.current_state = "thinking"
+        else:
+            self.current_state = state
+        self.broadcast_event("status_change", {
+            "state": state,
+            "details": details,
+            "killed": state == "killed",
+            **self._activity_meta(conversation_id),
+        })
+
+    def _tag_run(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from eidos.core.task_run import current_run
+
+        run = current_run.get()
+        if run is not None and run.conversation_id:
+            payload.setdefault("conversation_id", run.conversation_id)
+        payload.update(self._activity_meta(str(payload.get("conversation_id") or "")))
+        return payload
+
+    def _focus_conversation(self, ws: Optional[web.WebSocketResponse] = None) -> str:
+        if ws is not None:
+            focused = self._ws_focus.get(id(ws))
+            if focused:
+                return focused
+        active = getattr(self.agent_loop, "active_conversation_id", None)
+        return str(active) if active else ""
+
+    def dispatch_task(
+        self,
+        prompt: str,
+        speak_on_host: bool = False,
+        conversation_id: Optional[str] = None,
+    ):
         """Execute a user prompt asynchronously in the agent loop."""
+        conv_id = (conversation_id or self._focus_conversation() or "").strip()
         self.current_task = prompt
-        self.current_state = "thinking"
-        self.broadcast_event("status_change", {"state": "thinking", "details": f"Task: {prompt}"})
-        self.broadcast_event("log", {"message": f"Remote task requested: '{prompt}'"})
+        self._publish_activity("thinking", f"Task: {prompt}", conv_id)
+        self.broadcast_event("log", {"message": f"Remote task requested: '{prompt}'", "conversation_id": conv_id})
 
         def _run():
             called_loop = False
@@ -1623,103 +1758,113 @@ class RemoteGatewayServer:
                     import inspect
                     try:
                         sig = inspect.signature(run_task_fn)
-                        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
-                        if "speak_summary" in sig.parameters or has_kwargs:
-                            res = run_task_fn(prompt, speak_summary=speak_on_host)
-                        else:
-                            res = run_task_fn(prompt)
+                        params = sig.parameters
+                        has_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                        kwargs = {}
+                        if "speak_summary" in params or has_kwargs:
+                            kwargs["speak_summary"] = speak_on_host
+                        if conv_id and ("conversation_id" in params or has_kwargs):
+                            kwargs["conversation_id"] = conv_id
+                        res = run_task_fn(prompt, **kwargs) if kwargs else run_task_fn(prompt)
                     except (ValueError, TypeError):
-                        try:
-                            res = run_task_fn(prompt, speak_summary=speak_on_host)
-                        except TypeError:
-                            res = run_task_fn(prompt)
+                        res = run_task_fn(prompt)
                     called_loop = True
                 else:
                     res = {"success": False, "summary": "No agent loop available"}
 
                 summary = res.get("summary", "Done") if isinstance(res, dict) else str(res)
                 stopped = bool(res.get("stopped")) if isinstance(res, dict) else False
+                busy = bool(res.get("busy")) if isinstance(res, dict) else False
+                if busy:
+                    self._publish_activity("idle", summary, conv_id)
+                    self.broadcast_event("error", {"error": summary, "conversation_id": conv_id})
+                    return
 
-                is_killed = False
-                if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
-                    is_killed = self.agent_loop.kill_switch.is_triggered()
-
-                if is_killed or self.current_state == "killed":
-                    self.current_state = "killed"
-                    self.broadcast_event("status_change", {"state": "killed", "details": summary, "killed": True})
+                if self._kill_switch_on():
+                    self._publish_activity("killed", summary, conv_id)
                 elif stopped:
                     summary = "Task stopped by user."
-                    self.current_state = "idle"
-                    self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
+                    self._publish_activity("idle", summary, conv_id)
                 else:
-                    self.current_state = "idle"
-                    self.broadcast_event("status_change", {"state": "idle", "details": summary, "killed": False})
+                    self._publish_activity("idle", summary, conv_id)
 
-                self.broadcast_event("log", {"message": f"Task completed: {summary}"})
+                self.broadcast_event("log", {"message": f"Task completed: {summary}", "conversation_id": conv_id})
                 # run_task already emits on_task_finish, which is the one reply for this turn.
                 if not called_loop:
-                    self.broadcast_event("task_finished", {"summary": summary, "success": False})
+                    self.broadcast_event("task_finished", {
+                        "summary": summary,
+                        "success": False,
+                        "conversation_id": conv_id,
+                    })
             except Exception as e:
-                is_killed = False
-                if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
-                    is_killed = self.agent_loop.kill_switch.is_triggered()
-
-                if is_killed or self.current_state == "killed":
-                    self.current_state = "killed"
-                    self.broadcast_event("status_change", {"state": "killed", "details": str(e), "killed": True})
+                if self._kill_switch_on():
+                    self._publish_activity("killed", str(e), conv_id)
                 else:
-                    self.current_state = "error"
-                    self.broadcast_event("status_change", {"state": "error", "details": str(e), "killed": False})
+                    self._publish_activity("error", str(e), conv_id)
 
-                self.broadcast_event("log", {"message": f"Task error: {e}"})
-                self.broadcast_event("task_finished", {"summary": str(e), "success": False})
+                self.broadcast_event("log", {"message": f"Task error: {e}", "conversation_id": conv_id})
+                self.broadcast_event("task_finished", {
+                    "summary": str(e),
+                    "success": False,
+                    "conversation_id": conv_id,
+                })
 
         threading.Thread(target=_run, daemon=True, name="GatewayTaskWorker").start()
 
-    def stop_task(self):
-        """Stop the running agent task without engaging the emergency kill switch.
+    def stop_task(self, conversation_id: Optional[str] = None):
+        """Stop one conversation's task without engaging the emergency kill switch.
 
-        A stop while nothing is running must not emit another finish event.
+        A stop while that conversation is idle must not emit another finish event.
         That event was replacing a reply that had already been delivered when
-        the user only wanted speech playback to end.
+        the user only wanted speech playback to end. Cloud mode leaves speech
+        playing so a previous response can keep being read.
         """
-        if self.current_state not in ("thinking", "executing", "perceiving"):
+        conv_id = (conversation_id or self._focus_conversation() or "").strip()
+        running = self._running_conversation_ids()
+        if conv_id:
+            if conv_id not in running:
+                return
+        elif not running:
             return
-        if hasattr(self.agent_loop, "cancel_task") and callable(self.agent_loop.cancel_task):
+        cancel = getattr(self.agent_loop, "cancel_task", None)
+        if callable(cancel):
             try:
-                self.agent_loop.cancel_task()
+                cancel(conv_id or None)
             except Exception as e:
                 logger.error("Error in agent_loop.cancel_task: %s", e)
-        if hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
+        if not self._parallel_actions() and hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
             try:
                 self.agent_loop.voice.stop_speaking()
             except Exception:
                 pass
         self._abandon_pending_confirmations()
 
-        is_killed = False
-        if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
-            is_killed = self.agent_loop.kill_switch.is_triggered()
-
-        if is_killed:
-            self.current_state = "killed"
-            self.broadcast_event("status_change", {"state": "killed", "details": "Task stopped (Kill switch active)", "killed": True})
+        if self._kill_switch_on():
+            self._publish_activity("killed", "Task stopped (Kill switch active)", conv_id)
         else:
-            self.current_state = "idle"
-            self.broadcast_event("status_change", {"state": "idle", "details": "Task stopped by user", "killed": False})
+            self._publish_activity("idle", "Task stopped by user", conv_id)
 
-        self.broadcast_event("task_finished", {"summary": "Task stopped by user.", "success": False})
-        self.broadcast_event("log", {"message": "Active task stopped by user."})
+        self.broadcast_event("task_finished", {
+            "summary": "Task stopped by user.",
+            "success": False,
+            "conversation_id": conv_id,
+            **self._activity_meta(conv_id),
+        })
+        self.broadcast_event("log", {"message": "Active task stopped by user.", "conversation_id": conv_id})
 
     def trigger_kill(self):
         """Trigger emergency stop: trip kill switch, halt active loop task, and silence voice."""
         if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
             self.agent_loop.kill_switch.trigger()
-        if hasattr(self.agent_loop, "cancel_task") and callable(self.agent_loop.cancel_task):
-            try:
-                self.agent_loop.cancel_task()
-            except Exception as e:
-                logger.error("Error cancelling task on kill: %s", e)
+        cancel_all = getattr(self.agent_loop, "cancel_all_tasks", None)
+        cancel_one = getattr(self.agent_loop, "cancel_task", None)
+        try:
+            if callable(cancel_all):
+                cancel_all()
+            elif callable(cancel_one):
+                cancel_one()
+        except Exception as e:
+            logger.error("Error cancelling task on kill: %s", e)
         if hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
             try:
                 self.agent_loop.voice.stop_speaking()
@@ -1727,21 +1872,26 @@ class RemoteGatewayServer:
                 pass
         self._abandon_pending_confirmations()
 
-        self.current_state = "killed"
-        self.broadcast_event("status_change", {"state": "killed", "details": "Emergency stop tripped remotely!", "killed": True})
-        self.broadcast_event("task_finished", {"summary": "Emergency stop tripped remotely!", "success": False})
+        self._publish_activity("killed", "Emergency stop tripped remotely!", "")
+        self.broadcast_event("task_finished", {
+            "summary": "Emergency stop tripped remotely!",
+            "success": False,
+            **self._activity_meta(""),
+        })
         self.broadcast_event("log", {"message": "EMERGENCY KILL SWITCH TRIPPED!"})
 
     def reset_kill(self):
         """Reset emergency stop."""
         if hasattr(self.agent_loop, "kill_switch") and self.agent_loop.kill_switch:
             self.agent_loop.kill_switch.reset()
-        self.current_state = "idle"
-        self.broadcast_event("status_change", {"state": "idle", "details": "Emergency stop reset", "killed": False})
+        self._publish_activity("idle", "Emergency stop reset", self._focus_conversation())
         self.broadcast_event("log", {"message": "Emergency stop reset."})
 
     def speak_message(self, message: str, voice: Optional[str] = None) -> bool:
         """Vocalize a message via Kokoro TTS."""
+        if self._local_work_in_progress():
+            self.broadcast_event("log", {"message": self._local_work_message()})
+            return False
         if hasattr(self.agent_loop, "voice") and self.agent_loop.voice:
             try:
                 self.agent_loop.voice.speak(message, voice=voice, blocking=False)
@@ -1761,15 +1911,6 @@ class RemoteGatewayServer:
         elif hasattr(self.agent_loop, "clear_history") and callable(self.agent_loop.clear_history):
             self.agent_loop.clear_history()
 
-        if hasattr(self.agent_loop, "conversation_history") and isinstance(self.agent_loop.conversation_history, list):
-            self.agent_loop.conversation_history.clear()
-
-        self.broadcast_event("conversation_changed", {
-            "conversation_id": conv_id,
-            "title": title,
-            "messages": [],
-            "files": self._shared_files_for(conv_id),
-        })
         self.broadcast_event("log", {"message": f"Started new conversation: '{title}'"})
         return conv_id
 
@@ -1779,13 +1920,7 @@ class RemoteGatewayServer:
             try:
                 ok = self.agent_loop.switch_conversation(conv_id)
                 if ok:
-                    cid, title, msgs = self.get_active_conversation_info()
-                    self.broadcast_event("conversation_changed", {
-                        "conversation_id": cid,
-                        "title": title,
-                        "messages": msgs,
-                        "files": self._shared_files_for(cid),
-                    })
+                    _cid, title, _msgs = self.get_active_conversation_info()
                     self.broadcast_event("log", {"message": f"Switched conversation to: '{title}'"})
                     return True
             except Exception as e:
@@ -1885,28 +2020,28 @@ class RemoteGatewayServer:
         prompt: str,
         message_id: str = "",
         message_index: Optional[int] = None,
+        conversation_id: str = "",
     ) -> bool:
         """Drop a user turn and everything after it, then run the prompt again."""
         prompt = (prompt or "").strip()
         if not prompt:
             return self._fail_edit_retry("Nothing to retry.")
 
-        if self.current_state in ("thinking", "executing", "perceiving"):
-            return self._fail_edit_retry(
-                "Wait for the current task to finish before editing or retrying."
-            )
-
-        killed = self.current_state == "killed"
-        kill_switch = getattr(self.agent_loop, "kill_switch", None)
-        if kill_switch and callable(getattr(kill_switch, "is_triggered", None)):
-            try:
-                killed = killed or bool(kill_switch.is_triggered())
-            except Exception:
-                pass
-        if killed:
+        if self.current_state == "killed" or self._kill_switch_on():
             return self._fail_edit_retry("Reset the emergency stop before retrying.")
 
-        conv_id, title, messages = self.get_active_conversation_info()
+        requested = (conversation_id or self._focus_conversation() or "").strip()
+        active_id = str(getattr(self.agent_loop, "active_conversation_id", "") or "")
+        conv_key = requested or active_id
+        running = self._running_conversation_ids()
+        if conv_key and conv_key in running:
+            return self._fail_edit_retry(
+                "This conversation is still working. Stop it before editing that prompt."
+            )
+        if running and not self._parallel_actions():
+            return self._fail_edit_retry(self._local_work_message())
+
+        conv_id, title, messages = self._conversation_snapshot(conv_key or None)
         cut = self._user_turn_index(
             messages,
             message_id=message_id,
@@ -1933,16 +2068,17 @@ class RemoteGatewayServer:
                 deleted = 0
             if deleted > 0:
                 rewound = True
-                reloader = getattr(self.agent_loop, "reload_conversation_history", None)
-                if callable(reloader):
-                    try:
-                        reloader()
-                    except Exception as exc:
-                        logger.warning("Failed to reload conversation history: %s", exc)
+                if str(conv_id or "") == active_id:
+                    reloader = getattr(self.agent_loop, "reload_conversation_history", None)
+                    if callable(reloader):
+                        try:
+                            reloader()
+                        except Exception as exc:
+                            logger.warning("Failed to reload conversation history: %s", exc)
+                            self._replace_history_from_store(conv_id)
+                    else:
                         self._replace_history_from_store(conv_id)
-                else:
-                    self._replace_history_from_store(conv_id)
-        elif isinstance(getattr(self.agent_loop, "conversation_history", None), list):
+        elif str(conv_id or "") == active_id and isinstance(getattr(self.agent_loop, "conversation_history", None), list):
             history = self.agent_loop.conversation_history
             if 0 <= cut <= len(history):
                 del history[cut:]
@@ -1951,21 +2087,21 @@ class RemoteGatewayServer:
         if not rewound:
             return self._fail_edit_retry("Could not rewind the conversation for that retry.")
 
-        cid, cur_title, msgs = self.get_active_conversation_info()
+        cid, cur_title, msgs = self._conversation_snapshot(conv_id)
         self.broadcast_event("conversation_changed", {
             "conversation_id": cid or conv_id,
             "title": cur_title or title,
             "messages": msgs,
             "files": self._shared_files_for(cid or conv_id),
-        })
-        self.broadcast_event("log", {"message": "Retrying from an earlier prompt."})
-        self.dispatch_task(prompt)
+        }, only_ws=_ws_target.get())
+        self.broadcast_event("log", {"message": "Retrying from an earlier prompt.", "conversation_id": cid or conv_id})
+        self.dispatch_task(prompt, conversation_id=str(cid or conv_id or ""))
         return True
 
     def _fail_edit_retry(self, error: str) -> bool:
         """Tell connected clients why an edit or retry did not start."""
         self._edit_retry_error = error
-        self.broadcast_event("edit_retry_failed", {"error": error})
+        self.broadcast_event("edit_retry_failed", {"error": error}, only_ws=_ws_target.get())
         return False
 
     # =========================================================================
@@ -1973,38 +2109,48 @@ class RemoteGatewayServer:
     # =========================================================================
 
     def _on_agent_thought(self, thought: str):
-        self.broadcast_event("thought_chunk", {"chunk": thought, "is_thought": True})
+        self.broadcast_event("thought_chunk", self._tag_run({"chunk": thought, "is_thought": True}))
 
     def _on_agent_response(self, response: str):
-        self.broadcast_event("token_chunk", {"chunk": response, "is_thought": False})
+        self.broadcast_event("token_chunk", self._tag_run({"chunk": response, "is_thought": False}))
 
     def _on_agent_tool_start(self, tool_name: str, arguments: Any):
-        self.broadcast_event("tool_start", {"tool": tool_name, "arguments": arguments})
+        self.broadcast_event("tool_start", self._tag_run({"tool": tool_name, "arguments": arguments}))
 
     def _on_agent_tool_end(self, tool_name: str, result: Any):
-        self.broadcast_event("tool_end", {"tool": tool_name, "result": str(result)[:500]})
+        self.broadcast_event("tool_end", self._tag_run({"tool": tool_name, "result": str(result)[:500]}))
         self._maybe_share_tool_file(tool_name, result)
 
     def _on_agent_task_start(self, goal: str):
-        self.broadcast_event("task_start", {"goal": goal})
+        self.broadcast_event("task_start", self._tag_run({"goal": goal}))
 
     def _on_agent_task_finish(self, summary: str, success: bool):
-        trace = getattr(self.agent_loop, "last_turn_trace", None) or {}
+        from eidos.core.task_run import current_run
+
+        run = current_run.get()
+        trace = run.trace if run is not None and run.trace else (getattr(self.agent_loop, "last_turn_trace", None) or {})
         if not isinstance(trace, dict):
             trace = {}
         detail = trace.get("detail") or summary
         chat_text = detail if not success else summary
-        self.broadcast_event("task_finished", {
+        self.broadcast_event("task_finished", self._tag_run({
             "summary": chat_text,
             "detail": detail,
             "headline": summary,
             "success": success,
             "thoughts": trace.get("thoughts") or [],
             "actions": trace.get("actions") or [],
-        })
+        }))
 
     def _on_conversation_title_changed(self, title: str):
-        self.broadcast_event("conversation_title_changed", {"title": title})
+        self.broadcast_event(
+            "conversation_title_changed",
+            {
+                "title": title,
+                "conversation_id": str(getattr(self.agent_loop, "active_conversation_id", "") or ""),
+            },
+            only_ws=_ws_target.get(),
+        )
 
     def _on_conversation_changed(self, conv_id: Optional[str] = None, title: str = "New Chat"):
         cid, cur_title, msgs = self.get_active_conversation_info()
@@ -2013,7 +2159,7 @@ class RemoteGatewayServer:
             "title": cur_title or title,
             "messages": msgs,
             "files": self._shared_files_for(cid or conv_id),
-        })
+        }, only_ws=_ws_target.get())
 
     def _on_agent_background_activity(self, active: bool, task: str = "", details: str = ""):
         self.background_active = bool(active)
@@ -2120,19 +2266,16 @@ class RemoteGatewayServer:
         self._ws_clients.add(ws)
         logger.info("Remote gateway client connected to WebSocket (%d active)", len(self._ws_clients))
 
-        is_killed = False
-        if hasattr(self.agent_loop, "kill_switch"):
-            is_killed = self.agent_loop.kill_switch.is_triggered()
-
         # Send initial status
         active_cid, active_title, _ = self.get_active_conversation_info()
+        self._ws_focus[id(ws)] = str(active_cid or "")
         await ws.send_json({
             "event": "status_change",
-            "state": "killed" if is_killed else self.current_state,
+            "state": "killed" if self._kill_switch_on() else self.current_state,
             "details": self.current_task,
-            "killed": is_killed,
-            "conversation_id": active_cid,
+            "killed": self._kill_switch_on(),
             "conversation_title": active_title,
+            **self._activity_meta(str(active_cid or "")),
         })
 
         # Send active confirmations if any
@@ -2165,20 +2308,30 @@ class RemoteGatewayServer:
                         elif msg_type == "prompt":
                             prompt = str(data.get("prompt", "")).strip()
                             speak_host = bool(data.get("speak_on_host", False))
+                            conv = str(data.get("conversation_id") or "").strip() or self._focus_conversation(ws)
+                            if conv:
+                                self._ws_focus[id(ws)] = conv
                             if prompt:
-                                self.dispatch_task(prompt, speak_on_host=speak_host)
+                                self.dispatch_task(prompt, speak_on_host=speak_host, conversation_id=conv)
                         elif msg_type == "edit_retry":
                             prompt = str(data.get("prompt", "")).strip()
                             message_id = str(data.get("id") or data.get("message_id") or "").strip()
                             message_index = self._coerce_message_index(data.get("message_index"))
+                            conv = str(data.get("conversation_id") or "").strip() or self._focus_conversation(ws)
                             if prompt:
-                                self.edit_and_retry(
-                                    prompt,
-                                    message_id=message_id,
-                                    message_index=message_index,
-                                )
+                                token = _ws_target.set(id(ws))
+                                try:
+                                    self.edit_and_retry(
+                                        prompt,
+                                        message_id=message_id,
+                                        message_index=message_index,
+                                        conversation_id=conv,
+                                    )
+                                finally:
+                                    _ws_target.reset(token)
                         elif msg_type in ("stop", "cancel", "stop_task"):
-                            self.stop_task()
+                            conv = str(data.get("conversation_id") or "").strip() or self._focus_conversation(ws)
+                            self.stop_task(conv)
                         elif msg_type == "kill":
                             self.trigger_kill()
                         elif msg_type == "reset":
@@ -2202,11 +2355,23 @@ class RemoteGatewayServer:
                             self.clear_conversation()
                         elif msg_type == "new_chat":
                             title = str(data.get("title", "New Chat")).strip() or "New Chat"
-                            self.start_new_chat(title=title)
+                            token = _ws_target.set(id(ws))
+                            try:
+                                new_id = self.start_new_chat(title=title)
+                            finally:
+                                _ws_target.reset(token)
+                            if new_id:
+                                self._ws_focus[id(ws)] = new_id
                         elif msg_type == "switch_conversation":
                             conv_id = str(data.get("conversation_id", "")).strip()
                             if conv_id:
-                                self.switch_conversation(conv_id)
+                                token = _ws_target.set(id(ws))
+                                try:
+                                    switched = self.switch_conversation(conv_id)
+                                finally:
+                                    _ws_target.reset(token)
+                                if switched:
+                                    self._ws_focus[id(ws)] = conv_id
                         elif msg_type == "get_conversations":
                             store = getattr(self.agent_loop, "conversation_store", None)
                             active_id = getattr(self.agent_loop, "active_conversation_id", None)
@@ -2231,7 +2396,8 @@ class RemoteGatewayServer:
                                 "conversations": convs,
                             })
                         elif msg_type in ("get_history", "sync"):
-                            cid, title, msgs = self.get_active_conversation_info()
+                            focus = self._focus_conversation(ws)
+                            cid, title, msgs = self._conversation_snapshot(focus or None)
                             await ws.send_json({
                                 "event": "sync_history",
                                 "conversation_id": cid,
@@ -2240,20 +2406,30 @@ class RemoteGatewayServer:
                                 "files": self._shared_files_for(cid),
                             })
                             if msg_type == "sync":
+                                killed_now = self._kill_switch_on()
+                                state = "killed" if killed_now else (
+                                    "thinking" if cid and cid in self._running_conversation_ids() else "idle"
+                                )
                                 await ws.send_json({
                                     "event": "status_change",
-                                    "state": "killed" if is_killed else self.current_state,
-                                    "details": self.current_task,
-                                    "killed": is_killed,
-                                    "conversation_id": cid,
+                                    "state": state,
+                                    "details": self.current_task if state == "thinking" else "",
+                                    "killed": killed_now,
                                     "conversation_title": title,
+                                    **self._activity_meta(str(cid or "")),
                                 })
                         elif msg_type == "get_status":
+                            focus = self._focus_conversation(ws)
+                            killed_now = self._kill_switch_on()
+                            state = "killed" if killed_now else (
+                                "thinking" if focus and focus in self._running_conversation_ids() else self.current_state
+                            )
                             await ws.send_json({
                                 "event": "status_change",
-                                "state": "killed" if is_killed else self.current_state,
+                                "state": state,
                                 "details": self.current_task,
-                                "killed": is_killed,
+                                "killed": killed_now,
+                                **self._activity_meta(focus),
                             })
                         elif msg_type in ("get_job_focus", "get_focus"):
                             await ws.send_json({"event": "job_focus", **self.get_job_focus_payload()})
@@ -2274,12 +2450,17 @@ class RemoteGatewayServer:
                     logger.debug("WebSocket error: %s", ws.exception())
         finally:
             self._ws_clients.discard(ws)
+            self._ws_focus.pop(id(ws), None)
             logger.info("Remote gateway client disconnected (%d remaining)", len(self._ws_clients))
 
         return ws
 
-    def broadcast_event(self, event: str, data: Dict[str, Any]):
-        """Broadcast an event to all connected WebSocket clients (thread-safe)."""
+    def broadcast_event(self, event: str, data: Dict[str, Any], only_ws: Optional[int] = None):
+        """Broadcast an event to connected WebSocket clients (thread-safe).
+
+        ``only_ws`` limits delivery to one browser tab so another tab can stay
+        on its own conversation.
+        """
         if not self._loop or not self._ws_clients:
             return
 
@@ -2287,6 +2468,8 @@ class RemoteGatewayServer:
         async def _send():
             dead = set()
             for ws in list(self._ws_clients):
+                if only_ws is not None and id(ws) != only_ws:
+                    continue
                 try:
                     await ws.send_json(payload)
                 except Exception:

@@ -37,3 +37,5 @@ These 4 modules systematically complete the four cognitive capabilities required
 | Document | Title | Component Target | Core Focus |
 |---|---|---|---|
 | [`SPEC_LIVE_CONVERSATION.md`](SPEC_LIVE_CONVERSATION.md) | **Live Conversation (Hands-Free Voice)** | `eidos/voice/live_conversation.py`, desktop pill, web chat | Hands-free turns on the existing Parakeet and Kokoro path, shared by the desktop app and the web app, with the first sentence spoken while the task is still running. |
+| [`SPEC_SUBAGENTS.md`](SPEC_SUBAGENTS.md) | **Subagents** | `eidos/subagents/`, agent loop, settings | Background workers Eidos summons on the cloud. Same harness and tools, a fresh prompt per run, their own history, and the foreground chat left free. |
+| [`SPEC_CONVERSATION_RECALL.md`](SPEC_CONVERSATION_RECALL.md) ([Plan](../plans/PLAN_CONVERSATION_RECALL.md)) | **Conversation Recall** | `eidos/memory/conversation_store.py`, `eidos/core/loop.py` | A short verbatim chat tail plus scoped retrieval of older turns, so a new or cleared conversation can still surface relevant past exchanges. |

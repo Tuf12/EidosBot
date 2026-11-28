@@ -1,8 +1,10 @@
-"""One continuous WAV stream for phone playback.
+"""One recorded WAV for phone playback.
 
 Android keeps a single media element alive when the screen locks or the user
 leaves the app. A playlist of separate clips does not. This session writes one
-WAV: a short realtime lead-in until the reply text arrives, then speech PCM.
+WAV and keeps it until the next read-aloud replaces it: a short lead-in until
+the reply text arrives, then speech PCM. The live response can disconnect
+without deleting that recording, so pause, seek, and replay still have audio.
 """
 
 from __future__ import annotations

@@ -1,15 +1,16 @@
 """Ollama client for local multi-model execution with tool calling."""
 
+from contextlib import contextmanager
 import json
 import logging
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import requests
 
 from eidos.models.base import BaseModelClient, ModelResponse, ToolCall
 from eidos.models.inference_slot import gpu_inference_slot
-from eidos.models.inflight import InflightRequest
+from eidos.models.inflight import InflightRequest, model_run_id
 from eidos.models.ollama_options import chat_generation_options
 
 logger = logging.getLogger(__name__)
@@ -82,16 +83,34 @@ class OllamaClient(BaseModelClient):
         self.recall_interceptor = recall_interceptor
         self.on_recall_callback: Optional[Callable[[str, str], None]] = None
         self._inflight = InflightRequest()
+        self._owner_run_id: Optional[str] = None
         self._vision_capability_cache: Dict[str, bool] = {}
         self._logged_shared_vision = False
         self._logged_ps_failure = False
 
-    def abort(self) -> None:
-        """Close the model request that is currently generating."""
+    @contextmanager
+    def _bind_run(self) -> Iterator[None]:
+        """Own the single local ticket while this thread holds the GPU slot."""
+        owner = model_run_id.get()
+        previous = self._owner_run_id
+        self._owner_run_id = owner
+        try:
+            yield
+        finally:
+            if self._owner_run_id == owner:
+                self._owner_run_id = previous
+
+    def abort(self, run_id: Optional[str] = None) -> None:
+        """Close the local request. A different run's stop does not cancel it."""
+        if run_id is not None and self._owner_run_id != run_id:
+            return
         self._inflight.abort()
 
-    def reset_abort(self) -> None:
-        """Clear a previous stop so the next task can call the model."""
+    def reset_abort(self, run_id: Optional[str] = None) -> None:
+        """Clear a previous stop when this thread owns the local ticket."""
+        key = model_run_id.get() if run_id is None else run_id
+        if self._owner_run_id is not None and key is not None and self._owner_run_id != key:
+            return
         self._inflight.reset()
 
     def _cancelled_response(self, model_name: str) -> ModelResponse:
@@ -173,8 +192,9 @@ class OllamaClient(BaseModelClient):
         """Send chat completion request with optional tool definitions."""
         model_name = model_override or self.reasoning_model
         with gpu_inference_slot(f"ollama:{model_name}"):
-            self._release_extra_vision_model()
-            return self._chat_unlocked(messages, tools, model_override)
+            with self._bind_run():
+                self._release_extra_vision_model()
+                return self._chat_unlocked(messages, tools, model_override)
 
     def _chat_unlocked(
         self,
@@ -258,8 +278,9 @@ class OllamaClient(BaseModelClient):
         """Send multimodal vision query to Ollama."""
         model_name = self.resolve_vision_model(model_override)
         with gpu_inference_slot(f"ollama-vision:{model_name}"):
-            self._release_extra_vision_model()
-            return self._vision_chat_unlocked(prompt, image_base64, system_prompt, model_name)
+            with self._bind_run():
+                self._release_extra_vision_model()
+                return self._vision_chat_unlocked(prompt, image_base64, system_prompt, model_name)
 
     def _vision_chat_unlocked(
         self,
